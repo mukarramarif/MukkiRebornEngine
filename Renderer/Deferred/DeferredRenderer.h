@@ -10,12 +10,15 @@
 #include <glm/vec3.hpp>
 #include <glm/vec4.hpp>
 
+#include "Assets/AsyncGltfLoader.h"
 #include "Renderer/BufferManager.h"
 #include "Renderer/Deferred/GBuffer.h"
 #include "Renderer/RHI/Resources.h"
 
 namespace mukki
 {
+
+class JobSystem;
 
 struct SceneUniform
 {
@@ -39,6 +42,7 @@ public:
     struct Desc
     {
         std::filesystem::path shaderDirectory{};
+        JobSystem* jobSystem = nullptr;
     };
 
     DeferredRenderer() = default;
@@ -53,9 +57,12 @@ public:
     void Render(rhi::CommandList& commandList, const glm::mat4& viewProjection, const glm::vec3& cameraPosition);
 
     bool LoadModel(const std::filesystem::path& path);
+    void RequestModelLoad(const std::filesystem::path& path);
+    bool PollModelLoad();
     void UnloadModel();
 
     [[nodiscard]] bool IsInitialized() const { return m_initialized; }
+    [[nodiscard]] bool IsModelLoading() const { return m_asyncLoader.IsLoading(); }
     [[nodiscard]] bool HasModel() const { return !m_modelDrawItems.empty(); }
     [[nodiscard]] const std::string& GetModelName() const { return m_modelName; }
     [[nodiscard]] std::uint64_t GetModelVertexCount() const { return m_modelVertexCount; }
@@ -87,8 +94,22 @@ private:
     bool CreateScene();
     void CreateLightingSets(rhi::Device& device);
     void UpdateUniforms(std::uint32_t frameIndex, const glm::mat4& viewProjection, const glm::vec3& cameraPosition);
+    bool UploadModel(const std::filesystem::path& path, GltfModel& model);
+    [[nodiscard]] std::uint32_t RecordGBufferSecondaries(
+        std::uint32_t frameIndex,
+        const rhi::RenderingDesc& desc,
+        const std::vector<const DrawItem*>& items);
+    void RecordGBufferBatch(
+        std::uint32_t frameIndex,
+        const std::vector<const DrawItem*>& items,
+        std::size_t begin,
+        std::size_t end,
+        rhi::CommandList& secondary,
+        const rhi::RenderingDesc& desc);
 
     rhi::Device* m_device = nullptr;
+    JobSystem* m_jobSystem = nullptr;
+    AsyncGltfLoader m_asyncLoader{};
     GBuffer m_gbuffer{};
     std::unique_ptr<BufferManager> m_bufferManager{};
     std::vector<std::unique_ptr<rhi::Buffer>> m_uniformBuffers{};
@@ -113,10 +134,12 @@ private:
     std::vector<DrawItem> m_modelDrawItems{};
     std::vector<std::unique_ptr<rhi::Buffer>> m_modelVertexBuffers{};
     std::vector<std::unique_ptr<rhi::Buffer>> m_modelIndexBuffers{};
+    std::vector<std::vector<std::unique_ptr<rhi::CommandList>>> m_gbufferSecondaries{};
     SceneUniform m_sceneUniform{};
     std::string m_modelName{};
     std::uint64_t m_modelVertexCount = 0;
     std::uint64_t m_modelTriangleCount = 0;
+    std::uint32_t m_secondaryBatchCount = 1;
     bool m_lightingSetsDirty = true;
     bool m_initialized = false;
 };

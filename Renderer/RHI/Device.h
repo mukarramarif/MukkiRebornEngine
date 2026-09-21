@@ -42,6 +42,7 @@ public:
     virtual void Resize(const Extent2D& extent) = 0;
 
     [[nodiscard]] virtual CommandList& GetCommandList() = 0;
+    [[nodiscard]] virtual std::unique_ptr<CommandList> CreateSecondaryCommandList() = 0;
     [[nodiscard]] virtual const SwapchainInfo& GetSwapchainInfo() const = 0;
     [[nodiscard]] virtual std::uint32_t GetFrameIndex() const = 0;
     [[nodiscard]] virtual std::uint32_t GetFramesInFlight() const = 0;

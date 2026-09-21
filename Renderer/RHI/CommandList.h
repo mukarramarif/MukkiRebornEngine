@@ -26,6 +26,7 @@ struct RenderingDesc
 {
     std::vector<ColorAttachment> colorAttachments{};
     DepthAttachment depthAttachment{};
+    bool secondaryCommandBuffers = false;
 };
 
 class CommandList
@@ -51,6 +52,12 @@ public:
     virtual void SetPushConstants(const void* data, std::uint32_t size, ShaderStageMask stages) = 0;
     virtual void Draw(std::uint32_t vertexCount, std::uint32_t firstVertex = 0) = 0;
     virtual void DrawIndexed(std::uint32_t indexCount, std::uint32_t firstIndex = 0) = 0;
+
+    // Secondary command buffers inherit the active rendering scope of the primary command list that
+    // executes them. They can be recorded on worker threads and replayed with ExecuteCommands.
+    [[nodiscard]] virtual bool IsSecondary() const = 0;
+    virtual void BeginSecondary(const RenderingDesc& desc) = 0;
+    virtual void ExecuteCommands(const std::vector<const CommandList*>& secondaryCommandLists) = 0;
 
 protected:
     CommandList() = default;

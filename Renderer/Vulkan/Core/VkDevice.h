@@ -41,6 +41,7 @@ public:
     void Resize(const rhi::Extent2D& extent) override;
 
     [[nodiscard]] rhi::CommandList& GetCommandList() override;
+    [[nodiscard]] std::unique_ptr<rhi::CommandList> CreateSecondaryCommandList() override;
     [[nodiscard]] const rhi::SwapchainInfo& GetSwapchainInfo() const override;
     [[nodiscard]] std::uint32_t GetFrameIndex() const override { return m_frameIndex; }
     [[nodiscard]] std::uint32_t GetFramesInFlight() const override { return m_framesInFlight; }

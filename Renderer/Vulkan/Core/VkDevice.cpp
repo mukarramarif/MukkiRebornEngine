@@ -217,6 +217,15 @@ rhi::CommandList& VkDevice::GetCommandList()
     return *m_commandLists[m_frameIndex];
 }
 
+std::unique_ptr<rhi::CommandList> VkDevice::CreateSecondaryCommandList()
+{
+    MRE_ASSERT(m_initialized, "VkDevice::CreateSecondaryCommandList called before VkDevice::Init");
+
+    auto commandList = std::make_unique<VkCommandList>();
+    commandList->Init(m_device, m_graphicsQueueFamily, true);
+    return commandList;
+}
+
 const rhi::SwapchainInfo& VkDevice::GetSwapchainInfo() const
 {
     return m_swapchainInfo;

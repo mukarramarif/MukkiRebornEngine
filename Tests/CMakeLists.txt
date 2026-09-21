@@ -1,9 +1,11 @@
 find_package(GTest CONFIG REQUIRED)
 
 add_executable(mukki_tests
+    test_async_gltf_loader.cpp
     test_camera.cpp
     test_engine.cpp
     test_gltf_loader.cpp
+    test_job_system.cpp
     test_keybinds.cpp
     test_log.cpp
     test_path_utils.cpp

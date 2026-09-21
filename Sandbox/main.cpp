@@ -3,6 +3,7 @@
 #include "Application/Input.h"
 #include "Application/Keybinds.h"
 #include "Application/Window.h"
+#include "Core/JobSystem.h"
 #include "Renderer/Deferred/DeferredRenderer.h"
 #include "Renderer/RHI/Device.h"
 #include "Renderer/RHI/Resources.h"
@@ -88,6 +89,7 @@ protected:
         m_renderer = std::make_unique<mukki::DeferredRenderer>();
         mukki::DeferredRenderer::Desc rendererDesc{};
         rendererDesc.shaderDirectory = m_shaderDirectory;
+        rendererDesc.jobSystem = &m_jobSystem;
         if (!m_renderer->Init(*m_device, rendererDesc))
         {
             MRE_CRITICAL("Failed to initialize the deferred renderer");
@@ -209,8 +211,10 @@ protected:
         {
             const std::filesystem::path path = std::move(m_pendingModelPath);
             m_pendingModelPath.clear();
-            m_renderer->LoadModel(path);
+            m_renderer->RequestModelLoad(path);
         }
+
+        m_renderer->PollModelLoad();
 
         m_renderer->Render(commandList, m_camera.GetViewProjectionMatrix(), m_camera.GetPosition());
 
@@ -326,6 +330,11 @@ private:
 
         const std::string current = m_renderer->HasModel() ? m_renderer->GetModelName() : "none";
         ImGui::Text("Loaded: %s", current.c_str());
+        if (m_renderer->IsModelLoading())
+        {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4{1.0f, 0.8f, 0.2f, 1.0f}, "(loading...)");
+        }
 
         const std::string selectedName = mukki::PathToUtf8(
             m_sampleModels[static_cast<std::size_t>(m_selectedModel)].filename());
@@ -408,6 +417,7 @@ private:
 
     mukki::Camera m_camera{};
     mukki::FlyCameraController m_controller{};
+    mukki::JobSystem m_jobSystem{};
     std::unique_ptr<mukki::rhi::Device> m_device{};
     std::unique_ptr<mukki::DeferredRenderer> m_renderer{};
     mukki::vulkan::UiLayer m_ui{};

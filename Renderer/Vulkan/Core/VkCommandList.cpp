@@ -46,8 +46,10 @@ vk::ImageMemoryBarrier2 MakeImageBarrier(
 
 } // namespace
 
-void VkCommandList::Init(const vk::raii::Device& device, std::uint32_t queueFamilyIndex)
+void VkCommandList::Init(const vk::raii::Device& device, std::uint32_t queueFamilyIndex, bool secondary)
 {
+    m_secondary = secondary;
+
     const vk::CommandPoolCreateInfo poolInfo = vk::CommandPoolCreateInfo{}
                                                    .setFlags(vk::CommandPoolCreateFlagBits::eResetCommandBuffer)
                                                    .setQueueFamilyIndex(queueFamilyIndex);
@@ -55,7 +57,9 @@ void VkCommandList::Init(const vk::raii::Device& device, std::uint32_t queueFami
 
     const vk::CommandBufferAllocateInfo allocateInfo = vk::CommandBufferAllocateInfo{}
                                                            .setCommandPool(*m_commandPool)
-                                                           .setLevel(vk::CommandBufferLevel::ePrimary)
+                                                           .setLevel(
+                                                               secondary ? vk::CommandBufferLevel::eSecondary
+                                                                         : vk::CommandBufferLevel::ePrimary)
                                                            .setCommandBufferCount(1);
 
     std::vector<vk::raii::CommandBuffer> commandBuffers = device.allocateCommandBuffers(allocateInfo);
@@ -115,10 +119,11 @@ void VkCommandList::Begin()
 void VkCommandList::End()
 {
     MRE_ASSERT(m_recording, "VkCommandList::End called without Begin");
-    MRE_ASSERT(!m_rendering, "VkCommandList::End called while a rendering scope is open");
+    MRE_ASSERT(m_secondary || !m_rendering, "VkCommandList::End called while a rendering scope is open");
 
     m_commandBuffer.end();
     m_recording = false;
+    m_rendering = false;
 }
 
 void VkCommandList::BeginSwapchainRendering(const rhi::ClearColor& clearColor, bool clear)
@@ -287,6 +292,10 @@ void VkCommandList::BeginRendering(const rhi::RenderingDesc& desc)
                                           .setRenderArea(vk::Rect2D{vk::Offset2D{0, 0}, extent})
                                           .setLayerCount(1)
                                           .setColorAttachments(colorAttachments);
+    if (desc.secondaryCommandBuffers)
+    {
+        renderingInfo.flags |= vk::RenderingFlagBits::eContentsSecondaryCommandBuffers;
+    }
     if (hasDepth)
     {
         renderingInfo.pDepthAttachment = &depthAttachmentInfo;
@@ -338,6 +347,84 @@ void VkCommandList::EndRendering()
     m_renderingColorTextures.clear();
     m_renderingDepthTexture = nullptr;
     m_rendering = false;
+}
+
+void VkCommandList::BeginSecondary(const rhi::RenderingDesc& desc)
+{
+    MRE_ASSERT(m_secondary, "VkCommandList::BeginSecondary requires a secondary command list");
+    MRE_ASSERT(!m_recording, "VkCommandList::BeginSecondary called while already recording");
+    MRE_ASSERT(!desc.colorAttachments.empty(), "BeginSecondary requires at least one color attachment");
+
+    std::vector<vk::Format> colorFormats{};
+    colorFormats.reserve(desc.colorAttachments.size());
+
+    vk::Extent2D extent{0, 0};
+    for (const rhi::ColorAttachment& attachment : desc.colorAttachments)
+    {
+        MRE_ASSERT(attachment.texture != nullptr, "Color attachments require a texture");
+        const auto* texture = static_cast<const VkTexture*>(attachment.texture);
+        colorFormats.push_back(ToVkFormat(texture->GetFormat()));
+        extent = vk::Extent2D{texture->GetWidth(), texture->GetHeight()};
+    }
+
+    vk::Format depthFormat = vk::Format::eUndefined;
+    if (desc.depthAttachment.texture != nullptr)
+    {
+        const auto* depthTexture = static_cast<const VkTexture*>(desc.depthAttachment.texture);
+        MRE_ASSERT(depthTexture->IsDepth(), "The depth attachment texture must be a depth texture");
+        depthFormat = ToVkFormat(depthTexture->GetFormat());
+        if (extent.width == 0)
+        {
+            extent = vk::Extent2D{depthTexture->GetWidth(), depthTexture->GetHeight()};
+        }
+    }
+
+    vk::CommandBufferInheritanceRenderingInfo inheritanceRenderingInfo{};
+    inheritanceRenderingInfo.colorAttachmentCount = static_cast<std::uint32_t>(colorFormats.size());
+    inheritanceRenderingInfo.pColorAttachmentFormats = colorFormats.data();
+    inheritanceRenderingInfo.depthAttachmentFormat = depthFormat;
+    inheritanceRenderingInfo.stencilAttachmentFormat = vk::Format::eUndefined;
+    inheritanceRenderingInfo.rasterizationSamples = vk::SampleCountFlagBits::e1;
+
+    vk::CommandBufferInheritanceInfo inheritanceInfo{};
+    inheritanceInfo.pNext = &inheritanceRenderingInfo;
+
+    m_commandBuffer.reset();
+    m_commandBuffer.begin(vk::CommandBufferBeginInfo{}
+                              .setFlags(vk::CommandBufferUsageFlagBits::eOneTimeSubmit |
+                                        vk::CommandBufferUsageFlagBits::eRenderPassContinue)
+                              .setPInheritanceInfo(&inheritanceInfo));
+
+    m_recording = true;
+    m_rendering = true;
+    m_renderingSwapchain = false;
+    m_hasBoundPipeline = false;
+    m_boundPipelineLayout = vk::PipelineLayout{nullptr};
+    SetViewportAndScissor(extent);
+}
+
+void VkCommandList::ExecuteCommands(const std::vector<const rhi::CommandList*>& secondaryCommandLists)
+{
+    MRE_ASSERT(m_recording, "VkCommandList::ExecuteCommands called outside of a recording scope");
+    MRE_ASSERT(m_rendering, "VkCommandList::ExecuteCommands called outside of a rendering scope");
+    MRE_ASSERT(!m_secondary, "VkCommandList::ExecuteCommands can only be called on a primary command list");
+
+    if (secondaryCommandLists.empty())
+    {
+        return;
+    }
+
+    std::vector<vk::CommandBuffer> commandBuffers{};
+    commandBuffers.reserve(secondaryCommandLists.size());
+    for (const rhi::CommandList* secondary : secondaryCommandLists)
+    {
+        MRE_ASSERT(secondary != nullptr, "ExecuteCommands requires non-null secondary command lists");
+        MRE_ASSERT(secondary->IsSecondary(), "ExecuteCommands requires secondary command lists");
+        const auto& vkSecondary = static_cast<const VkCommandList&>(*secondary);
+        commandBuffers.push_back(*vkSecondary.GetHandle());
+    }
+
+    m_commandBuffer.executeCommands(commandBuffers);
 }
 
 void VkCommandList::BindPipeline(const rhi::Pipeline& pipeline)
