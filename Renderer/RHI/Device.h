@@ -1,0 +1,49 @@
+#pragma once
+
+#include <cstdint>
+#include <memory>
+#include <string>
+
+#include "Renderer/RHI/CommandList.h"
+#include "Renderer/RHI/Resources.h"
+
+namespace mukki::rhi
+{
+
+struct DeviceDesc
+{
+    void* nativeWindowHandle = nullptr;
+    std::string applicationName = "MukkiRebornEngine";
+    Extent2D initialExtent{1280, 720};
+    bool enableValidation = true;
+    std::uint32_t framesInFlight = 2;
+};
+
+struct SwapchainInfo
+{
+    Format format = Format::Undefined;
+    Extent2D extent{};
+    std::uint32_t imageCount = 0;
+};
+
+class Device
+{
+public:
+    virtual ~Device() = default;
+
+    Device(const Device&) = delete;
+    Device& operator=(const Device&) = delete;
+
+    virtual bool BeginFrame() = 0;
+    virtual void EndFrame() = 0;
+    virtual void WaitIdle() = 0;
+    virtual void Resize(const Extent2D& extent) = 0;
+
+    [[nodiscard]] virtual CommandList& GetCommandList() = 0;
+    [[nodiscard]] virtual const SwapchainInfo& GetSwapchainInfo() const = 0;
+
+protected:
+    Device() = default;
+};
+
+} // namespace mukki::rhi

@@ -1,0 +1,25 @@
+# Build output
+build/
+out/
+vcpkg_installed/
+
+# CMake
+CMakeUserPresets.json
+compile_commands.json
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+# Compiled shaders
+*.spv
+
+# Logs
+*.log
+
+# OS
+Thumbs.db
+.DS_Store

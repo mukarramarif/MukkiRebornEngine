@@ -1,0 +1,21 @@
+{
+  "name": "mukki-reborn-engine",
+  "version-string": "0.1.0",
+  "description": "Vendor-agnostic game engine with a Vulkan RHI and a deferred renderer",
+  "builtin-baseline": "1f5e0348089e8a9b187f57d42866ebc871e815da",
+  "dependencies": [
+    "glfw3",
+    "glm",
+    "gtest",
+    "vulkan",
+    "vulkan-memory-allocator",
+    {
+      "name": "imgui",
+      "features": [
+        "docking-experimental",
+        "glfw-binding",
+        "vulkan-binding"
+      ]
+    }
+  ]
+}
