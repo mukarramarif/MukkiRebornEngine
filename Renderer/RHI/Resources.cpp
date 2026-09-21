@@ -7,6 +7,14 @@ namespace mukki::rhi
 
 Buffer::~Buffer() = default;
 
+Texture::~Texture() = default;
+
+Sampler::~Sampler() = default;
+
+DescriptorSetLayout::~DescriptorSetLayout() = default;
+
+DescriptorSet::~DescriptorSet() = default;
+
 Shader::~Shader() = default;
 
 Pipeline::~Pipeline() = default;

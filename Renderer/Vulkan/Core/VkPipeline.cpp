@@ -2,6 +2,7 @@
 
 #include "Renderer/Vulkan/Core/VkConversions.h"
 #include "Renderer/Vulkan/Core/VkShader.h"
+#include "Renderer/Vulkan/Resources/DescriptorSet.h"
 #include "Utilities/Assert.h"
 
 #include <array>
@@ -30,6 +31,18 @@ VkPipeline::VkPipeline(const vk::raii::Device& device, const rhi::PipelineDesc& 
     if (desc.pushConstantSize > 0)
     {
         layoutInfo.setPushConstantRanges(pushConstantRange);
+    }
+
+    std::vector<vk::DescriptorSetLayout> descriptorSetLayouts{};
+    descriptorSetLayouts.reserve(desc.descriptorSetLayouts.size());
+    for (const rhi::DescriptorSetLayout* layout : desc.descriptorSetLayouts)
+    {
+        MRE_ASSERT(layout != nullptr, "PipelineDesc contains a null descriptor set layout");
+        descriptorSetLayouts.push_back(static_cast<const VkDescriptorSetLayout*>(layout)->GetHandle());
+    }
+    if (!descriptorSetLayouts.empty())
+    {
+        layoutInfo.setSetLayouts(descriptorSetLayouts);
     }
 
     m_layout = vk::raii::PipelineLayout{device, layoutInfo};
@@ -126,9 +139,13 @@ VkPipeline::VkPipeline(const vk::raii::Device& device, const rhi::PipelineDesc& 
                                                                                vk::ColorComponentFlagBits::eB |
                                                                                vk::ColorComponentFlagBits::eA);
 
+    const std::vector<vk::PipelineColorBlendAttachmentState> colorBlendAttachments(
+        desc.colorFormats.size(),
+        colorBlendAttachment);
+
     const vk::PipelineColorBlendStateCreateInfo colorBlendState = vk::PipelineColorBlendStateCreateInfo{}
                                                                       .setLogicOpEnable(false)
-                                                                      .setAttachments(colorBlendAttachment);
+                                                                      .setAttachments(colorBlendAttachments);
 
     std::vector<vk::Format> colorFormats{};
     colorFormats.reserve(desc.colorFormats.size());

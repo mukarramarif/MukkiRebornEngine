@@ -1,6 +1,9 @@
 #pragma once
 
 #include "Renderer/RHI/Device.h"
+#include "Renderer/RHI/Resources.h"
+
+#include <imgui.h>
 
 struct GLFWwindow;
 
@@ -23,6 +26,9 @@ public:
 
     void BeginFrame();
     void EndFrame(rhi::CommandList& commandList);
+
+    [[nodiscard]] ImTextureID AddTexture(const rhi::Texture& texture);
+    void RemoveTexture(ImTextureID textureId);
 
     [[nodiscard]] bool IsInitialized() const { return m_initialized; }
 

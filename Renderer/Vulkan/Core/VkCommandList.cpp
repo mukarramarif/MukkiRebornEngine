@@ -3,6 +3,8 @@
 #include "Renderer/Vulkan/Core/VkConversions.h"
 #include "Renderer/Vulkan/Core/VkPipeline.h"
 #include "Renderer/Vulkan/Resources/Buffer.h"
+#include "Renderer/Vulkan/Resources/DescriptorSet.h"
+#include "Renderer/Vulkan/Resources/Texture.h"
 #include "Utilities/Assert.h"
 
 #include <utility>
@@ -17,6 +19,7 @@ vk::ImageMemoryBarrier2 MakeImageBarrier(
     const vk::Image& image,
     vk::ImageLayout oldLayout,
     vk::ImageLayout newLayout,
+    vk::ImageAspectFlags aspect,
     vk::PipelineStageFlags2 srcStage,
     vk::AccessFlags2 srcAccess,
     vk::PipelineStageFlags2 dstStage,
@@ -33,7 +36,7 @@ vk::ImageMemoryBarrier2 MakeImageBarrier(
     barrier.dstQueueFamilyIndex = vk::QueueFamilyIgnored;
     barrier.image = image;
     barrier.subresourceRange = vk::ImageSubresourceRange{}
-                                   .setAspectMask(vk::ImageAspectFlagBits::eColor)
+                                   .setAspectMask(aspect)
                                    .setBaseMipLevel(0)
                                    .setLevelCount(1)
                                    .setBaseArrayLayer(0)
@@ -69,11 +72,14 @@ void VkCommandList::Shutdown()
     m_swapchainExtent = vk::Extent2D{0, 0};
     m_swapchainImageLayout = vk::ImageLayout::eUndefined;
     m_boundPipelineLayout = vk::PipelineLayout{nullptr};
+    m_renderingColorTextures.clear();
+    m_renderingDepthTexture = nullptr;
     m_swapchainImageIndex = 0;
     m_hasBoundPipeline = false;
     m_renderedThisFrame = false;
     m_recording = false;
     m_rendering = false;
+    m_renderingSwapchain = false;
 }
 
 void VkCommandList::SetSwapchainTarget(
@@ -128,6 +134,7 @@ void VkCommandList::BeginSwapchainRendering(const rhi::ClearColor& clearColor, b
             m_swapchainImage,
             m_swapchainImageLayout,
             vk::ImageLayout::eColorAttachmentOptimal,
+            vk::ImageAspectFlagBits::eColor,
             wasInitialized ? vk::PipelineStageFlagBits2::eColorAttachmentOutput : vk::PipelineStageFlagBits2::eNone,
             vk::AccessFlagBits2::eNone,
             vk::PipelineStageFlagBits2::eColorAttachmentOutput,
@@ -154,25 +161,15 @@ void VkCommandList::BeginSwapchainRendering(const rhi::ClearColor& clearColor, b
                                                 .setColorAttachments(colorAttachment);
 
     m_commandBuffer.beginRendering(renderingInfo);
-
-    const vk::Viewport viewport = vk::Viewport{}
-                                      .setX(0.0f)
-                                      .setY(0.0f)
-                                      .setWidth(static_cast<float>(m_swapchainExtent.width))
-                                      .setHeight(static_cast<float>(m_swapchainExtent.height))
-                                      .setMinDepth(0.0f)
-                                      .setMaxDepth(1.0f);
-    m_commandBuffer.setViewport(0, viewport);
-
-    const vk::Rect2D scissor = vk::Rect2D{}.setOffset(vk::Offset2D{0, 0}).setExtent(m_swapchainExtent);
-    m_commandBuffer.setScissor(0, scissor);
+    SetViewportAndScissor(m_swapchainExtent);
 
     m_rendering = true;
+    m_renderingSwapchain = true;
 }
 
 void VkCommandList::EndSwapchainRendering()
 {
-    MRE_ASSERT(m_rendering, "VkCommandList::EndSwapchainRendering called without an open rendering scope");
+    MRE_ASSERT(m_renderingSwapchain, "VkCommandList::EndSwapchainRendering called without an open rendering scope");
 
     m_commandBuffer.endRendering();
 
@@ -180,6 +177,7 @@ void VkCommandList::EndSwapchainRendering()
         m_swapchainImage,
         vk::ImageLayout::eColorAttachmentOptimal,
         vk::ImageLayout::ePresentSrcKHR,
+        vk::ImageAspectFlagBits::eColor,
         vk::PipelineStageFlagBits2::eColorAttachmentOutput,
         vk::AccessFlagBits2::eColorAttachmentWrite,
         vk::PipelineStageFlagBits2::eNone,
@@ -188,7 +186,158 @@ void VkCommandList::EndSwapchainRendering()
     m_swapchainImageLayout = vk::ImageLayout::ePresentSrcKHR;
 
     m_rendering = false;
+    m_renderingSwapchain = false;
     m_renderedThisFrame = true;
+}
+
+void VkCommandList::BeginRendering(const rhi::RenderingDesc& desc)
+{
+    MRE_ASSERT(m_recording, "VkCommandList::BeginRendering called outside of a recording scope");
+    MRE_ASSERT(!m_rendering, "VkCommandList::BeginRendering called while a rendering scope is open");
+    MRE_ASSERT(!desc.colorAttachments.empty(), "BeginRendering requires at least one color attachment");
+
+    std::vector<vk::RenderingAttachmentInfo> colorAttachments{};
+    colorAttachments.reserve(desc.colorAttachments.size());
+    m_renderingColorTextures.clear();
+    m_renderingColorTextures.reserve(desc.colorAttachments.size());
+
+    vk::Extent2D extent{0, 0};
+    for (const rhi::ColorAttachment& attachment : desc.colorAttachments)
+    {
+        MRE_ASSERT(attachment.texture != nullptr, "Color attachments require a texture");
+        const auto* texture = static_cast<const VkTexture*>(attachment.texture);
+
+        if (texture->GetLayout() != vk::ImageLayout::eColorAttachmentOptimal)
+        {
+            const bool wasInitialized = texture->GetLayout() != vk::ImageLayout::eUndefined;
+            const vk::ImageMemoryBarrier2 barrier = MakeImageBarrier(
+                texture->GetImage(),
+                texture->GetLayout(),
+                vk::ImageLayout::eColorAttachmentOptimal,
+                vk::ImageAspectFlagBits::eColor,
+                wasInitialized ? vk::PipelineStageFlagBits2::eColorAttachmentOutput
+                               : vk::PipelineStageFlagBits2::eNone,
+                wasInitialized ? vk::AccessFlagBits2::eColorAttachmentWrite : vk::AccessFlagBits2::eNone,
+                vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                vk::AccessFlagBits2::eColorAttachmentWrite);
+            m_commandBuffer.pipelineBarrier2(vk::DependencyInfo{}.setImageMemoryBarriers(barrier));
+            texture->SetLayout(vk::ImageLayout::eColorAttachmentOptimal);
+        }
+
+        colorAttachments.push_back(vk::RenderingAttachmentInfo{}
+                                       .setImageView(texture->GetImageView())
+                                       .setImageLayout(vk::ImageLayout::eColorAttachmentOptimal)
+                                       .setLoadOp(attachment.clear ? vk::AttachmentLoadOp::eClear
+                                                                   : vk::AttachmentLoadOp::eLoad)
+                                       .setStoreOp(vk::AttachmentStoreOp::eStore)
+                                       .setClearValue(vk::ClearValue{vk::ClearColorValue{
+                                           attachment.clearColor.r,
+                                           attachment.clearColor.g,
+                                           attachment.clearColor.b,
+                                           attachment.clearColor.a}}));
+
+        m_renderingColorTextures.push_back(texture);
+        extent = vk::Extent2D{texture->GetWidth(), texture->GetHeight()};
+    }
+
+    vk::RenderingAttachmentInfo depthAttachmentInfo{};
+    const bool hasDepth = desc.depthAttachment.texture != nullptr;
+    if (hasDepth)
+    {
+        const auto* depthTexture = static_cast<const VkTexture*>(desc.depthAttachment.texture);
+        MRE_ASSERT(depthTexture->IsDepth(), "The depth attachment texture must be a depth texture");
+
+        if (depthTexture->GetLayout() != vk::ImageLayout::eDepthAttachmentOptimal)
+        {
+            const bool wasInitialized = depthTexture->GetLayout() != vk::ImageLayout::eUndefined;
+            const vk::ImageMemoryBarrier2 barrier = MakeImageBarrier(
+                depthTexture->GetImage(),
+                depthTexture->GetLayout(),
+                vk::ImageLayout::eDepthAttachmentOptimal,
+                vk::ImageAspectFlagBits::eDepth,
+                wasInitialized ? vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+                                     vk::PipelineStageFlagBits2::eLateFragmentTests
+                               : vk::PipelineStageFlagBits2::eNone,
+                wasInitialized ? vk::AccessFlagBits2::eDepthStencilAttachmentWrite
+                               : vk::AccessFlagBits2::eNone,
+                vk::PipelineStageFlagBits2::eEarlyFragmentTests | vk::PipelineStageFlagBits2::eLateFragmentTests,
+                vk::AccessFlagBits2::eDepthStencilAttachmentWrite);
+            m_commandBuffer.pipelineBarrier2(vk::DependencyInfo{}.setImageMemoryBarriers(barrier));
+            depthTexture->SetLayout(vk::ImageLayout::eDepthAttachmentOptimal);
+        }
+
+        depthAttachmentInfo = vk::RenderingAttachmentInfo{}
+                                  .setImageView(depthTexture->GetImageView())
+                                  .setImageLayout(vk::ImageLayout::eDepthAttachmentOptimal)
+                                  .setLoadOp(desc.depthAttachment.clear ? vk::AttachmentLoadOp::eClear
+                                                                        : vk::AttachmentLoadOp::eLoad)
+                                  .setStoreOp(vk::AttachmentStoreOp::eStore)
+                                  .setClearValue(vk::ClearValue{vk::ClearDepthStencilValue{
+                                      desc.depthAttachment.clearDepth,
+                                      0}});
+
+        m_renderingDepthTexture = depthTexture;
+        if (extent.width == 0)
+        {
+            extent = vk::Extent2D{depthTexture->GetWidth(), depthTexture->GetHeight()};
+        }
+    }
+
+    vk::RenderingInfo renderingInfo = vk::RenderingInfo{}
+                                          .setRenderArea(vk::Rect2D{vk::Offset2D{0, 0}, extent})
+                                          .setLayerCount(1)
+                                          .setColorAttachments(colorAttachments);
+    if (hasDepth)
+    {
+        renderingInfo.pDepthAttachment = &depthAttachmentInfo;
+    }
+
+    m_commandBuffer.beginRendering(renderingInfo);
+    SetViewportAndScissor(extent);
+
+    m_rendering = true;
+    m_renderingSwapchain = false;
+}
+
+void VkCommandList::EndRendering()
+{
+    MRE_ASSERT(m_rendering && !m_renderingSwapchain, "VkCommandList::EndRendering called without an open scope");
+
+    m_commandBuffer.endRendering();
+
+    for (const VkTexture* texture : m_renderingColorTextures)
+    {
+        const vk::ImageMemoryBarrier2 barrier = MakeImageBarrier(
+            texture->GetImage(),
+            vk::ImageLayout::eColorAttachmentOptimal,
+            vk::ImageLayout::eShaderReadOnlyOptimal,
+            vk::ImageAspectFlagBits::eColor,
+            vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            vk::AccessFlagBits2::eColorAttachmentWrite,
+            vk::PipelineStageFlagBits2::eFragmentShader,
+            vk::AccessFlagBits2::eShaderSampledRead);
+        m_commandBuffer.pipelineBarrier2(vk::DependencyInfo{}.setImageMemoryBarriers(barrier));
+        texture->SetLayout(vk::ImageLayout::eShaderReadOnlyOptimal);
+    }
+
+    if (m_renderingDepthTexture != nullptr)
+    {
+        const vk::ImageMemoryBarrier2 barrier = MakeImageBarrier(
+            m_renderingDepthTexture->GetImage(),
+            vk::ImageLayout::eDepthAttachmentOptimal,
+            vk::ImageLayout::eShaderReadOnlyOptimal,
+            vk::ImageAspectFlagBits::eDepth,
+            vk::PipelineStageFlagBits2::eEarlyFragmentTests | vk::PipelineStageFlagBits2::eLateFragmentTests,
+            vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+            vk::PipelineStageFlagBits2::eFragmentShader,
+            vk::AccessFlagBits2::eShaderSampledRead);
+        m_commandBuffer.pipelineBarrier2(vk::DependencyInfo{}.setImageMemoryBarriers(barrier));
+        m_renderingDepthTexture->SetLayout(vk::ImageLayout::eShaderReadOnlyOptimal);
+    }
+
+    m_renderingColorTextures.clear();
+    m_renderingDepthTexture = nullptr;
+    m_rendering = false;
 }
 
 void VkCommandList::BindPipeline(const rhi::Pipeline& pipeline)
@@ -201,12 +350,33 @@ void VkCommandList::BindPipeline(const rhi::Pipeline& pipeline)
     m_hasBoundPipeline = true;
 }
 
+void VkCommandList::BindDescriptorSet(std::uint32_t setIndex, const rhi::DescriptorSet& descriptorSet)
+{
+    MRE_ASSERT(m_recording, "VkCommandList::BindDescriptorSet called outside of a recording scope");
+    MRE_ASSERT(m_hasBoundPipeline, "VkCommandList::BindDescriptorSet requires a bound pipeline");
+
+    const auto& vkDescriptorSet = static_cast<const VkDescriptorSet&>(descriptorSet);
+    const vk::DescriptorSet handle = vkDescriptorSet.GetHandle();
+    m_commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, m_boundPipelineLayout, setIndex, handle, {});
+}
+
 void VkCommandList::BindVertexBuffer(const rhi::Buffer& buffer)
 {
     MRE_ASSERT(m_recording, "VkCommandList::BindVertexBuffer called outside of a recording scope");
 
     const auto& vkBuffer = static_cast<const VkBuffer&>(buffer);
     m_commandBuffer.bindVertexBuffers(0, vkBuffer.GetHandle(), vk::DeviceSize{0});
+}
+
+void VkCommandList::BindIndexBuffer(const rhi::Buffer& buffer, bool use32BitIndices)
+{
+    MRE_ASSERT(m_recording, "VkCommandList::BindIndexBuffer called outside of a recording scope");
+
+    const auto& vkBuffer = static_cast<const VkBuffer&>(buffer);
+    m_commandBuffer.bindIndexBuffer(
+        vkBuffer.GetHandle(),
+        0,
+        use32BitIndices ? vk::IndexType::eUint32 : vk::IndexType::eUint16);
 }
 
 void VkCommandList::SetPushConstants(const void* data, std::uint32_t size, rhi::ShaderStageMask stages)
@@ -224,6 +394,29 @@ void VkCommandList::Draw(std::uint32_t vertexCount, std::uint32_t firstVertex)
     MRE_ASSERT(m_rendering, "VkCommandList::Draw called outside of a rendering scope");
 
     m_commandBuffer.draw(vertexCount, 1, firstVertex, 0);
+}
+
+void VkCommandList::DrawIndexed(std::uint32_t indexCount, std::uint32_t firstIndex)
+{
+    MRE_ASSERT(m_recording, "VkCommandList::DrawIndexed called outside of a recording scope");
+    MRE_ASSERT(m_rendering, "VkCommandList::DrawIndexed called outside of a rendering scope");
+
+    m_commandBuffer.drawIndexed(indexCount, 1, firstIndex, 0, 0);
+}
+
+void VkCommandList::SetViewportAndScissor(const vk::Extent2D& extent)
+{
+    const vk::Viewport viewport = vk::Viewport{}
+                                      .setX(0.0f)
+                                      .setY(0.0f)
+                                      .setWidth(static_cast<float>(extent.width))
+                                      .setHeight(static_cast<float>(extent.height))
+                                      .setMinDepth(0.0f)
+                                      .setMaxDepth(1.0f);
+    m_commandBuffer.setViewport(0, viewport);
+
+    const vk::Rect2D scissor = vk::Rect2D{}.setOffset(vk::Offset2D{0, 0}).setExtent(extent);
+    m_commandBuffer.setScissor(0, scissor);
 }
 
 } // namespace mukki::vulkan

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <vector>
 
 #include <vulkan/vulkan.hpp>
 #include <vulkan/vulkan_raii.hpp>
@@ -10,6 +11,8 @@
 
 namespace mukki::vulkan
 {
+
+class VkTexture;
 
 class VkCommandList final : public rhi::CommandList
 {
@@ -34,16 +37,23 @@ public:
     void End() override;
     void BeginSwapchainRendering(const rhi::ClearColor& clearColor, bool clear) override;
     void EndSwapchainRendering() override;
+    void BeginRendering(const rhi::RenderingDesc& desc) override;
+    void EndRendering() override;
 
     void BindPipeline(const rhi::Pipeline& pipeline) override;
+    void BindDescriptorSet(std::uint32_t setIndex, const rhi::DescriptorSet& descriptorSet) override;
     void BindVertexBuffer(const rhi::Buffer& buffer) override;
+    void BindIndexBuffer(const rhi::Buffer& buffer, bool use32BitIndices) override;
     void SetPushConstants(const void* data, std::uint32_t size, rhi::ShaderStageMask stages) override;
     void Draw(std::uint32_t vertexCount, std::uint32_t firstVertex) override;
+    void DrawIndexed(std::uint32_t indexCount, std::uint32_t firstIndex) override;
 
     [[nodiscard]] const vk::raii::CommandBuffer& GetHandle() const { return m_commandBuffer; }
     [[nodiscard]] bool WasSwapchainRendered() const { return m_renderedThisFrame; }
 
 private:
+    void SetViewportAndScissor(const vk::Extent2D& extent);
+
     vk::raii::CommandPool m_commandPool{nullptr};
     vk::raii::CommandBuffer m_commandBuffer{nullptr};
     vk::Image m_swapchainImage{nullptr};
@@ -51,11 +61,14 @@ private:
     vk::Extent2D m_swapchainExtent{0, 0};
     vk::ImageLayout m_swapchainImageLayout = vk::ImageLayout::eUndefined;
     vk::PipelineLayout m_boundPipelineLayout{nullptr};
+    std::vector<const VkTexture*> m_renderingColorTextures{};
+    const VkTexture* m_renderingDepthTexture = nullptr;
     std::uint32_t m_swapchainImageIndex = 0;
     bool m_hasBoundPipeline = false;
     bool m_renderedThisFrame = false;
     bool m_recording = false;
     bool m_rendering = false;
+    bool m_renderingSwapchain = false;
 };
 
 } // namespace mukki::vulkan

@@ -71,8 +71,9 @@ CMake options:
 
 ## Run
 
-The sandbox renders a triangle with an ImGui overlay. Compiled Slang shaders are copied next to the
-executable automatically.
+The sandbox renders a deferred scene (G-buffer pass + PBR lighting pass with ACES tonemapping) with
+an ImGui overlay, including a debug window showing the G-buffer channels. Compiled Slang shaders are
+copied next to the executable automatically.
 
 ```powershell
 .\build\windows-debug\Debug\mukki_sandbox.exe
@@ -89,10 +90,11 @@ quit.
 - `Core/` - engine core (version, time)
 - `Renderer/RHI/` - vendor-agnostic render hardware interface (device, command lists, resources)
 - `Renderer/Vulkan/` - Vulkan backend implementation
+- `Renderer/Deferred/` - deferred renderer (G-buffer, lighting, tonemapping)
 - `Renderer/Shaders/` - Slang shaders compiled at build time
 - `Renderer/BufferManager` - vertex/index/uniform buffer management
 - `Utilities/` - logging, asserts, future containers and allocators
 - `Tests/` - GoogleTest unit tests
 - `Sandbox/` - sandbox executable
 
-`Renderer/Deferred/` (G-buffer, lighting, tonemapping) and `Renderer/DX12/` are planned.
+`Renderer/DX12/` and a render graph are planned.

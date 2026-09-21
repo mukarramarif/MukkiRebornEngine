@@ -20,6 +20,9 @@ compile_commands.json
 # Logs
 *.log
 
+# ImGui
+imgui.ini
+
 # OS
 Thumbs.db
 .DS_Store

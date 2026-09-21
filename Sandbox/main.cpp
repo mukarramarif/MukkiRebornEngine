@@ -3,14 +3,13 @@
 #include "Application/Input.h"
 #include "Application/Keybinds.h"
 #include "Application/Window.h"
-#include "Renderer/BufferManager.h"
+#include "Renderer/Deferred/DeferredRenderer.h"
 #include "Renderer/RHI/Device.h"
 #include "Renderer/RHI/Resources.h"
 #include "Renderer/Vulkan/Core/VkDevice.h"
 #include "Renderer/Vulkan/UiLayer.h"
 #include "Utilities/Log.h"
 
-#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -20,27 +19,22 @@
 #include <utility>
 
 #include <GLFW/glfw3.h>
-#include <glm/vec2.hpp>
 #include <glm/vec3.hpp>
-#include <glm/vec4.hpp>
 #include <imgui.h>
 
 namespace
 {
 
-constexpr float kPi = 3.14159265358979f;
-
-struct PushConstants
+void DrawTexturePreview(const char* label, ImTextureID textureId, float width, float aspect)
 {
-    glm::vec4 tint{1.0f};
-    glm::vec4 params{0.0f};
-};
+    if (textureId == 0)
+    {
+        return;
+    }
 
-struct Vertex
-{
-    glm::vec2 position{0.0f};
-    glm::vec3 color{0.0f};
-};
+    ImGui::SeparatorText(label);
+    ImGui::Image(ImTextureRef{textureId}, ImVec2(width, width / aspect));
+}
 
 class SandboxApp final : public mukki::Application
 {
@@ -66,7 +60,8 @@ protected:
         keybinds.Bind("app.quit", mukki::Binding::Key(GLFW_KEY_ESCAPE));
 
         m_camera.SetPerspective(1.0471975512f, GetWindow().GetAspectRatio(), 0.1f, 1000.0f);
-        m_camera.SetPosition(glm::vec3{0.0f, 0.0f, 3.0f});
+        m_camera.SetPosition(glm::vec3{6.0f, 3.0f, 7.0f});
+        m_camera.SetRotation(-0.7f, -0.25f);
 
         mukki::rhi::DeviceDesc deviceDesc{};
         deviceDesc.nativeWindowHandle = GetWindow().GetHandle();
@@ -84,40 +79,15 @@ protected:
             return;
         }
 
-        m_bufferManager = std::make_unique<mukki::BufferManager>(*m_device);
-
-        m_vertexShader = m_device->CreateShader(
-            mukki::rhi::ShaderStage::Vertex,
-            (m_shaderDirectory / "triangle.vert.spv").string());
-        m_fragmentShader = m_device->CreateShader(
-            mukki::rhi::ShaderStage::Fragment,
-            (m_shaderDirectory / "triangle.frag.spv").string());
-        if (m_vertexShader == nullptr || m_fragmentShader == nullptr)
+        m_renderer = std::make_unique<mukki::DeferredRenderer>();
+        mukki::DeferredRenderer::Desc rendererDesc{};
+        rendererDesc.shaderDirectory = m_shaderDirectory;
+        if (!m_renderer->Init(*m_device, rendererDesc))
         {
-            MRE_CRITICAL("Failed to load the triangle shaders from '{}'", m_shaderDirectory.string());
+            MRE_CRITICAL("Failed to initialize the deferred renderer");
             RequestExit();
             return;
         }
-
-        mukki::rhi::VertexLayout vertexLayout{};
-        vertexLayout.AddAttribute(0, mukki::rhi::Format::R32G32Sfloat);
-        vertexLayout.AddAttribute(1, mukki::rhi::Format::R32G32B32Sfloat);
-
-        mukki::rhi::PipelineDesc pipelineDesc{};
-        pipelineDesc.vertexShader = m_vertexShader.get();
-        pipelineDesc.fragmentShader = m_fragmentShader.get();
-        pipelineDesc.vertexLayout = vertexLayout;
-        pipelineDesc.cullMode = mukki::rhi::CullMode::None;
-        pipelineDesc.pushConstantSize = sizeof(PushConstants);
-        pipelineDesc.colorFormats = {m_device->GetSwapchainInfo().format};
-        m_pipeline = m_device->CreatePipeline(pipelineDesc);
-
-        const Vertex vertices[] = {
-            {{0.0f, 0.6f}, {1.0f, 0.2f, 0.2f}},
-            {{0.5f, -0.5f}, {0.2f, 1.0f, 0.3f}},
-            {{-0.5f, -0.5f}, {0.3f, 0.4f, 1.0f}},
-        };
-        m_vertexBuffer = &m_bufferManager->CreateVertexBuffer(vertices, sizeof(vertices));
 
         if (!m_ui.Init(*m_device, GetWindow().GetHandle()))
         {
@@ -128,7 +98,7 @@ protected:
 
     void OnUpdate(float deltaTime) override
     {
-        if (m_device == nullptr)
+        if (m_device == nullptr || m_renderer == nullptr)
         {
             RequestExit();
             return;
@@ -158,17 +128,27 @@ protected:
         cameraInput.lookEnabled = lookHeld;
 
         m_controller.Update(m_camera, cameraInput, deltaTime);
-
-        m_pushConstants.params.x = std::fmod(m_pushConstants.params.x + deltaTime * 0.8f, kPi * 2.0f);
         m_frameTimeMs = deltaTime * 1000.0f;
 
         if (GetWindow().WasResized())
         {
+            const std::uint32_t width = static_cast<std::uint32_t>(GetWindow().GetWidth());
+            const std::uint32_t height = static_cast<std::uint32_t>(GetWindow().GetHeight());
+
             m_camera.SetPerspective(1.0471975512f, GetWindow().GetAspectRatio(), 0.1f, 1000.0f);
-            m_device->Resize(mukki::rhi::Extent2D{
-                static_cast<std::uint32_t>(GetWindow().GetWidth()),
-                static_cast<std::uint32_t>(GetWindow().GetHeight())});
+            m_device->Resize(mukki::rhi::Extent2D{width, height});
+            m_renderer->Resize(width, height);
+            ReleaseDebugTextures();
+            m_renderedFrame = false;
             GetWindow().ClearResizedFlag();
+        }
+
+        if (!m_debugTexturesRegistered && m_renderedFrame)
+        {
+            m_albedoTextureId = m_ui.AddTexture(m_renderer->GetAlbedoTexture());
+            m_normalTextureId = m_ui.AddTexture(m_renderer->GetNormalTexture());
+            m_positionTextureId = m_ui.AddTexture(m_renderer->GetPositionTexture());
+            m_debugTexturesRegistered = true;
         }
 
         ++m_frameCount;
@@ -180,7 +160,7 @@ protected:
 
     void OnRender() override
     {
-        if (m_device == nullptr)
+        if (m_device == nullptr || m_renderer == nullptr)
         {
             return;
         }
@@ -201,59 +181,82 @@ protected:
             static_cast<double>(m_camera.GetPosition().x),
             static_cast<double>(m_camera.GetPosition().y),
             static_cast<double>(m_camera.GetPosition().z));
-        ImGui::ColorEdit3("Tint", &m_pushConstants.tint.x);
+        ImGui::Checkbox("Show G-buffer", &m_showGBuffer);
         ImGui::Checkbox("Show demo window", &m_showDemoWindow);
         ImGui::End();
+
+        if (m_showGBuffer)
+        {
+            ImGui::Begin("G-buffer", &m_showGBuffer);
+
+            const float previewWidth = ImGui::GetContentRegionAvail().x;
+            const float width = static_cast<float>(m_renderer->GetAlbedoTexture().GetWidth());
+            const float height = static_cast<float>(m_renderer->GetAlbedoTexture().GetHeight());
+            const float aspect = height > 0.0f ? width / height : 1.0f;
+
+            DrawTexturePreview("Albedo (metalness in A)", m_albedoTextureId, previewWidth, aspect);
+            DrawTexturePreview("Normal (roughness in A)", m_normalTextureId, previewWidth, aspect);
+            DrawTexturePreview("Position", m_positionTextureId, previewWidth, aspect);
+            ImGui::End();
+        }
+
         if (m_showDemoWindow)
         {
             ImGui::ShowDemoWindow(&m_showDemoWindow);
         }
 
-        const mukki::rhi::ClearColor clearColor{0.05f, 0.07f, 0.12f, 1.0f};
+        m_renderer->Render(commandList, m_camera.GetViewProjectionMatrix(), m_camera.GetPosition());
 
-        commandList.BeginSwapchainRendering(clearColor, true);
-        commandList.BindPipeline(*m_pipeline);
-        commandList.BindVertexBuffer(*m_vertexBuffer);
-        commandList.SetPushConstants(&m_pushConstants, sizeof(PushConstants), mukki::rhi::ShaderStageMask::Vertex);
-        commandList.Draw(3);
-        commandList.EndSwapchainRendering();
-
-        commandList.BeginSwapchainRendering(clearColor, false);
+        commandList.BeginSwapchainRendering(mukki::rhi::ClearColor{0.0f, 0.0f, 0.0f, 1.0f}, false);
         m_ui.EndFrame(commandList);
         commandList.EndSwapchainRendering();
 
         commandList.End();
         m_device->EndFrame();
+        m_renderedFrame = true;
     }
 
     void OnShutdown() override
     {
+        ReleaseDebugTextures();
         m_ui.Shutdown();
-
-        m_vertexBuffer = nullptr;
-        m_pipeline.reset();
-        m_vertexShader.reset();
-        m_fragmentShader.reset();
-        m_bufferManager.reset();
+        m_renderer.reset();
         m_device.reset();
     }
 
 private:
+    void ReleaseDebugTextures()
+    {
+        if (!m_debugTexturesRegistered)
+        {
+            return;
+        }
+
+        m_ui.RemoveTexture(m_albedoTextureId);
+        m_ui.RemoveTexture(m_normalTextureId);
+        m_ui.RemoveTexture(m_positionTextureId);
+        m_albedoTextureId = 0;
+        m_normalTextureId = 0;
+        m_positionTextureId = 0;
+        m_debugTexturesRegistered = false;
+    }
+
     mukki::Camera m_camera{};
     mukki::FlyCameraController m_controller{};
     std::unique_ptr<mukki::rhi::Device> m_device{};
-    std::unique_ptr<mukki::BufferManager> m_bufferManager{};
-    std::unique_ptr<mukki::rhi::Shader> m_vertexShader{};
-    std::unique_ptr<mukki::rhi::Shader> m_fragmentShader{};
-    std::unique_ptr<mukki::rhi::Pipeline> m_pipeline{};
-    mukki::rhi::Buffer* m_vertexBuffer = nullptr;
+    std::unique_ptr<mukki::DeferredRenderer> m_renderer{};
     mukki::vulkan::UiLayer m_ui{};
-    PushConstants m_pushConstants{};
+    ImTextureID m_albedoTextureId = 0;
+    ImTextureID m_normalTextureId = 0;
+    ImTextureID m_positionTextureId = 0;
     std::filesystem::path m_shaderDirectory{};
     float m_frameTimeMs = 0.0f;
     int m_maxFrames = 0;
     int m_frameCount = 0;
-    bool m_showDemoWindow = true;
+    bool m_debugTexturesRegistered = false;
+    bool m_renderedFrame = false;
+    bool m_showGBuffer = true;
+    bool m_showDemoWindow = false;
 };
 
 } // namespace

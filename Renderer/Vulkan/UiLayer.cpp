@@ -4,6 +4,7 @@
 #include "Renderer/Vulkan/Core/VkCommandList.h"
 #include "Renderer/Vulkan/Core/VkConversions.h"
 #include "Renderer/Vulkan/Core/VkDevice.h"
+#include "Renderer/Vulkan/Resources/Texture.h"
 #include "Utilities/Assert.h"
 #include "Utilities/Log.h"
 
@@ -130,6 +131,31 @@ void UiLayer::EndFrame(rhi::CommandList& commandList)
     {
         ImGui_ImplVulkan_RenderDrawData(drawData, *vkCommandList->GetHandle());
     }
+}
+
+ImTextureID UiLayer::AddTexture(const rhi::Texture& texture)
+{
+    MRE_ASSERT(m_initialized, "UiLayer::AddTexture called before UiLayer::Init");
+
+    const auto* vkTexture = dynamic_cast<const VkTexture*>(&texture);
+    MRE_ASSERT(vkTexture != nullptr, "UiLayer requires Vulkan textures");
+    MRE_ASSERT(
+        vkTexture->GetLayout() == vk::ImageLayout::eShaderReadOnlyOptimal,
+        "ImGui textures must be in a shader readable layout before registration");
+
+    const ::VkDescriptorSet descriptorSet =
+        ImGui_ImplVulkan_AddTexture(vkTexture->GetImageView(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    return reinterpret_cast<ImTextureID>(descriptorSet);
+}
+
+void UiLayer::RemoveTexture(ImTextureID textureId)
+{
+    if (textureId == 0)
+    {
+        return;
+    }
+
+    ImGui_ImplVulkan_RemoveTexture(reinterpret_cast<::VkDescriptorSet>(textureId));
 }
 
 } // namespace mukki::vulkan

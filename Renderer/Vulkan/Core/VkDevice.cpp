@@ -32,8 +32,8 @@ bool VkDevice::Init(const rhi::DeviceDesc& desc)
         return false;
     }
 
-    if (!PickPhysicalDevice() || !CreateLogicalDevice() || !CreateAllocator() || !CreateSwapchain() ||
-        !CreateFrameResources())
+    if (!PickPhysicalDevice() || !CreateLogicalDevice() || !CreateAllocator() || !CreateDescriptorPool() ||
+        !CreateSwapchain() || !CreateFrameResources())
     {
         Shutdown();
         return false;
@@ -57,6 +57,7 @@ void VkDevice::Shutdown()
     m_frameSync.Shutdown();
     m_swapchain.reset();
     m_bufferAllocator.Shutdown();
+    m_descriptorPool = vk::raii::DescriptorPool{nullptr};
     if (m_allocator != VK_NULL_HANDLE)
     {
         vmaDestroyAllocator(m_allocator);
@@ -230,6 +231,33 @@ std::unique_ptr<rhi::Buffer> VkDevice::CreateBuffer(
     return m_bufferAllocator.CreateBuffer(desc, initialData, initialDataSize);
 }
 
+std::unique_ptr<rhi::Texture> VkDevice::CreateTexture(const rhi::TextureDesc& desc)
+{
+    MRE_ASSERT(m_initialized, "VkDevice::CreateTexture called before VkDevice::Init");
+    return std::make_unique<VkTexture>(m_allocator, m_device, desc);
+}
+
+std::unique_ptr<rhi::Sampler> VkDevice::CreateSampler(const rhi::SamplerDesc& desc)
+{
+    MRE_ASSERT(m_initialized, "VkDevice::CreateSampler called before VkDevice::Init");
+    return std::make_unique<VkSampler>(m_device, desc);
+}
+
+std::unique_ptr<rhi::DescriptorSetLayout> VkDevice::CreateDescriptorSetLayout(
+    const std::vector<rhi::DescriptorBinding>& bindings)
+{
+    MRE_ASSERT(m_initialized, "VkDevice::CreateDescriptorSetLayout called before VkDevice::Init");
+    return std::make_unique<VkDescriptorSetLayout>(m_device, bindings);
+}
+
+std::unique_ptr<rhi::DescriptorSet> VkDevice::CreateDescriptorSet(const rhi::DescriptorSetLayout& layout)
+{
+    MRE_ASSERT(m_initialized, "VkDevice::CreateDescriptorSet called before VkDevice::Init");
+
+    const auto& vkLayout = static_cast<const VkDescriptorSetLayout&>(layout);
+    return std::make_unique<VkDescriptorSet>(m_device, m_descriptorPool, vkLayout);
+}
+
 std::unique_ptr<rhi::Shader> VkDevice::CreateShader(rhi::ShaderStage stage, const std::string& spirvPath)
 {
     MRE_ASSERT(m_initialized, "VkDevice::CreateShader called before VkDevice::Init");
@@ -356,6 +384,9 @@ bool VkDevice::CreateLogicalDevice()
     queueInfo.queueCount = 1;
     queueInfo.pQueuePriorities = &queuePriority;
 
+    vk::PhysicalDeviceVulkan11Features features11{};
+    features11.shaderDrawParameters = true;
+
     vk::PhysicalDeviceVulkan12Features features12{};
     features12.timelineSemaphore = true;
 
@@ -363,10 +394,11 @@ bool VkDevice::CreateLogicalDevice()
     features13.dynamicRendering = true;
     features13.synchronization2 = true;
 
+    features11.pNext = &features12;
     features12.pNext = &features13;
 
     vk::PhysicalDeviceFeatures2 features2{};
-    features2.pNext = &features12;
+    features2.pNext = &features11;
 
     const std::array<const char*, 1> extensions{vk::KHRSwapchainExtensionName};
 
@@ -408,6 +440,21 @@ bool VkDevice::CreateAllocator()
     }
 
     MRE_INFO("VMA allocator created");
+    return true;
+}
+
+bool VkDevice::CreateDescriptorPool()
+{
+    const std::array<vk::DescriptorPoolSize, 2> poolSizes{
+        vk::DescriptorPoolSize{vk::DescriptorType::eUniformBuffer, 256},
+        vk::DescriptorPoolSize{vk::DescriptorType::eCombinedImageSampler, 256},
+    };
+
+    const vk::DescriptorPoolCreateInfo createInfo = vk::DescriptorPoolCreateInfo{}
+                                                        .setFlags(vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet)
+                                                        .setMaxSets(512)
+                                                        .setPoolSizes(poolSizes);
+    m_descriptorPool = vk::raii::DescriptorPool{m_device, createInfo};
     return true;
 }
 

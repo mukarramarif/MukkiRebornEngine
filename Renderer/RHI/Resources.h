@@ -36,6 +36,13 @@ enum class BufferUsage : std::uint8_t
     Staging,
 };
 
+enum class TextureUsage : std::uint8_t
+{
+    Sampled = 0,
+    ColorAttachment,
+    DepthAttachment,
+};
+
 enum class ShaderStage : std::uint8_t
 {
     Vertex = 0,
@@ -57,6 +64,25 @@ enum class CullMode : std::uint8_t
     None = 0,
     Front,
     Back,
+};
+
+enum class Filter : std::uint8_t
+{
+    Nearest = 0,
+    Linear,
+};
+
+enum class AddressMode : std::uint8_t
+{
+    Repeat = 0,
+    ClampToEdge,
+    MirroredRepeat,
+};
+
+enum class DescriptorType : std::uint8_t
+{
+    UniformBuffer = 0,
+    CombinedImageSampler,
 };
 
 struct Extent2D
@@ -96,6 +122,50 @@ protected:
     Buffer() = default;
 };
 
+struct TextureDesc
+{
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    Format format = Format::Undefined;
+    TextureUsage usage = TextureUsage::Sampled;
+};
+
+class Texture
+{
+public:
+    virtual ~Texture();
+
+    Texture(const Texture&) = delete;
+    Texture& operator=(const Texture&) = delete;
+
+    [[nodiscard]] virtual std::uint32_t GetWidth() const = 0;
+    [[nodiscard]] virtual std::uint32_t GetHeight() const = 0;
+    [[nodiscard]] virtual Format GetFormat() const = 0;
+    [[nodiscard]] virtual TextureUsage GetUsage() const = 0;
+
+protected:
+    Texture() = default;
+};
+
+struct SamplerDesc
+{
+    Filter minFilter = Filter::Linear;
+    Filter magFilter = Filter::Linear;
+    AddressMode addressMode = AddressMode::ClampToEdge;
+};
+
+class Sampler
+{
+public:
+    virtual ~Sampler();
+
+    Sampler(const Sampler&) = delete;
+    Sampler& operator=(const Sampler&) = delete;
+
+protected:
+    Sampler() = default;
+};
+
 class Shader
 {
 public:
@@ -130,6 +200,44 @@ private:
     std::uint32_t m_stride = 0;
 };
 
+struct DescriptorBinding
+{
+    std::uint32_t binding = 0;
+    DescriptorType type = DescriptorType::UniformBuffer;
+    ShaderStageMask stages = ShaderStageMask::VertexFragment;
+};
+
+class DescriptorSetLayout
+{
+public:
+    virtual ~DescriptorSetLayout();
+
+    DescriptorSetLayout(const DescriptorSetLayout&) = delete;
+    DescriptorSetLayout& operator=(const DescriptorSetLayout&) = delete;
+
+protected:
+    DescriptorSetLayout() = default;
+};
+
+class DescriptorSet
+{
+public:
+    virtual ~DescriptorSet();
+
+    DescriptorSet(const DescriptorSet&) = delete;
+    DescriptorSet& operator=(const DescriptorSet&) = delete;
+
+    virtual void BindBuffer(
+        std::uint32_t binding,
+        const Buffer& buffer,
+        std::uint64_t offset = 0,
+        std::uint64_t range = 0) = 0;
+    virtual void BindTexture(std::uint32_t binding, const Texture& texture, const Sampler& sampler) = 0;
+
+protected:
+    DescriptorSet() = default;
+};
+
 struct PipelineDesc
 {
     const Shader* vertexShader = nullptr;
@@ -143,6 +251,7 @@ struct PipelineDesc
     CullMode cullMode = CullMode::Back;
     std::uint32_t pushConstantSize = 0;
     ShaderStageMask pushConstantStages = ShaderStageMask::Vertex;
+    std::vector<const DescriptorSetLayout*> descriptorSetLayouts{};
     std::vector<Format> colorFormats{};
     Format depthFormat = Format::Undefined;
 };

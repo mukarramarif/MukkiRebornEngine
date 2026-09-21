@@ -16,6 +16,9 @@
 #include "Renderer/Vulkan/Core/VkShader.h"
 #include "Renderer/Vulkan/Core/VkSwapchain.h"
 #include "Renderer/Vulkan/Resources/BufferAllocator.h"
+#include "Renderer/Vulkan/Resources/DescriptorSet.h"
+#include "Renderer/Vulkan/Resources/Sampler.h"
+#include "Renderer/Vulkan/Resources/Texture.h"
 
 namespace mukki::vulkan
 {
@@ -39,14 +42,22 @@ public:
 
     [[nodiscard]] rhi::CommandList& GetCommandList() override;
     [[nodiscard]] const rhi::SwapchainInfo& GetSwapchainInfo() const override;
+    [[nodiscard]] std::uint32_t GetFrameIndex() const override { return m_frameIndex; }
+    [[nodiscard]] std::uint32_t GetFramesInFlight() const override { return m_framesInFlight; }
 
     [[nodiscard]] std::unique_ptr<rhi::Buffer> CreateBuffer(
         const rhi::BufferDesc& desc,
         const void* initialData,
         std::uint64_t initialDataSize) override;
+    [[nodiscard]] std::unique_ptr<rhi::Texture> CreateTexture(const rhi::TextureDesc& desc) override;
+    [[nodiscard]] std::unique_ptr<rhi::Sampler> CreateSampler(const rhi::SamplerDesc& desc) override;
     [[nodiscard]] std::unique_ptr<rhi::Shader> CreateShader(rhi::ShaderStage stage, const std::string& spirvPath)
         override;
     [[nodiscard]] std::unique_ptr<rhi::Pipeline> CreatePipeline(const rhi::PipelineDesc& desc) override;
+    [[nodiscard]] std::unique_ptr<rhi::DescriptorSetLayout> CreateDescriptorSetLayout(
+        const std::vector<rhi::DescriptorBinding>& bindings) override;
+    [[nodiscard]] std::unique_ptr<rhi::DescriptorSet> CreateDescriptorSet(const rhi::DescriptorSetLayout& layout)
+        override;
 
     [[nodiscard]] bool IsInitialized() const { return m_initialized; }
     [[nodiscard]] const VkInstance& GetVkInstance() const { return m_instance; }
@@ -60,6 +71,7 @@ private:
     bool PickPhysicalDevice();
     bool CreateLogicalDevice();
     bool CreateAllocator();
+    bool CreateDescriptorPool();
     bool CreateSwapchain();
     bool CreateFrameResources();
     void RecreateSwapchain();
@@ -71,6 +83,7 @@ private:
     vk::raii::Queue m_graphicsQueue{nullptr};
     VmaAllocator m_allocator = VK_NULL_HANDLE;
     VkBufferAllocator m_bufferAllocator{};
+    vk::raii::DescriptorPool m_descriptorPool{nullptr};
     std::unique_ptr<VkSwapchain> m_swapchain{};
     FrameSync m_frameSync{};
     std::vector<std::unique_ptr<VkCommandList>> m_commandLists{};

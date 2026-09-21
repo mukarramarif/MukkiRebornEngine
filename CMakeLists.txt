@@ -51,6 +51,7 @@ function(mre_add_slang_shaders target)
             COMMAND "${MRE_SLANGC_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/${shader}"
                 -target spirv
+                -matrix-layout-column-major
                 -fvk-use-entrypoint-name
                 -o "${spirv}"
             DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${shader}"
@@ -82,6 +83,8 @@ add_library(mukki_engine STATIC
     Core/Engine.cpp
     Core/Time.cpp
     Renderer/BufferManager.cpp
+    Renderer/Deferred/DeferredRenderer.cpp
+    Renderer/Deferred/GBuffer.cpp
     Renderer/RHI/Resources.cpp
     Renderer/Vulkan/Core/FrameSync.cpp
     Renderer/Vulkan/Core/VkCommandList.cpp
@@ -93,6 +96,9 @@ add_library(mukki_engine STATIC
     Renderer/Vulkan/Core/VkSwapchain.cpp
     Renderer/Vulkan/Resources/Buffer.cpp
     Renderer/Vulkan/Resources/BufferAllocator.cpp
+    Renderer/Vulkan/Resources/DescriptorSet.cpp
+    Renderer/Vulkan/Resources/Sampler.cpp
+    Renderer/Vulkan/Resources/Texture.cpp
     Renderer/Vulkan/UiLayer.cpp
     Renderer/Vulkan/VmaImplementation.cpp
     Utilities/Assert.cpp
@@ -125,8 +131,10 @@ if(MRE_BUILD_SANDBOX)
     )
     target_link_libraries(mukki_sandbox PRIVATE mukki::engine)
     mre_add_slang_shaders(mukki_sandbox
-        Renderer/Shaders/triangle.vert.slang
-        Renderer/Shaders/triangle.frag.slang
+        Renderer/Shaders/gbuffer.vert.slang
+        Renderer/Shaders/gbuffer.frag.slang
+        Renderer/Shaders/lighting.vert.slang
+        Renderer/Shaders/lighting.frag.slang
     )
 endif()
 
