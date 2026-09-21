@@ -7,6 +7,13 @@
 static_assert(mukki::kKeyCount == static_cast<std::size_t>(GLFW_KEY_LAST) + 1);
 static_assert(mukki::kMouseButtonCount == static_cast<std::size_t>(GLFW_MOUSE_BUTTON_LAST) + 1);
 
+namespace
+{
+
+mukki::Input* g_activeInput = nullptr;
+
+} // namespace
+
 namespace mukki
 {
 
@@ -24,8 +31,8 @@ bool Input::Init(GLFWwindow* window)
     m_scrollAccumulator = 0.0f;
     m_cursorCaptured = false;
 
-    glfwSetWindowUserPointer(m_window, this);
     glfwSetScrollCallback(m_window, &Input::ScrollCallback);
+    g_activeInput = this;
 
     return true;
 }
@@ -35,7 +42,10 @@ void Input::Shutdown()
     if (m_window != nullptr)
     {
         glfwSetScrollCallback(m_window, nullptr);
-        glfwSetWindowUserPointer(m_window, nullptr);
+        if (g_activeInput == this)
+        {
+            g_activeInput = nullptr;
+        }
         m_window = nullptr;
     }
 
@@ -82,12 +92,12 @@ void Input::SetCursorCaptured(bool captured)
 
 void Input::ScrollCallback(GLFWwindow* window, double xOffset, double yOffset)
 {
+    (void)window;
     (void)xOffset;
 
-    auto* input = static_cast<Input*>(glfwGetWindowUserPointer(window));
-    if (input != nullptr)
+    if (g_activeInput != nullptr)
     {
-        input->m_scrollAccumulator += static_cast<float>(yOffset);
+        g_activeInput->m_scrollAccumulator += static_cast<float>(yOffset);
     }
 }
 

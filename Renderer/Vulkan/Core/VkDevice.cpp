@@ -39,6 +39,8 @@ bool VkDevice::Init(const rhi::DeviceDesc& desc)
         return false;
     }
 
+    m_bufferAllocator.Init(m_device, m_allocator, *m_graphicsQueue, m_graphicsQueueFamily);
+
     m_initialized = true;
     MRE_INFO("Vulkan device initialized");
     return true;
@@ -54,6 +56,7 @@ void VkDevice::Shutdown()
     m_commandLists.clear();
     m_frameSync.Shutdown();
     m_swapchain.reset();
+    m_bufferAllocator.Shutdown();
     if (m_allocator != VK_NULL_HANDLE)
     {
         vmaDestroyAllocator(m_allocator);
@@ -216,6 +219,34 @@ rhi::CommandList& VkDevice::GetCommandList()
 const rhi::SwapchainInfo& VkDevice::GetSwapchainInfo() const
 {
     return m_swapchainInfo;
+}
+
+std::unique_ptr<rhi::Buffer> VkDevice::CreateBuffer(
+    const rhi::BufferDesc& desc,
+    const void* initialData,
+    std::uint64_t initialDataSize)
+{
+    MRE_ASSERT(m_initialized, "VkDevice::CreateBuffer called before VkDevice::Init");
+    return m_bufferAllocator.CreateBuffer(desc, initialData, initialDataSize);
+}
+
+std::unique_ptr<rhi::Shader> VkDevice::CreateShader(rhi::ShaderStage stage, const std::string& spirvPath)
+{
+    MRE_ASSERT(m_initialized, "VkDevice::CreateShader called before VkDevice::Init");
+
+    const std::vector<std::uint32_t> code = VkShader::LoadSpirv(spirvPath);
+    if (code.empty())
+    {
+        return nullptr;
+    }
+
+    return std::make_unique<VkShader>(m_device, stage, code);
+}
+
+std::unique_ptr<rhi::Pipeline> VkDevice::CreatePipeline(const rhi::PipelineDesc& desc)
+{
+    MRE_ASSERT(m_initialized, "VkDevice::CreatePipeline called before VkDevice::Init");
+    return std::make_unique<VkPipeline>(m_device, desc);
 }
 
 bool VkDevice::PickPhysicalDevice()

@@ -42,6 +42,13 @@ public:
     [[nodiscard]] virtual CommandList& GetCommandList() = 0;
     [[nodiscard]] virtual const SwapchainInfo& GetSwapchainInfo() const = 0;
 
+    [[nodiscard]] virtual std::unique_ptr<Buffer> CreateBuffer(
+        const BufferDesc& desc,
+        const void* initialData = nullptr,
+        std::uint64_t initialDataSize = 0) = 0;
+    [[nodiscard]] virtual std::unique_ptr<Shader> CreateShader(ShaderStage stage, const std::string& spirvPath) = 0;
+    [[nodiscard]] virtual std::unique_ptr<Pipeline> CreatePipeline(const PipelineDesc& desc) = 0;
+
 protected:
     Device() = default;
 };

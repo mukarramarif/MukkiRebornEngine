@@ -43,7 +43,8 @@ function(mre_add_slang_shaders target)
     set(spirv_outputs "")
 
     foreach(shader IN LISTS ARGN)
-        get_filename_component(shader_name "${shader}" NAME_WE)
+        get_filename_component(shader_file_name "${shader}" NAME)
+        string(REGEX REPLACE "\\.slang$" "" shader_name "${shader_file_name}")
         set(spirv "${output_dir}/${shader_name}.spv")
         add_custom_command(
             OUTPUT "${spirv}"
@@ -62,6 +63,13 @@ function(mre_add_slang_shaders target)
     add_custom_target(${target}_shaders DEPENDS ${spirv_outputs})
     add_dependencies(${target} ${target}_shaders)
     set_target_properties(${target} PROPERTIES MRE_SHADER_OUTPUT_DIRECTORY "${output_dir}")
+
+    add_custom_command(
+        TARGET ${target} POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" -E copy_directory "${output_dir}" "$<TARGET_FILE_DIR:${target}>/shaders"
+        COMMENT "Copying compiled shaders next to ${target}"
+        VERBATIM
+    )
 endfunction()
 
 add_library(mukki_engine STATIC
@@ -69,15 +77,23 @@ add_library(mukki_engine STATIC
     Application/Camera.cpp
     Application/Input.cpp
     Application/Keybinds.cpp
+    Application/UI/UiStyles.cpp
     Application/Window.cpp
     Core/Engine.cpp
     Core/Time.cpp
+    Renderer/BufferManager.cpp
+    Renderer/RHI/Resources.cpp
     Renderer/Vulkan/Core/FrameSync.cpp
     Renderer/Vulkan/Core/VkCommandList.cpp
     Renderer/Vulkan/Core/VkConversions.cpp
     Renderer/Vulkan/Core/VkDevice.cpp
     Renderer/Vulkan/Core/VkInstance.cpp
+    Renderer/Vulkan/Core/VkPipeline.cpp
+    Renderer/Vulkan/Core/VkShader.cpp
     Renderer/Vulkan/Core/VkSwapchain.cpp
+    Renderer/Vulkan/Resources/Buffer.cpp
+    Renderer/Vulkan/Resources/BufferAllocator.cpp
+    Renderer/Vulkan/UiLayer.cpp
     Renderer/Vulkan/VmaImplementation.cpp
     Utilities/Assert.cpp
     Utilities/Log.cpp
@@ -108,6 +124,10 @@ if(MRE_BUILD_SANDBOX)
         Sandbox/main.cpp
     )
     target_link_libraries(mukki_sandbox PRIVATE mukki::engine)
+    mre_add_slang_shaders(mukki_sandbox
+        Renderer/Shaders/triangle.vert.slang
+        Renderer/Shaders/triangle.frag.slang
+    )
 endif()
 
 if(MRE_BUILD_TESTS)

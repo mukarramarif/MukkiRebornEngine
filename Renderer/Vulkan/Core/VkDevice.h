@@ -12,7 +12,10 @@
 #include "Renderer/Vulkan/Core/FrameSync.h"
 #include "Renderer/Vulkan/Core/VkCommandList.h"
 #include "Renderer/Vulkan/Core/VkInstance.h"
+#include "Renderer/Vulkan/Core/VkPipeline.h"
+#include "Renderer/Vulkan/Core/VkShader.h"
 #include "Renderer/Vulkan/Core/VkSwapchain.h"
+#include "Renderer/Vulkan/Resources/BufferAllocator.h"
 
 namespace mukki::vulkan
 {
@@ -37,6 +40,14 @@ public:
     [[nodiscard]] rhi::CommandList& GetCommandList() override;
     [[nodiscard]] const rhi::SwapchainInfo& GetSwapchainInfo() const override;
 
+    [[nodiscard]] std::unique_ptr<rhi::Buffer> CreateBuffer(
+        const rhi::BufferDesc& desc,
+        const void* initialData,
+        std::uint64_t initialDataSize) override;
+    [[nodiscard]] std::unique_ptr<rhi::Shader> CreateShader(rhi::ShaderStage stage, const std::string& spirvPath)
+        override;
+    [[nodiscard]] std::unique_ptr<rhi::Pipeline> CreatePipeline(const rhi::PipelineDesc& desc) override;
+
     [[nodiscard]] bool IsInitialized() const { return m_initialized; }
     [[nodiscard]] const VkInstance& GetVkInstance() const { return m_instance; }
     [[nodiscard]] const vk::raii::PhysicalDevice& GetPhysicalDevice() const { return m_physicalDevice; }
@@ -59,6 +70,7 @@ private:
     vk::raii::Device m_device{nullptr};
     vk::raii::Queue m_graphicsQueue{nullptr};
     VmaAllocator m_allocator = VK_NULL_HANDLE;
+    VkBufferAllocator m_bufferAllocator{};
     std::unique_ptr<VkSwapchain> m_swapchain{};
     FrameSync m_frameSync{};
     std::vector<std::unique_ptr<VkCommandList>> m_commandLists{};
