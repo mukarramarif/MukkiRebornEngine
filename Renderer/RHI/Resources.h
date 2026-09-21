@@ -128,6 +128,8 @@ struct TextureDesc
     std::uint32_t height = 0;
     Format format = Format::Undefined;
     TextureUsage usage = TextureUsage::Sampled;
+    const void* initialData = nullptr;
+    std::uint64_t initialDataSize = 0;
 };
 
 class Texture

@@ -11,7 +11,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 if(MSVC)
-    add_compile_options(/W4 /permissive- /utf-8 /Zc:preprocessor)
+    add_compile_options(/W4 /permissive- /utf-8 /Zc:preprocessor /FS)
 else()
     add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
@@ -24,6 +24,9 @@ find_package(glfw3 CONFIG REQUIRED)
 find_package(glm CONFIG REQUIRED)
 find_package(VulkanMemoryAllocator CONFIG REQUIRED)
 find_package(imgui CONFIG REQUIRED)
+
+find_path(MRE_TINYGLTF_INCLUDE_DIR NAMES tiny_gltf.h REQUIRED)
+find_path(MRE_STB_INCLUDE_DIR NAMES stb_image.h REQUIRED)
 
 find_program(MRE_SLANGC_EXECUTABLE
     NAMES slangc
@@ -80,6 +83,7 @@ add_library(mukki_engine STATIC
     Application/Keybinds.cpp
     Application/UI/UiStyles.cpp
     Application/Window.cpp
+    Assets/GltfLoader.cpp
     Core/Engine.cpp
     Core/Time.cpp
     Renderer/BufferManager.cpp
@@ -95,22 +99,28 @@ add_library(mukki_engine STATIC
     Renderer/Vulkan/Core/VkShader.cpp
     Renderer/Vulkan/Core/VkSwapchain.cpp
     Renderer/Vulkan/Resources/Buffer.cpp
-    Renderer/Vulkan/Resources/BufferAllocator.cpp
     Renderer/Vulkan/Resources/DescriptorSet.cpp
+    Renderer/Vulkan/Resources/ResourceAllocator.cpp
     Renderer/Vulkan/Resources/Sampler.cpp
     Renderer/Vulkan/Resources/Texture.cpp
     Renderer/Vulkan/UiLayer.cpp
     Renderer/Vulkan/VmaImplementation.cpp
     Utilities/Assert.cpp
     Utilities/Log.cpp
+    Utilities/PathUtils.cpp
 )
 add_library(mukki::engine ALIAS mukki_engine)
 
 target_include_directories(mukki_engine PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+target_include_directories(mukki_engine SYSTEM PRIVATE
+    "${MRE_TINYGLTF_INCLUDE_DIR}"
+    "${MRE_STB_INCLUDE_DIR}"
+)
 target_compile_definitions(mukki_engine PUBLIC
     MRE_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
     MRE_VERSION_MINOR=${PROJECT_VERSION_MINOR}
     MRE_VERSION_PATCH=${PROJECT_VERSION_PATCH}
+    GLM_FORCE_DEPTH_ZERO_TO_ONE
 )
 target_compile_definitions(mukki_engine PRIVATE
     VMA_STATIC_VULKAN_FUNCTIONS=1
@@ -130,6 +140,14 @@ if(MRE_BUILD_SANDBOX)
         Sandbox/main.cpp
     )
     target_link_libraries(mukki_sandbox PRIVATE mukki::engine)
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/glTF-Sample-Models/2.0")
+        target_compile_definitions(mukki_sandbox PRIVATE
+            MRE_SAMPLE_MODELS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/glTF-Sample-Models/2.0")
+    else()
+        message(STATUS "glTF sample models submodule not found, sandbox model browser disabled")
+    endif()
+
     mre_add_slang_shaders(mukki_sandbox
         Renderer/Shaders/gbuffer.vert.slang
         Renderer/Shaders/gbuffer.frag.slang

@@ -1,11 +1,15 @@
 #include "Renderer/Deferred/DeferredRenderer.h"
 
+#include "Assets/GltfLoader.h"
 #include "Renderer/RHI/Device.h"
 #include "Utilities/Assert.h"
 #include "Utilities/Log.h"
+#include "Utilities/PathUtils.h"
 
 #include <algorithm>
 #include <cstddef>
+#include <iterator>
+#include <string>
 
 #include <glm/ext/matrix_transform.hpp>
 #include <glm/geometric.hpp>
@@ -19,52 +23,19 @@ struct Vertex
 {
     glm::vec3 position{0.0f};
     glm::vec3 normal{0.0f};
-};
-
-constexpr Vertex kCubeVertices[] = {
-    {{0.5f, -0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}},
-    {{0.5f, 0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}},
-    {{0.5f, 0.5f, 0.5f}, {1.0f, 0.0f, 0.0f}},
-    {{0.5f, -0.5f, 0.5f}, {1.0f, 0.0f, 0.0f}},
-    {{-0.5f, -0.5f, 0.5f}, {-1.0f, 0.0f, 0.0f}},
-    {{-0.5f, 0.5f, 0.5f}, {-1.0f, 0.0f, 0.0f}},
-    {{-0.5f, 0.5f, -0.5f}, {-1.0f, 0.0f, 0.0f}},
-    {{-0.5f, -0.5f, -0.5f}, {-1.0f, 0.0f, 0.0f}},
-    {{-0.5f, 0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}},
-    {{-0.5f, 0.5f, 0.5f}, {0.0f, 1.0f, 0.0f}},
-    {{0.5f, 0.5f, 0.5f}, {0.0f, 1.0f, 0.0f}},
-    {{0.5f, 0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}},
-    {{-0.5f, -0.5f, 0.5f}, {0.0f, -1.0f, 0.0f}},
-    {{-0.5f, -0.5f, -0.5f}, {0.0f, -1.0f, 0.0f}},
-    {{0.5f, -0.5f, -0.5f}, {0.0f, -1.0f, 0.0f}},
-    {{0.5f, -0.5f, 0.5f}, {0.0f, -1.0f, 0.0f}},
-    {{-0.5f, -0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}},
-    {{0.5f, -0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}},
-    {{0.5f, 0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}},
-    {{-0.5f, 0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}},
-    {{0.5f, -0.5f, -0.5f}, {0.0f, 0.0f, -1.0f}},
-    {{-0.5f, -0.5f, -0.5f}, {0.0f, 0.0f, -1.0f}},
-    {{-0.5f, 0.5f, -0.5f}, {0.0f, 0.0f, -1.0f}},
-    {{0.5f, 0.5f, -0.5f}, {0.0f, 0.0f, -1.0f}},
-};
-
-constexpr std::uint32_t kCubeIndices[] = {
-    0,  1,  2,  0,  2,  3,
-    4,  5,  6,  4,  6,  7,
-    8,  9,  10, 8,  10, 11,
-    12, 13, 14, 12, 14, 15,
-    16, 17, 18, 16, 18, 19,
-    20, 21, 22, 20, 22, 23,
+    glm::vec2 uv{0.0f};
 };
 
 constexpr Vertex kPlaneVertices[] = {
-    {{-10.0f, 0.0f, -10.0f}, {0.0f, 1.0f, 0.0f}},
-    {{10.0f, 0.0f, -10.0f}, {0.0f, 1.0f, 0.0f}},
-    {{10.0f, 0.0f, 10.0f}, {0.0f, 1.0f, 0.0f}},
-    {{-10.0f, 0.0f, 10.0f}, {0.0f, 1.0f, 0.0f}},
+    {{-10.0f, 0.0f, -10.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f}},
+    {{10.0f, 0.0f, -10.0f}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f}},
+    {{10.0f, 0.0f, 10.0f}, {0.0f, 1.0f, 0.0f}, {1.0f, 1.0f}},
+    {{-10.0f, 0.0f, 10.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 1.0f}},
 };
 
 constexpr std::uint32_t kPlaneIndices[] = {0, 1, 2, 0, 2, 3};
+
+constexpr std::uint32_t kWhitePixel = 0xFFFFFFFFu;
 
 } // namespace
 
@@ -84,8 +55,27 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
     m_bufferManager = std::make_unique<BufferManager>(device);
     m_gbufferSampler = device.CreateSampler(rhi::SamplerDesc{});
 
+    const rhi::TextureDesc whiteTextureDesc{
+        1,
+        1,
+        rhi::Format::R8G8B8A8Unorm,
+        rhi::TextureUsage::Sampled,
+        &kWhitePixel,
+        sizeof(kWhitePixel)};
+    m_whiteTexture = device.CreateTexture(whiteTextureDesc);
+    if (m_whiteTexture == nullptr)
+    {
+        MRE_CRITICAL("Failed to create the default white texture");
+        Shutdown();
+        return false;
+    }
+
     const std::vector<rhi::DescriptorBinding> sceneBindings{
         rhi::DescriptorBinding{0, rhi::DescriptorType::UniformBuffer, rhi::ShaderStageMask::VertexFragment},
+    };
+    const std::vector<rhi::DescriptorBinding> materialBindings{
+        rhi::DescriptorBinding{0, rhi::DescriptorType::CombinedImageSampler, rhi::ShaderStageMask::Fragment},
+        rhi::DescriptorBinding{1, rhi::DescriptorType::CombinedImageSampler, rhi::ShaderStageMask::Fragment},
     };
     const std::vector<rhi::DescriptorBinding> lightingBindings{
         rhi::DescriptorBinding{0, rhi::DescriptorType::UniformBuffer, rhi::ShaderStageMask::VertexFragment},
@@ -94,7 +84,12 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
         rhi::DescriptorBinding{3, rhi::DescriptorType::CombinedImageSampler, rhi::ShaderStageMask::Fragment},
     };
     m_sceneSetLayout = device.CreateDescriptorSetLayout(sceneBindings);
+    m_materialSetLayout = device.CreateDescriptorSetLayout(materialBindings);
     m_lightingSetLayout = device.CreateDescriptorSetLayout(lightingBindings);
+
+    m_defaultMaterialSet = device.CreateDescriptorSet(*m_materialSetLayout);
+    m_defaultMaterialSet->BindTexture(0, *m_whiteTexture, *m_gbufferSampler);
+    m_defaultMaterialSet->BindTexture(1, *m_whiteTexture, *m_gbufferSampler);
 
     const std::uint32_t framesInFlight = device.GetFramesInFlight();
     m_uniformBuffers.reserve(framesInFlight);
@@ -128,22 +123,26 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
 
 void DeferredRenderer::Shutdown()
 {
+    UnloadModel();
+
     m_lightingSets.clear();
     m_sceneSets.clear();
+    m_materials.clear();
+    m_defaultMaterialSet.reset();
     m_lightingPipeline.reset();
     m_gbufferPipeline.reset();
     m_lightingFragmentShader.reset();
     m_lightingVertexShader.reset();
     m_gbufferFragmentShader.reset();
     m_gbufferVertexShader.reset();
-    m_drawItems.clear();
+    m_sceneDrawItems.clear();
     m_lightingSetLayout.reset();
+    m_materialSetLayout.reset();
     m_sceneSetLayout.reset();
+    m_whiteTexture.reset();
     m_gbufferSampler.reset();
     m_planeIndexBuffer = nullptr;
     m_planeVertexBuffer = nullptr;
-    m_cubeIndexBuffer = nullptr;
-    m_cubeVertexBuffer = nullptr;
     m_uniformBuffers.clear();
     m_bufferManager.reset();
     m_gbuffer.Shutdown();
@@ -177,6 +176,168 @@ void DeferredRenderer::Resize(std::uint32_t width, std::uint32_t height)
     }
 }
 
+bool DeferredRenderer::LoadModel(const std::filesystem::path& path)
+{
+    MRE_ASSERT(m_initialized, "DeferredRenderer::LoadModel called before DeferredRenderer::Init");
+    MRE_ASSERT(m_device != nullptr, "DeferredRenderer requires a device");
+
+    GltfModel model{};
+    if (!LoadGltfModel(path, model))
+    {
+        return false;
+    }
+
+    m_device->WaitIdle();
+    UnloadModel();
+
+    const glm::vec3 center = (model.minBounds + model.maxBounds) * 0.5f;
+    const glm::vec3 extent = model.maxBounds - model.minBounds;
+    const float maxExtent = std::max({extent.x, extent.y, extent.z});
+    const float scale = maxExtent > 0.0f ? 2.5f / maxExtent : 1.0f;
+    const float lift = (center.y - model.minBounds.y) * scale;
+
+    const glm::mat4 fit = glm::translate(glm::mat4{1.0f}, glm::vec3{0.0f, lift, 0.0f}) *
+                          glm::scale(glm::mat4{1.0f}, glm::vec3{scale}) *
+                          glm::translate(glm::mat4{1.0f}, -center);
+
+    const auto createTextureFromImage = [this, &model](int imageIndex, rhi::Format format) {
+        std::unique_ptr<rhi::Texture> texture{};
+        if (imageIndex < 0 || imageIndex >= static_cast<int>(model.images.size()))
+        {
+            return texture;
+        }
+
+        const GltfImage& image = model.images[static_cast<std::size_t>(imageIndex)];
+        if (image.width == 0 || image.height == 0 || image.pixels.empty())
+        {
+            return texture;
+        }
+
+        const rhi::TextureDesc textureDesc{
+            image.width,
+            image.height,
+            format,
+            rhi::TextureUsage::Sampled,
+            image.pixels.data(),
+            image.pixels.size()};
+        return m_device->CreateTexture(textureDesc);
+    };
+
+    m_materials.reserve(model.materials.size());
+    for (const GltfMaterial& source : model.materials)
+    {
+        Material material{};
+        material.baseColorTexture = createTextureFromImage(source.baseColorImage, rhi::Format::R8G8B8A8Srgb);
+        material.metallicRoughnessTexture =
+            createTextureFromImage(source.metallicRoughnessImage, rhi::Format::R8G8B8A8Unorm);
+
+        material.descriptorSet = m_device->CreateDescriptorSet(*m_materialSetLayout);
+        material.descriptorSet->BindTexture(
+            0,
+            material.baseColorTexture != nullptr ? *material.baseColorTexture : *m_whiteTexture,
+            *m_gbufferSampler);
+        material.descriptorSet->BindTexture(
+            1,
+            material.metallicRoughnessTexture != nullptr ? *material.metallicRoughnessTexture : *m_whiteTexture,
+            *m_gbufferSampler);
+
+        m_materials.push_back(std::move(material));
+    }
+
+    m_modelVertexBuffers.reserve(model.primitives.size());
+    m_modelIndexBuffers.reserve(model.primitives.size());
+    for (const GltfPrimitive& primitive : model.primitives)
+    {
+        const std::uint64_t vertexBytes = sizeof(GltfVertex) * primitive.vertices.size();
+        const std::uint64_t indexBytes = sizeof(std::uint32_t) * primitive.indices.size();
+
+        m_modelVertexBuffers.push_back(m_device->CreateBuffer(
+            rhi::BufferDesc{vertexBytes, rhi::BufferUsage::Vertex, false},
+            primitive.vertices.data(),
+            vertexBytes));
+        m_modelIndexBuffers.push_back(m_device->CreateBuffer(
+            rhi::BufferDesc{indexBytes, rhi::BufferUsage::Index, false},
+            primitive.indices.data(),
+            indexBytes));
+    }
+
+    for (const GltfNode& node : model.nodes)
+    {
+        if (node.meshIndex < 0 || node.meshIndex >= static_cast<int>(model.meshPrimitives.size()))
+        {
+            continue;
+        }
+
+        for (const std::uint32_t primitiveIndex : model.meshPrimitives[static_cast<std::size_t>(node.meshIndex)])
+        {
+            const GltfPrimitive& primitive = model.primitives[primitiveIndex];
+
+            DrawItem item{};
+            item.vertexBuffer = m_modelVertexBuffers[primitiveIndex].get();
+            item.indexBuffer = m_modelIndexBuffers[primitiveIndex].get();
+            item.indexCount = static_cast<std::uint32_t>(primitive.indices.size());
+            item.firstIndex = 0;
+            item.pushConstants.model = fit * node.worldTransform;
+
+            if (primitive.materialIndex >= 0 &&
+                primitive.materialIndex < static_cast<int>(m_materials.size()))
+            {
+                const GltfMaterial& material = model.materials[static_cast<std::size_t>(primitive.materialIndex)];
+                item.pushConstants.baseColorFactor = material.baseColorFactor;
+                item.pushConstants.params = glm::vec4{
+                    material.roughnessFactor,
+                    material.metallicFactor,
+                    0.0f,
+                    0.0f};
+                item.materialSet = m_materials[static_cast<std::size_t>(primitive.materialIndex)].descriptorSet.get();
+            }
+            else
+            {
+                item.pushConstants.baseColorFactor = glm::vec4{0.8f, 0.8f, 0.8f, 1.0f};
+                item.pushConstants.params = glm::vec4{0.6f, 0.0f, 0.0f, 0.0f};
+                item.materialSet = m_defaultMaterialSet.get();
+            }
+
+            m_modelDrawItems.push_back(item);
+        }
+    }
+
+    m_modelName = PathToUtf8(path.filename());
+    m_modelVertexCount = model.vertexCount;
+    m_modelTriangleCount = model.triangleCount;
+
+    std::size_t textureCount = 0;
+    for (const Material& material : m_materials)
+    {
+        if (material.baseColorTexture != nullptr)
+        {
+            ++textureCount;
+        }
+        if (material.metallicRoughnessTexture != nullptr)
+        {
+            ++textureCount;
+        }
+    }
+
+    MRE_INFO(
+        "Model '{}' uploaded ({} draw items, {} textures)",
+        m_modelName,
+        m_modelDrawItems.size(),
+        textureCount);
+    return true;
+}
+
+void DeferredRenderer::UnloadModel()
+{
+    m_modelDrawItems.clear();
+    m_modelVertexBuffers.clear();
+    m_modelIndexBuffers.clear();
+    m_materials.clear();
+    m_modelName.clear();
+    m_modelVertexCount = 0;
+    m_modelTriangleCount = 0;
+}
+
 void DeferredRenderer::Render(
     rhi::CommandList& commandList,
     const glm::mat4& viewProjection,
@@ -198,19 +359,28 @@ void DeferredRenderer::Render(
     };
     gbufferDesc.depthAttachment = rhi::DepthAttachment{&m_gbuffer.GetDepth(), 1.0f, true};
 
+    const auto drawItems = [&commandList, frameIndex](const std::vector<DrawItem>& items) {
+        for (const DrawItem& item : items)
+        {
+            commandList.BindVertexBuffer(*item.vertexBuffer);
+            commandList.BindIndexBuffer(*item.indexBuffer);
+            if (item.materialSet != nullptr)
+            {
+                commandList.BindDescriptorSet(1, *item.materialSet);
+            }
+            commandList.SetPushConstants(
+                &item.pushConstants,
+                sizeof(ObjectPushConstants),
+                rhi::ShaderStageMask::VertexFragment);
+            commandList.DrawIndexed(item.indexCount, item.firstIndex);
+        }
+    };
+
     commandList.BeginRendering(gbufferDesc);
     commandList.BindPipeline(*m_gbufferPipeline);
     commandList.BindDescriptorSet(0, *m_sceneSets[frameIndex]);
-    for (const DrawItem& item : m_drawItems)
-    {
-        commandList.BindVertexBuffer(*item.vertexBuffer);
-        commandList.BindIndexBuffer(*item.indexBuffer);
-        commandList.SetPushConstants(
-            &item.pushConstants,
-            sizeof(ObjectPushConstants),
-            rhi::ShaderStageMask::VertexFragment);
-        commandList.DrawIndexed(item.indexCount, item.firstIndex);
-    }
+    drawItems(m_sceneDrawItems);
+    drawItems(m_modelDrawItems);
     commandList.EndRendering();
 
     if (m_lightingSetsDirty)
@@ -230,27 +400,28 @@ bool DeferredRenderer::CreatePipelines(rhi::Device& device, const std::filesyste
 {
     m_gbufferVertexShader = device.CreateShader(
         rhi::ShaderStage::Vertex,
-        (shaderDirectory / "gbuffer.vert.spv").string());
+        shaderDirectory / "gbuffer.vert.spv");
     m_gbufferFragmentShader = device.CreateShader(
         rhi::ShaderStage::Fragment,
-        (shaderDirectory / "gbuffer.frag.spv").string());
+        shaderDirectory / "gbuffer.frag.spv");
     m_lightingVertexShader = device.CreateShader(
         rhi::ShaderStage::Vertex,
-        (shaderDirectory / "lighting.vert.spv").string());
+        shaderDirectory / "lighting.vert.spv");
     m_lightingFragmentShader = device.CreateShader(
         rhi::ShaderStage::Fragment,
-        (shaderDirectory / "lighting.frag.spv").string());
+        shaderDirectory / "lighting.frag.spv");
 
     if (m_gbufferVertexShader == nullptr || m_gbufferFragmentShader == nullptr ||
         m_lightingVertexShader == nullptr || m_lightingFragmentShader == nullptr)
     {
-        MRE_CRITICAL("Failed to load the deferred shaders from '{}'", shaderDirectory.string());
+        MRE_CRITICAL("Failed to load the deferred shaders from '{}'", PathToUtf8(shaderDirectory));
         return false;
     }
 
     rhi::VertexLayout vertexLayout{};
     vertexLayout.AddAttribute(0, rhi::Format::R32G32B32Sfloat);
     vertexLayout.AddAttribute(1, rhi::Format::R32G32B32Sfloat);
+    vertexLayout.AddAttribute(2, rhi::Format::R32G32Sfloat);
 
     rhi::PipelineDesc gbufferPipelineDesc{};
     gbufferPipelineDesc.vertexShader = m_gbufferVertexShader.get();
@@ -262,7 +433,7 @@ bool DeferredRenderer::CreatePipelines(rhi::Device& device, const std::filesyste
     gbufferPipelineDesc.cullMode = rhi::CullMode::None;
     gbufferPipelineDesc.pushConstantSize = sizeof(ObjectPushConstants);
     gbufferPipelineDesc.pushConstantStages = rhi::ShaderStageMask::VertexFragment;
-    gbufferPipelineDesc.descriptorSetLayouts = {m_sceneSetLayout.get()};
+    gbufferPipelineDesc.descriptorSetLayouts = {m_sceneSetLayout.get(), m_materialSetLayout.get()};
     gbufferPipelineDesc.colorFormats = {
         rhi::Format::R8G8B8A8Unorm,
         rhi::Format::R8G8B8A8Unorm,
@@ -288,74 +459,21 @@ bool DeferredRenderer::CreateScene()
 {
     MRE_ASSERT(m_bufferManager != nullptr, "DeferredRenderer requires a buffer manager");
 
-    m_cubeVertexBuffer = &m_bufferManager->CreateVertexBuffer(kCubeVertices, sizeof(kCubeVertices));
-    m_cubeIndexBuffer = &m_bufferManager->CreateIndexBuffer(kCubeIndices, sizeof(kCubeIndices));
     m_planeVertexBuffer = &m_bufferManager->CreateVertexBuffer(kPlaneVertices, sizeof(kPlaneVertices));
     m_planeIndexBuffer = &m_bufferManager->CreateIndexBuffer(kPlaneIndices, sizeof(kPlaneIndices));
 
-    const auto makeItem = [](rhi::Buffer* vertexBuffer,
-                             rhi::Buffer* indexBuffer,
-                             std::uint32_t indexCount,
-                             const glm::vec3& position,
-                             const glm::vec4& albedo,
-                             float roughness,
-                             float metalness) {
-        DrawItem item{};
-        item.vertexBuffer = vertexBuffer;
-        item.indexBuffer = indexBuffer;
-        item.indexCount = indexCount;
-        item.firstIndex = 0;
-        item.pushConstants.model = glm::translate(glm::mat4{1.0f}, position);
-        item.pushConstants.albedo = albedo;
-        item.pushConstants.params = glm::vec4{roughness, metalness, 0.0f, 0.0f};
-        return item;
-    };
+    DrawItem ground{};
+    ground.vertexBuffer = m_planeVertexBuffer;
+    ground.indexBuffer = m_planeIndexBuffer;
+    ground.indexCount = static_cast<std::uint32_t>(std::size(kPlaneIndices));
+    ground.firstIndex = 0;
+    ground.materialSet = m_defaultMaterialSet.get();
+    ground.pushConstants.model = glm::mat4{1.0f};
+    ground.pushConstants.baseColorFactor = glm::vec4{0.35f, 0.35f, 0.38f, 1.0f};
+    ground.pushConstants.params = glm::vec4{0.9f, 0.0f, 0.0f, 0.0f};
+    m_sceneDrawItems.push_back(ground);
 
-    constexpr std::uint32_t cubeIndexCount = static_cast<std::uint32_t>(std::size(kCubeIndices));
-    constexpr std::uint32_t planeIndexCount = static_cast<std::uint32_t>(std::size(kPlaneIndices));
-
-    m_drawItems.push_back(makeItem(
-        m_planeVertexBuffer,
-        m_planeIndexBuffer,
-        planeIndexCount,
-        glm::vec3{0.0f, 0.0f, 0.0f},
-        glm::vec4{0.35f, 0.35f, 0.38f, 1.0f},
-        0.9f,
-        0.0f));
-    m_drawItems.push_back(makeItem(
-        m_cubeVertexBuffer,
-        m_cubeIndexBuffer,
-        cubeIndexCount,
-        glm::vec3{-2.5f, 0.5f, 0.0f},
-        glm::vec4{0.85f, 0.25f, 0.25f, 1.0f},
-        0.35f,
-        0.0f));
-    m_drawItems.push_back(makeItem(
-        m_cubeVertexBuffer,
-        m_cubeIndexBuffer,
-        cubeIndexCount,
-        glm::vec3{0.0f, 0.5f, -2.5f},
-        glm::vec4{0.25f, 0.8f, 0.35f, 1.0f},
-        0.6f,
-        0.0f));
-    m_drawItems.push_back(makeItem(
-        m_cubeVertexBuffer,
-        m_cubeIndexBuffer,
-        cubeIndexCount,
-        glm::vec3{2.5f, 0.5f, 0.5f},
-        glm::vec4{0.3f, 0.45f, 0.9f, 1.0f},
-        0.25f,
-        1.0f));
-    m_drawItems.push_back(makeItem(
-        m_cubeVertexBuffer,
-        m_cubeIndexBuffer,
-        cubeIndexCount,
-        glm::vec3{0.0f, 0.5f, 2.5f},
-        glm::vec4{0.9f, 0.8f, 0.3f, 1.0f},
-        0.5f,
-        0.5f));
-
-    MRE_ASSERT(m_cubeVertexBuffer != nullptr, "Failed to create the cube vertex buffer");
+    MRE_ASSERT(m_planeVertexBuffer != nullptr, "Failed to create the ground plane vertex buffer");
     return true;
 }
 

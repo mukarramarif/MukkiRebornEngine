@@ -9,14 +9,18 @@
 #include "Renderer/Vulkan/Core/VkDevice.h"
 #include "Renderer/Vulkan/UiLayer.h"
 #include "Utilities/Log.h"
+#include "Utilities/PathUtils.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <filesystem>
 #include <memory>
+#include <string>
 #include <utility>
+#include <vector>
 
 #include <GLFW/glfw3.h>
 #include <glm/vec3.hpp>
@@ -39,9 +43,10 @@ void DrawTexturePreview(const char* label, ImTextureID textureId, float width, f
 class SandboxApp final : public mukki::Application
 {
 public:
-    SandboxApp(int maxFrames, std::filesystem::path shaderDirectory)
+    SandboxApp(int maxFrames, std::filesystem::path shaderDirectory, std::filesystem::path requestedModel)
         : m_maxFrames(maxFrames)
         , m_shaderDirectory(std::move(shaderDirectory))
+        , m_requestedModel(std::move(requestedModel))
     {
     }
 
@@ -56,12 +61,13 @@ protected:
         keybinds.Bind("camera.up", mukki::Binding::Key(GLFW_KEY_E));
         keybinds.Bind("camera.down", mukki::Binding::Key(GLFW_KEY_Q));
         keybinds.Bind("camera.fast", mukki::Binding::Key(GLFW_KEY_LEFT_SHIFT));
-        keybinds.Bind("camera.look", mukki::Binding::Mouse(GLFW_MOUSE_BUTTON_RIGHT));
+        keybinds.Bind("camera.freeCursor", mukki::Binding::Key(GLFW_KEY_LEFT_ALT));
+        keybinds.Bind("camera.toggleCursor", mukki::Binding::Key(GLFW_KEY_TAB));
         keybinds.Bind("app.quit", mukki::Binding::Key(GLFW_KEY_ESCAPE));
 
         m_camera.SetPerspective(1.0471975512f, GetWindow().GetAspectRatio(), 0.1f, 1000.0f);
-        m_camera.SetPosition(glm::vec3{6.0f, 3.0f, 7.0f});
-        m_camera.SetRotation(-0.7f, -0.25f);
+        m_camera.SetPosition(glm::vec3{4.0f, 2.5f, 5.0f});
+        m_camera.SetRotation(-0.65f, -0.3f);
 
         mukki::rhi::DeviceDesc deviceDesc{};
         deviceDesc.nativeWindowHandle = GetWindow().GetHandle();
@@ -93,6 +99,17 @@ protected:
         {
             MRE_CRITICAL("Failed to initialize the ImGui layer");
             RequestExit();
+            return;
+        }
+
+        ScanSampleModels();
+        if (!m_requestedModel.empty())
+        {
+            m_pendingModelPath = m_requestedModel;
+        }
+        else
+        {
+            LoadModelByIndex(m_selectedModel);
         }
     }
 
@@ -113,10 +130,16 @@ protected:
             return;
         }
 
-        const bool lookHeld = keybinds.IsActionDown("camera.look");
-        if (input.IsCursorCaptured() != lookHeld)
+        if (keybinds.IsActionPressed("camera.toggleCursor"))
         {
-            GetInput().SetCursorCaptured(lookHeld);
+            m_cursorReleased = !m_cursorReleased;
+        }
+
+        const bool freeCursor = m_cursorReleased || keybinds.IsActionDown("camera.freeCursor");
+        const bool lookEnabled = !freeCursor;
+        if (input.IsCursorCaptured() != lookEnabled)
+        {
+            GetInput().SetCursorCaptured(lookEnabled);
         }
 
         mukki::CameraInput cameraInput{};
@@ -125,7 +148,7 @@ protected:
         cameraInput.vertical = keybinds.GetAxis("camera.down", "camera.up");
         cameraInput.look = input.GetState().mouseDelta;
         cameraInput.fast = keybinds.IsActionDown("camera.fast");
-        cameraInput.lookEnabled = lookHeld;
+        cameraInput.lookEnabled = lookEnabled;
 
         m_controller.Update(m_camera, cameraInput, deltaTime);
         m_frameTimeMs = deltaTime * 1000.0f;
@@ -174,35 +197,19 @@ protected:
         commandList.Begin();
 
         m_ui.BeginFrame();
-        ImGui::Begin("Mukki Sandbox");
-        ImGui::Text("Frame time: %.2f ms", static_cast<double>(m_frameTimeMs));
-        ImGui::Text(
-            "Camera: %.2f, %.2f, %.2f",
-            static_cast<double>(m_camera.GetPosition().x),
-            static_cast<double>(m_camera.GetPosition().y),
-            static_cast<double>(m_camera.GetPosition().z));
-        ImGui::Checkbox("Show G-buffer", &m_showGBuffer);
-        ImGui::Checkbox("Show demo window", &m_showDemoWindow);
-        ImGui::End();
-
-        if (m_showGBuffer)
-        {
-            ImGui::Begin("G-buffer", &m_showGBuffer);
-
-            const float previewWidth = ImGui::GetContentRegionAvail().x;
-            const float width = static_cast<float>(m_renderer->GetAlbedoTexture().GetWidth());
-            const float height = static_cast<float>(m_renderer->GetAlbedoTexture().GetHeight());
-            const float aspect = height > 0.0f ? width / height : 1.0f;
-
-            DrawTexturePreview("Albedo (metalness in A)", m_albedoTextureId, previewWidth, aspect);
-            DrawTexturePreview("Normal (roughness in A)", m_normalTextureId, previewWidth, aspect);
-            DrawTexturePreview("Position", m_positionTextureId, previewWidth, aspect);
-            ImGui::End();
-        }
-
+        DrawStatsWindow();
+        DrawModelBrowser();
+        DrawGBufferWindow();
         if (m_showDemoWindow)
         {
             ImGui::ShowDemoWindow(&m_showDemoWindow);
+        }
+
+        if (!m_pendingModelPath.empty())
+        {
+            const std::filesystem::path path = std::move(m_pendingModelPath);
+            m_pendingModelPath.clear();
+            m_renderer->LoadModel(path);
         }
 
         m_renderer->Render(commandList, m_camera.GetViewProjectionMatrix(), m_camera.GetPosition());
@@ -225,6 +232,164 @@ protected:
     }
 
 private:
+    void ScanSampleModels()
+    {
+#ifdef MRE_SAMPLE_MODELS_DIR
+        m_modelsRoot = std::filesystem::path{MRE_SAMPLE_MODELS_DIR};
+        if (!std::filesystem::exists(m_modelsRoot))
+        {
+            MRE_WARN("Sample models directory '{}' does not exist", mukki::PathToUtf8(m_modelsRoot));
+            return;
+        }
+
+        for (const std::filesystem::directory_entry& entry :
+             std::filesystem::recursive_directory_iterator(m_modelsRoot))
+        {
+            if (!entry.is_regular_file())
+            {
+                continue;
+            }
+
+            const std::filesystem::path& path = entry.path();
+            const std::string extension = mukki::PathToUtf8(path.extension());
+            if (extension != ".gltf" && extension != ".glb")
+            {
+                continue;
+            }
+
+            const std::string variant = mukki::PathToUtf8(path.parent_path().filename());
+            if (variant == "glTF-Embedded")
+            {
+                continue;
+            }
+
+            m_sampleModels.push_back(path);
+        }
+
+        std::sort(m_sampleModels.begin(), m_sampleModels.end());
+
+        for (std::size_t index = 0; index < m_sampleModels.size(); ++index)
+        {
+            if (mukki::PathToUtf8(m_sampleModels[index].filename()).find("DamagedHelmet") != std::string::npos)
+            {
+                m_selectedModel = static_cast<int>(index);
+                break;
+            }
+        }
+
+        MRE_INFO("Found {} sample models in '{}'", m_sampleModels.size(), mukki::PathToUtf8(m_modelsRoot));
+#else
+        MRE_WARN("Sample models directory was not configured at build time");
+#endif
+    }
+
+    void LoadModelByIndex(int index)
+    {
+        if (index < 0 || index >= static_cast<int>(m_sampleModels.size()))
+        {
+            return;
+        }
+
+        m_pendingModelPath = m_sampleModels[static_cast<std::size_t>(index)];
+    }
+
+    void DrawStatsWindow()
+    {
+        ImGui::Begin("Mukki Sandbox");
+        ImGui::Text("Frame time: %.2f ms", static_cast<double>(m_frameTimeMs));
+        ImGui::Text(
+            "Camera: %.2f, %.2f, %.2f",
+            static_cast<double>(m_camera.GetPosition().x),
+            static_cast<double>(m_camera.GetPosition().y),
+            static_cast<double>(m_camera.GetPosition().z));
+        ImGui::Checkbox("Show G-buffer", &m_showGBuffer);
+        ImGui::Checkbox("Show demo window", &m_showDemoWindow);
+        ImGui::SeparatorText("Controls");
+        ImGui::TextUnformatted("WASD/QE move, Shift fast");
+        ImGui::TextUnformatted("Mouse looks around");
+        ImGui::TextUnformatted("Tab toggles the cursor, Left Alt holds it free");
+        ImGui::TextUnformatted("Esc quits");
+        ImGui::End();
+    }
+
+    void DrawModelBrowser()
+    {
+        ImGui::Begin("Model browser");
+
+        if (m_sampleModels.empty())
+        {
+            ImGui::TextUnformatted("No sample models available.");
+            ImGui::TextUnformatted("Initialize the ThirdParty/glTF-Sample-Models submodule and reconfigure.");
+            ImGui::End();
+            return;
+        }
+
+        const std::string current = m_renderer->HasModel() ? m_renderer->GetModelName() : "none";
+        ImGui::Text("Loaded: %s", current.c_str());
+
+        const std::string selectedName = mukki::PathToUtf8(
+            m_sampleModels[static_cast<std::size_t>(m_selectedModel)].filename());
+        if (ImGui::BeginCombo("Model", selectedName.c_str()))
+        {
+            for (std::size_t index = 0; index < m_sampleModels.size(); ++index)
+            {
+                std::error_code relativeError{};
+                const std::filesystem::path relativePath =
+                    std::filesystem::relative(m_sampleModels[index], m_modelsRoot, relativeError);
+                const std::string relative =
+                    relativeError ? mukki::PathToUtf8(m_sampleModels[index]) : mukki::PathToUtf8(relativePath);
+                const bool selected = static_cast<int>(index) == m_selectedModel;
+                if (ImGui::Selectable(relative.c_str(), selected))
+                {
+                    m_selectedModel = static_cast<int>(index);
+                    LoadModelByIndex(m_selectedModel);
+                }
+                if (selected)
+                {
+                    ImGui::SetItemDefaultFocus();
+                }
+            }
+            ImGui::EndCombo();
+        }
+
+        if (ImGui::Button("Reload"))
+        {
+            LoadModelByIndex(m_selectedModel);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Unload"))
+        {
+            m_renderer->UnloadModel();
+        }
+
+        ImGui::Separator();
+        ImGui::Text("Vertices: %llu", static_cast<unsigned long long>(m_renderer->GetModelVertexCount()));
+        ImGui::Text("Triangles: %llu", static_cast<unsigned long long>(m_renderer->GetModelTriangleCount()));
+        ImGui::Text("Models found: %zu", m_sampleModels.size());
+
+        ImGui::End();
+    }
+
+    void DrawGBufferWindow()
+    {
+        if (!m_showGBuffer)
+        {
+            return;
+        }
+
+        ImGui::Begin("G-buffer", &m_showGBuffer);
+
+        const float previewWidth = ImGui::GetContentRegionAvail().x;
+        const float width = static_cast<float>(m_renderer->GetAlbedoTexture().GetWidth());
+        const float height = static_cast<float>(m_renderer->GetAlbedoTexture().GetHeight());
+        const float aspect = height > 0.0f ? width / height : 1.0f;
+
+        DrawTexturePreview("Albedo (metalness in A)", m_albedoTextureId, previewWidth, aspect);
+        DrawTexturePreview("Normal (roughness in A)", m_normalTextureId, previewWidth, aspect);
+        DrawTexturePreview("Position", m_positionTextureId, previewWidth, aspect);
+        ImGui::End();
+    }
+
     void ReleaseDebugTextures()
     {
         if (!m_debugTexturesRegistered)
@@ -246,16 +411,22 @@ private:
     std::unique_ptr<mukki::rhi::Device> m_device{};
     std::unique_ptr<mukki::DeferredRenderer> m_renderer{};
     mukki::vulkan::UiLayer m_ui{};
+    std::vector<std::filesystem::path> m_sampleModels{};
+    std::filesystem::path m_modelsRoot{};
+    std::filesystem::path m_pendingModelPath{};
     ImTextureID m_albedoTextureId = 0;
     ImTextureID m_normalTextureId = 0;
     ImTextureID m_positionTextureId = 0;
     std::filesystem::path m_shaderDirectory{};
+    std::filesystem::path m_requestedModel{};
     float m_frameTimeMs = 0.0f;
+    int m_selectedModel = 0;
     int m_maxFrames = 0;
     int m_frameCount = 0;
     bool m_debugTexturesRegistered = false;
     bool m_renderedFrame = false;
-    bool m_showGBuffer = true;
+    bool m_cursorReleased = false;
+    bool m_showGBuffer = false;
     bool m_showDemoWindow = false;
 };
 
@@ -264,11 +435,16 @@ private:
 int main(int argc, char** argv)
 {
     int maxFrames = 0;
+    std::filesystem::path requestedModel{};
     for (int i = 1; i < argc; ++i)
     {
         if (std::strcmp(argv[i], "--frames") == 0 && i + 1 < argc)
         {
             maxFrames = std::atoi(argv[i + 1]);
+        }
+        else if (std::strcmp(argv[i], "--model") == 0 && i + 1 < argc)
+        {
+            requestedModel = argv[i + 1];
         }
     }
 
@@ -280,7 +456,7 @@ int main(int argc, char** argv)
         const std::filesystem::path shaderDirectory =
             std::filesystem::absolute(argv[0]).parent_path() / "shaders";
 
-        SandboxApp app{maxFrames, shaderDirectory};
+        SandboxApp app{maxFrames, shaderDirectory, requestedModel};
         if (!app.Init(mukki::WindowDesc{}))
         {
             MRE_CRITICAL("Failed to initialize the application");

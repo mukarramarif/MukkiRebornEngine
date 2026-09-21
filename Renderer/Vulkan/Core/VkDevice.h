@@ -15,7 +15,7 @@
 #include "Renderer/Vulkan/Core/VkPipeline.h"
 #include "Renderer/Vulkan/Core/VkShader.h"
 #include "Renderer/Vulkan/Core/VkSwapchain.h"
-#include "Renderer/Vulkan/Resources/BufferAllocator.h"
+#include "Renderer/Vulkan/Resources/ResourceAllocator.h"
 #include "Renderer/Vulkan/Resources/DescriptorSet.h"
 #include "Renderer/Vulkan/Resources/Sampler.h"
 #include "Renderer/Vulkan/Resources/Texture.h"
@@ -51,8 +51,9 @@ public:
         std::uint64_t initialDataSize) override;
     [[nodiscard]] std::unique_ptr<rhi::Texture> CreateTexture(const rhi::TextureDesc& desc) override;
     [[nodiscard]] std::unique_ptr<rhi::Sampler> CreateSampler(const rhi::SamplerDesc& desc) override;
-    [[nodiscard]] std::unique_ptr<rhi::Shader> CreateShader(rhi::ShaderStage stage, const std::string& spirvPath)
-        override;
+    [[nodiscard]] std::unique_ptr<rhi::Shader> CreateShader(
+        rhi::ShaderStage stage,
+        const std::filesystem::path& spirvPath) override;
     [[nodiscard]] std::unique_ptr<rhi::Pipeline> CreatePipeline(const rhi::PipelineDesc& desc) override;
     [[nodiscard]] std::unique_ptr<rhi::DescriptorSetLayout> CreateDescriptorSetLayout(
         const std::vector<rhi::DescriptorBinding>& bindings) override;
@@ -82,7 +83,7 @@ private:
     vk::raii::Device m_device{nullptr};
     vk::raii::Queue m_graphicsQueue{nullptr};
     VmaAllocator m_allocator = VK_NULL_HANDLE;
-    VkBufferAllocator m_bufferAllocator{};
+    VkResourceAllocator m_resourceAllocator{};
     vk::raii::DescriptorPool m_descriptorPool{nullptr};
     std::unique_ptr<VkSwapchain> m_swapchain{};
     FrameSync m_frameSync{};

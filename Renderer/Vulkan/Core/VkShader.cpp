@@ -2,6 +2,7 @@
 
 #include "Utilities/Assert.h"
 #include "Utilities/Log.h"
+#include "Utilities/PathUtils.h"
 
 #include <filesystem>
 #include <fstream>
@@ -18,26 +19,25 @@ VkShader::VkShader(const vk::raii::Device& device, rhi::ShaderStage stage, const
     m_module = vk::raii::ShaderModule{device, createInfo};
 }
 
-std::vector<std::uint32_t> VkShader::LoadSpirv(const std::string& path)
+std::vector<std::uint32_t> VkShader::LoadSpirv(const std::filesystem::path& path)
 {
-    const std::filesystem::path filePath{path};
-    if (!std::filesystem::exists(filePath))
+    if (!std::filesystem::exists(path))
     {
-        MRE_ERROR("Shader file '{}' does not exist", path);
+        MRE_ERROR("Shader file '{}' does not exist", PathToUtf8(path));
         return {};
     }
 
-    const std::uintmax_t fileSize = std::filesystem::file_size(filePath);
+    const std::uintmax_t fileSize = std::filesystem::file_size(path);
     if (fileSize == 0 || fileSize % sizeof(std::uint32_t) != 0)
     {
-        MRE_ERROR("Shader file '{}' has an invalid size ({} bytes)", path, fileSize);
+        MRE_ERROR("Shader file '{}' has an invalid size ({} bytes)", PathToUtf8(path), fileSize);
         return {};
     }
 
-    std::ifstream stream{filePath, std::ios::in | std::ios::binary};
+    std::ifstream stream{path, std::ios::in | std::ios::binary};
     if (!stream.is_open())
     {
-        MRE_ERROR("Failed to open shader file '{}'", path);
+        MRE_ERROR("Failed to open shader file '{}'", PathToUtf8(path));
         return {};
     }
 
@@ -45,7 +45,7 @@ std::vector<std::uint32_t> VkShader::LoadSpirv(const std::string& path)
     stream.read(reinterpret_cast<char*>(code.data()), static_cast<std::streamsize>(fileSize));
     if (!stream)
     {
-        MRE_ERROR("Failed to read shader file '{}'", path);
+        MRE_ERROR("Failed to read shader file '{}'", PathToUtf8(path));
         return {};
     }
 

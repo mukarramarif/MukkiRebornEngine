@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <vector>
@@ -51,7 +52,9 @@ public:
         std::uint64_t initialDataSize = 0) = 0;
     [[nodiscard]] virtual std::unique_ptr<Texture> CreateTexture(const TextureDesc& desc) = 0;
     [[nodiscard]] virtual std::unique_ptr<Sampler> CreateSampler(const SamplerDesc& desc) = 0;
-    [[nodiscard]] virtual std::unique_ptr<Shader> CreateShader(ShaderStage stage, const std::string& spirvPath) = 0;
+    [[nodiscard]] virtual std::unique_ptr<Shader> CreateShader(
+        ShaderStage stage,
+        const std::filesystem::path& spirvPath) = 0;
     [[nodiscard]] virtual std::unique_ptr<Pipeline> CreatePipeline(const PipelineDesc& desc) = 0;
     [[nodiscard]] virtual std::unique_ptr<DescriptorSetLayout> CreateDescriptorSetLayout(
         const std::vector<DescriptorBinding>& bindings) = 0;

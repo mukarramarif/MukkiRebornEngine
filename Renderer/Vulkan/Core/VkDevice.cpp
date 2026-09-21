@@ -39,7 +39,7 @@ bool VkDevice::Init(const rhi::DeviceDesc& desc)
         return false;
     }
 
-    m_bufferAllocator.Init(m_device, m_allocator, *m_graphicsQueue, m_graphicsQueueFamily);
+    m_resourceAllocator.Init(m_device, m_allocator, *m_graphicsQueue, m_graphicsQueueFamily);
 
     m_initialized = true;
     MRE_INFO("Vulkan device initialized");
@@ -56,7 +56,7 @@ void VkDevice::Shutdown()
     m_commandLists.clear();
     m_frameSync.Shutdown();
     m_swapchain.reset();
-    m_bufferAllocator.Shutdown();
+    m_resourceAllocator.Shutdown();
     m_descriptorPool = vk::raii::DescriptorPool{nullptr};
     if (m_allocator != VK_NULL_HANDLE)
     {
@@ -228,13 +228,13 @@ std::unique_ptr<rhi::Buffer> VkDevice::CreateBuffer(
     std::uint64_t initialDataSize)
 {
     MRE_ASSERT(m_initialized, "VkDevice::CreateBuffer called before VkDevice::Init");
-    return m_bufferAllocator.CreateBuffer(desc, initialData, initialDataSize);
+    return m_resourceAllocator.CreateBuffer(desc, initialData, initialDataSize);
 }
 
 std::unique_ptr<rhi::Texture> VkDevice::CreateTexture(const rhi::TextureDesc& desc)
 {
     MRE_ASSERT(m_initialized, "VkDevice::CreateTexture called before VkDevice::Init");
-    return std::make_unique<VkTexture>(m_allocator, m_device, desc);
+    return m_resourceAllocator.CreateTexture(desc);
 }
 
 std::unique_ptr<rhi::Sampler> VkDevice::CreateSampler(const rhi::SamplerDesc& desc)
@@ -258,7 +258,9 @@ std::unique_ptr<rhi::DescriptorSet> VkDevice::CreateDescriptorSet(const rhi::Des
     return std::make_unique<VkDescriptorSet>(m_device, m_descriptorPool, vkLayout);
 }
 
-std::unique_ptr<rhi::Shader> VkDevice::CreateShader(rhi::ShaderStage stage, const std::string& spirvPath)
+std::unique_ptr<rhi::Shader> VkDevice::CreateShader(
+    rhi::ShaderStage stage,
+    const std::filesystem::path& spirvPath)
 {
     MRE_ASSERT(m_initialized, "VkDevice::CreateShader called before VkDevice::Init");
 

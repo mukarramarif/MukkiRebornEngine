@@ -28,7 +28,19 @@ echo 'export VCPKG_ROOT=$HOME/vcpkg' >> ~/.bashrc
 
 Dependencies are declared in `vcpkg.json` and installed automatically in manifest mode on the first
 configure into `build/<preset>/vcpkg_installed`. That first configure can take several minutes while
-vcpkg builds the dependencies.
+vcpkg builds the dependencies. `tinygltf` is pinned to 2.9.3 because the 3.0.0 port hash no longer
+matches GitHub's regenerated tarball.
+
+Sample assets live in a submodule (about 1.7 GB, cloned shallow):
+
+```sh
+git clone --recurse-submodules <repository-url>
+# or, in an existing checkout
+git submodule update --init --depth 1
+```
+
+Without the submodule the engine still builds and tests pass, but the sandbox model browser is
+disabled.
 
 Shader compilation uses `slangc` from the Vulkan SDK, found through the `VULKAN_SDK` environment
 variable (or on `PATH`). If `slangc` is missing, CMake prints a warning, shader targets are skipped
@@ -79,22 +91,29 @@ copied next to the executable automatically.
 .\build\windows-debug\Debug\mukki_sandbox.exe
 ```
 
-Pass `--frames N` to run a fixed number of frames and exit (used for smoke testing).
+Pass `--frames N` to run a fixed number of frames and exit (used for smoke testing). Pass
+`--model <path>` to load a specific glTF/GLB file instead of the default sample model.
 
-Controls: `WASD`/`QE` to move, hold the right mouse button to look, `Shift` to move faster, `Esc` to
-quit.
+Controls: `WASD`/`QE` to move, mouse to look, `Shift` to move faster, `Tab` to toggle the cursor for
+UI interaction (or hold `Left Alt`), `Esc` to quit.
+
+The sandbox has a model browser window listing the sample models from the submodule (the `glTF` and
+`glTF-Binary` variants of `2.0/`), a G-buffer debug window, and an ImGui demo window. Loaded models
+are auto-fitted to the ground plane.
 
 ## Layout
 
 - `Application/` - windowing, input, keybinds, camera, ImGui styles
+- `Assets/` - asset loading (glTF via tinygltf, KTX2 planned)
 - `Core/` - engine core (version, time)
 - `Renderer/RHI/` - vendor-agnostic render hardware interface (device, command lists, resources)
 - `Renderer/Vulkan/` - Vulkan backend implementation
 - `Renderer/Deferred/` - deferred renderer (G-buffer, lighting, tonemapping)
 - `Renderer/Shaders/` - Slang shaders compiled at build time
 - `Renderer/BufferManager` - vertex/index/uniform buffer management
+- `ThirdParty/` - submodules (glTF sample models)
 - `Utilities/` - logging, asserts, future containers and allocators
 - `Tests/` - GoogleTest unit tests
 - `Sandbox/` - sandbox executable
 
-`Renderer/DX12/` and a render graph are planned.
+`Renderer/DX12/`, a render graph and KTX2 textures are planned.

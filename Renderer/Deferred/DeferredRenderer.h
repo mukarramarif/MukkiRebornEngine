@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include <glm/mat4x4.hpp>
@@ -28,7 +29,7 @@ struct SceneUniform
 struct ObjectPushConstants
 {
     glm::mat4 model{1.0f};
-    glm::vec4 albedo{1.0f};
+    glm::vec4 baseColorFactor{1.0f};
     glm::vec4 params{0.0f};
 };
 
@@ -51,7 +52,15 @@ public:
     void Resize(std::uint32_t width, std::uint32_t height);
     void Render(rhi::CommandList& commandList, const glm::mat4& viewProjection, const glm::vec3& cameraPosition);
 
+    bool LoadModel(const std::filesystem::path& path);
+    void UnloadModel();
+
     [[nodiscard]] bool IsInitialized() const { return m_initialized; }
+    [[nodiscard]] bool HasModel() const { return !m_modelDrawItems.empty(); }
+    [[nodiscard]] const std::string& GetModelName() const { return m_modelName; }
+    [[nodiscard]] std::uint64_t GetModelVertexCount() const { return m_modelVertexCount; }
+    [[nodiscard]] std::uint64_t GetModelTriangleCount() const { return m_modelTriangleCount; }
+
     [[nodiscard]] rhi::Texture& GetAlbedoTexture() { return m_gbuffer.GetAlbedo(); }
     [[nodiscard]] rhi::Texture& GetNormalTexture() { return m_gbuffer.GetNormal(); }
     [[nodiscard]] rhi::Texture& GetPositionTexture() { return m_gbuffer.GetPosition(); }
@@ -63,7 +72,15 @@ private:
         rhi::Buffer* indexBuffer = nullptr;
         std::uint32_t indexCount = 0;
         std::uint32_t firstIndex = 0;
+        rhi::DescriptorSet* materialSet = nullptr;
         ObjectPushConstants pushConstants{};
+    };
+
+    struct Material
+    {
+        std::unique_ptr<rhi::Texture> baseColorTexture{};
+        std::unique_ptr<rhi::Texture> metallicRoughnessTexture{};
+        std::unique_ptr<rhi::DescriptorSet> descriptorSet{};
     };
 
     bool CreatePipelines(rhi::Device& device, const std::filesystem::path& shaderDirectory);
@@ -75,23 +92,31 @@ private:
     GBuffer m_gbuffer{};
     std::unique_ptr<BufferManager> m_bufferManager{};
     std::vector<std::unique_ptr<rhi::Buffer>> m_uniformBuffers{};
-    rhi::Buffer* m_cubeVertexBuffer = nullptr;
-    rhi::Buffer* m_cubeIndexBuffer = nullptr;
     rhi::Buffer* m_planeVertexBuffer = nullptr;
     rhi::Buffer* m_planeIndexBuffer = nullptr;
     std::unique_ptr<rhi::Sampler> m_gbufferSampler{};
+    std::unique_ptr<rhi::Texture> m_whiteTexture{};
     std::unique_ptr<rhi::DescriptorSetLayout> m_sceneSetLayout{};
+    std::unique_ptr<rhi::DescriptorSetLayout> m_materialSetLayout{};
     std::unique_ptr<rhi::DescriptorSetLayout> m_lightingSetLayout{};
+    std::unique_ptr<rhi::DescriptorSet> m_defaultMaterialSet{};
     std::vector<std::unique_ptr<rhi::DescriptorSet>> m_sceneSets{};
     std::vector<std::unique_ptr<rhi::DescriptorSet>> m_lightingSets{};
+    std::vector<Material> m_materials{};
     std::unique_ptr<rhi::Shader> m_gbufferVertexShader{};
     std::unique_ptr<rhi::Shader> m_gbufferFragmentShader{};
     std::unique_ptr<rhi::Shader> m_lightingVertexShader{};
     std::unique_ptr<rhi::Shader> m_lightingFragmentShader{};
     std::unique_ptr<rhi::Pipeline> m_gbufferPipeline{};
     std::unique_ptr<rhi::Pipeline> m_lightingPipeline{};
-    std::vector<DrawItem> m_drawItems{};
+    std::vector<DrawItem> m_sceneDrawItems{};
+    std::vector<DrawItem> m_modelDrawItems{};
+    std::vector<std::unique_ptr<rhi::Buffer>> m_modelVertexBuffers{};
+    std::vector<std::unique_ptr<rhi::Buffer>> m_modelIndexBuffers{};
     SceneUniform m_sceneUniform{};
+    std::string m_modelName{};
+    std::uint64_t m_modelVertexCount = 0;
+    std::uint64_t m_modelTriangleCount = 0;
     bool m_lightingSetsDirty = true;
     bool m_initialized = false;
 };

@@ -1,7 +1,7 @@
 #pragma once
 
 #include <cstdint>
-#include <string>
+#include <filesystem>
 #include <vector>
 
 #include <vulkan/vulkan.hpp>
@@ -21,7 +21,7 @@ public:
     [[nodiscard]] rhi::ShaderStage GetStage() const override { return m_stage; }
     [[nodiscard]] vk::ShaderModule GetHandle() const { return *m_module; }
 
-    [[nodiscard]] static std::vector<std::uint32_t> LoadSpirv(const std::string& path);
+    [[nodiscard]] static std::vector<std::uint32_t> LoadSpirv(const std::filesystem::path& path);
 
 private:
     vk::raii::ShaderModule m_module{nullptr};

@@ -13,14 +13,14 @@
 namespace mukki::vulkan
 {
 
-class VkBufferAllocator
+class VkResourceAllocator
 {
 public:
-    VkBufferAllocator() = default;
-    ~VkBufferAllocator() = default;
+    VkResourceAllocator() = default;
+    ~VkResourceAllocator() = default;
 
-    VkBufferAllocator(const VkBufferAllocator&) = delete;
-    VkBufferAllocator& operator=(const VkBufferAllocator&) = delete;
+    VkResourceAllocator(const VkResourceAllocator&) = delete;
+    VkResourceAllocator& operator=(const VkResourceAllocator&) = delete;
 
     void Init(const vk::raii::Device& device, VmaAllocator allocator, vk::Queue queue, std::uint32_t queueFamily);
     void Shutdown();
@@ -29,6 +29,7 @@ public:
         const rhi::BufferDesc& desc,
         const void* initialData,
         std::uint64_t initialDataSize);
+    [[nodiscard]] std::unique_ptr<rhi::Texture> CreateTexture(const rhi::TextureDesc& desc);
 
 private:
     void ImmediateSubmit(const std::function<void(vk::CommandBuffer)>& record);

@@ -14,7 +14,13 @@ namespace mukki::vulkan
 class VkTexture final : public rhi::Texture
 {
 public:
-    VkTexture(VmaAllocator allocator, const vk::raii::Device& device, const rhi::TextureDesc& desc);
+    VkTexture(
+        VmaAllocator allocator,
+        vk::Image image,
+        VmaAllocation allocation,
+        vk::raii::ImageView view,
+        const rhi::TextureDesc& desc,
+        vk::ImageLayout layout);
     ~VkTexture() override;
 
     [[nodiscard]] std::uint32_t GetWidth() const override { return m_desc.width; }
