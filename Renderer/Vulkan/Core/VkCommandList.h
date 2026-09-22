@@ -23,7 +23,7 @@ public:
     VkCommandList(const VkCommandList&) = delete;
     VkCommandList& operator=(const VkCommandList&) = delete;
 
-    void Init(const vk::raii::Device& device, std::uint32_t queueFamilyIndex);
+    void Init(const vk::raii::Device& device, std::uint32_t queueFamilyIndex, bool secondary = false);
     void Shutdown();
 
     void SetSwapchainTarget(
@@ -48,6 +48,10 @@ public:
     void Draw(std::uint32_t vertexCount, std::uint32_t firstVertex) override;
     void DrawIndexed(std::uint32_t indexCount, std::uint32_t firstIndex) override;
 
+    [[nodiscard]] bool IsSecondary() const override { return m_secondary; }
+    void BeginSecondary(const rhi::RenderingDesc& desc) override;
+    void ExecuteCommands(const std::vector<const rhi::CommandList*>& secondaryCommandLists) override;
+
     [[nodiscard]] const vk::raii::CommandBuffer& GetHandle() const { return m_commandBuffer; }
     [[nodiscard]] bool WasSwapchainRendered() const { return m_renderedThisFrame; }
 
@@ -69,6 +73,7 @@ private:
     bool m_recording = false;
     bool m_rendering = false;
     bool m_renderingSwapchain = false;
+    bool m_secondary = false;
 };
 
 } // namespace mukki::vulkan

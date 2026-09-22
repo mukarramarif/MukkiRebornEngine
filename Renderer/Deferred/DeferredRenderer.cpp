@@ -1,6 +1,7 @@
 #include "Renderer/Deferred/DeferredRenderer.h"
 
 #include "Assets/GltfLoader.h"
+#include "Core/JobSystem.h"
 #include "Renderer/RHI/Device.h"
 #include "Utilities/Assert.h"
 #include "Utilities/Log.h"
@@ -8,6 +9,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <future>
 #include <iterator>
 #include <string>
 
@@ -45,6 +47,12 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
     MRE_ASSERT(!desc.shaderDirectory.empty(), "DeferredRenderer requires a shader directory");
 
     m_device = &device;
+    m_jobSystem = desc.jobSystem;
+    if (m_jobSystem != nullptr)
+    {
+        m_asyncLoader.SetJobSystem(*m_jobSystem);
+        m_secondaryBatchCount = std::max(1u, m_jobSystem->GetThreadCount());
+    }
 
     const rhi::Extent2D extent = device.GetSwapchainInfo().extent;
     if (!m_gbuffer.Init(device, std::max(1u, extent.width), std::max(1u, extent.height)))
@@ -106,6 +114,17 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
         m_sceneSets.push_back(std::move(sceneSet));
     }
 
+    m_gbufferSecondaries.clear();
+    m_gbufferSecondaries.resize(framesInFlight);
+    for (std::uint32_t frame = 0; frame < framesInFlight; ++frame)
+    {
+        m_gbufferSecondaries[frame].reserve(m_secondaryBatchCount);
+        for (std::uint32_t batch = 0; batch < m_secondaryBatchCount; ++batch)
+        {
+            m_gbufferSecondaries[frame].push_back(device.CreateSecondaryCommandList());
+        }
+    }
+
     if (!CreateScene() || !CreatePipelines(device, desc.shaderDirectory))
     {
         Shutdown();
@@ -136,6 +155,7 @@ void DeferredRenderer::Shutdown()
     m_gbufferFragmentShader.reset();
     m_gbufferVertexShader.reset();
     m_sceneDrawItems.clear();
+    m_gbufferSecondaries.clear();
     m_lightingSetLayout.reset();
     m_materialSetLayout.reset();
     m_sceneSetLayout.reset();
@@ -147,6 +167,7 @@ void DeferredRenderer::Shutdown()
     m_bufferManager.reset();
     m_gbuffer.Shutdown();
     m_device = nullptr;
+    m_jobSystem = nullptr;
     m_lightingSetsDirty = true;
     m_initialized = false;
 }
@@ -186,6 +207,38 @@ bool DeferredRenderer::LoadModel(const std::filesystem::path& path)
     {
         return false;
     }
+
+    return UploadModel(path, model);
+}
+
+void DeferredRenderer::RequestModelLoad(const std::filesystem::path& path)
+{
+    MRE_ASSERT(m_initialized, "DeferredRenderer::RequestModelLoad called before DeferredRenderer::Init");
+    m_asyncLoader.Load(path);
+}
+
+bool DeferredRenderer::PollModelLoad()
+{
+    MRE_ASSERT(m_initialized, "DeferredRenderer::PollModelLoad called before DeferredRenderer::Init");
+
+    if (!m_asyncLoader.IsReady())
+    {
+        return false;
+    }
+
+    GltfLoadResult result = m_asyncLoader.Consume();
+    if (!result.success)
+    {
+        MRE_ERROR("Asynchronous load of '{}' failed", PathToUtf8(result.path));
+        return false;
+    }
+
+    return UploadModel(result.path, result.model);
+}
+
+bool DeferredRenderer::UploadModel(const std::filesystem::path& path, GltfModel& model)
+{
+    MRE_ASSERT(m_device != nullptr, "DeferredRenderer requires a device");
 
     m_device->WaitIdle();
     UnloadModel();
@@ -329,6 +382,7 @@ bool DeferredRenderer::LoadModel(const std::filesystem::path& path)
 
 void DeferredRenderer::UnloadModel()
 {
+    m_asyncLoader.Reset();
     m_modelDrawItems.clear();
     m_modelVertexBuffers.clear();
     m_modelIndexBuffers.clear();
@@ -359,29 +413,62 @@ void DeferredRenderer::Render(
     };
     gbufferDesc.depthAttachment = rhi::DepthAttachment{&m_gbuffer.GetDepth(), 1.0f, true};
 
-    const auto drawItems = [&commandList, frameIndex](const std::vector<DrawItem>& items) {
-        for (const DrawItem& item : items)
+    std::vector<const DrawItem*> gbufferItems{};
+    gbufferItems.reserve(m_sceneDrawItems.size() + m_modelDrawItems.size());
+    for (const DrawItem& item : m_sceneDrawItems)
+    {
+        gbufferItems.push_back(&item);
+    }
+    for (const DrawItem& item : m_modelDrawItems)
+    {
+        gbufferItems.push_back(&item);
+    }
+
+    const auto drawItems = [&commandList, frameIndex](const std::vector<const DrawItem*>& items) {
+        for (const DrawItem* item : items)
         {
-            commandList.BindVertexBuffer(*item.vertexBuffer);
-            commandList.BindIndexBuffer(*item.indexBuffer);
-            if (item.materialSet != nullptr)
+            commandList.BindVertexBuffer(*item->vertexBuffer);
+            commandList.BindIndexBuffer(*item->indexBuffer);
+            if (item->materialSet != nullptr)
             {
-                commandList.BindDescriptorSet(1, *item.materialSet);
+                commandList.BindDescriptorSet(1, *item->materialSet);
             }
             commandList.SetPushConstants(
-                &item.pushConstants,
+                &item->pushConstants,
                 sizeof(ObjectPushConstants),
                 rhi::ShaderStageMask::VertexFragment);
-            commandList.DrawIndexed(item.indexCount, item.firstIndex);
+            commandList.DrawIndexed(item->indexCount, item->firstIndex);
         }
     };
 
-    commandList.BeginRendering(gbufferDesc);
-    commandList.BindPipeline(*m_gbufferPipeline);
-    commandList.BindDescriptorSet(0, *m_sceneSets[frameIndex]);
-    drawItems(m_sceneDrawItems);
-    drawItems(m_modelDrawItems);
-    commandList.EndRendering();
+    const bool useSecondaries =
+        m_jobSystem != nullptr && m_secondaryBatchCount > 1 && gbufferItems.size() > 1 &&
+        frameIndex < m_gbufferSecondaries.size();
+
+    if (useSecondaries)
+    {
+        const std::uint32_t batchCount = RecordGBufferSecondaries(frameIndex, gbufferDesc, gbufferItems);
+
+        std::vector<const rhi::CommandList*> secondaries{};
+        secondaries.reserve(batchCount);
+        for (std::uint32_t batch = 0; batch < batchCount; ++batch)
+        {
+            secondaries.push_back(m_gbufferSecondaries[frameIndex][batch].get());
+        }
+
+        gbufferDesc.secondaryCommandBuffers = true;
+        commandList.BeginRendering(gbufferDesc);
+        commandList.ExecuteCommands(secondaries);
+        commandList.EndRendering();
+    }
+    else
+    {
+        commandList.BeginRendering(gbufferDesc);
+        commandList.BindPipeline(*m_gbufferPipeline);
+        commandList.BindDescriptorSet(0, *m_sceneSets[frameIndex]);
+        drawItems(gbufferItems);
+        commandList.EndRendering();
+    }
 
     if (m_lightingSetsDirty)
     {
@@ -394,6 +481,85 @@ void DeferredRenderer::Render(
     commandList.BindDescriptorSet(0, *m_lightingSets[frameIndex]);
     commandList.Draw(3);
     commandList.EndSwapchainRendering();
+}
+
+std::uint32_t DeferredRenderer::RecordGBufferSecondaries(
+    std::uint32_t frameIndex,
+    const rhi::RenderingDesc& desc,
+    const std::vector<const DrawItem*>& items)
+{
+    MRE_ASSERT(m_jobSystem != nullptr, "RecordGBufferSecondaries requires a job system");
+    MRE_ASSERT(frameIndex < m_gbufferSecondaries.size(), "Frame index out of range");
+    MRE_ASSERT(!items.empty(), "RecordGBufferSecondaries requires draw items");
+
+    const std::uint32_t batchCount = std::min(
+        m_secondaryBatchCount,
+        static_cast<std::uint32_t>(items.size()));
+    MRE_ASSERT(batchCount > 0, "RecordGBufferSecondaries requires at least one batch");
+    MRE_ASSERT(
+        batchCount <= m_gbufferSecondaries[frameIndex].size(),
+        "Not enough secondary command lists were allocated");
+
+    const std::size_t itemsPerBatch = (items.size() + batchCount - 1) / batchCount;
+
+    std::vector<std::future<void>> futures{};
+    futures.reserve(batchCount);
+
+    for (std::uint32_t batch = 0; batch < batchCount; ++batch)
+    {
+        const std::size_t begin = static_cast<std::size_t>(batch) * itemsPerBatch;
+        const std::size_t end = std::min(begin + itemsPerBatch, items.size());
+        if (begin >= end)
+        {
+            break;
+        }
+
+        rhi::CommandList* secondary = m_gbufferSecondaries[frameIndex][batch].get();
+        futures.push_back(m_jobSystem->Submit([this, frameIndex, secondary, &desc, &items, begin, end]() {
+            RecordGBufferBatch(frameIndex, items, begin, end, *secondary, desc);
+        }));
+    }
+
+    for (std::future<void>& future : futures)
+    {
+        future.get();
+    }
+
+    return batchCount;
+}
+
+void DeferredRenderer::RecordGBufferBatch(
+    std::uint32_t frameIndex,
+    const std::vector<const DrawItem*>& items,
+    std::size_t begin,
+    std::size_t end,
+    rhi::CommandList& secondary,
+    const rhi::RenderingDesc& desc)
+{
+    MRE_ASSERT(m_gbufferPipeline != nullptr, "RecordGBufferBatch requires the G-buffer pipeline");
+    MRE_ASSERT(frameIndex < m_sceneSets.size(), "Frame index out of range");
+
+    secondary.BeginSecondary(desc);
+    secondary.BindPipeline(*m_gbufferPipeline);
+    secondary.BindDescriptorSet(0, *m_sceneSets[frameIndex]);
+
+    for (std::size_t index = begin; index < end; ++index)
+    {
+        const DrawItem& item = *items[index];
+        secondary.BindVertexBuffer(*item.vertexBuffer);
+        secondary.BindIndexBuffer(*item.indexBuffer);
+        if (item.materialSet != nullptr)
+        {
+            secondary.BindDescriptorSet(1, *item.materialSet);
+        }
+        secondary.SetPushConstants(
+            &item.pushConstants,
+            sizeof(ObjectPushConstants),
+            rhi::ShaderStageMask::VertexFragment);
+        secondary.DrawIndexed(item.indexCount, item.firstIndex);
+    }
+
+    secondary.End();
 }
 
 bool DeferredRenderer::CreatePipelines(rhi::Device& device, const std::filesystem::path& shaderDirectory)

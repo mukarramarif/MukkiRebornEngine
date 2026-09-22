@@ -24,6 +24,7 @@ find_package(glfw3 CONFIG REQUIRED)
 find_package(glm CONFIG REQUIRED)
 find_package(VulkanMemoryAllocator CONFIG REQUIRED)
 find_package(imgui CONFIG REQUIRED)
+find_package(Threads REQUIRED)
 
 find_path(MRE_TINYGLTF_INCLUDE_DIR NAMES tiny_gltf.h REQUIRED)
 find_path(MRE_STB_INCLUDE_DIR NAMES stb_image.h REQUIRED)
@@ -83,8 +84,10 @@ add_library(mukki_engine STATIC
     Application/Keybinds.cpp
     Application/UI/UiStyles.cpp
     Application/Window.cpp
+    Assets/AsyncGltfLoader.cpp
     Assets/GltfLoader.cpp
     Core/Engine.cpp
+    Core/JobSystem.cpp
     Core/Time.cpp
     Renderer/BufferManager.cpp
     Renderer/Deferred/DeferredRenderer.cpp
@@ -133,6 +136,7 @@ target_link_libraries(mukki_engine
         glfw
         glm::glm
         imgui::imgui
+        Threads::Threads
 )
 
 if(MRE_BUILD_SANDBOX)
