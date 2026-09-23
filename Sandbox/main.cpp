@@ -218,9 +218,11 @@ protected:
 
         m_renderer->Render(commandList, m_camera.GetViewProjectionMatrix(), m_camera.GetPosition());
 
+        commandList.BeginGpuZone("ImGui");
         commandList.BeginSwapchainRendering(mukki::rhi::ClearColor{0.0f, 0.0f, 0.0f, 1.0f}, false);
         m_ui.EndFrame(commandList);
         commandList.EndSwapchainRendering();
+        commandList.EndGpuZone();
 
         commandList.End();
         m_device->EndFrame();

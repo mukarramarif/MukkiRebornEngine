@@ -46,6 +46,7 @@ public:
     [[nodiscard]] virtual const SwapchainInfo& GetSwapchainInfo() const = 0;
     [[nodiscard]] virtual std::uint32_t GetFrameIndex() const = 0;
     [[nodiscard]] virtual std::uint32_t GetFramesInFlight() const = 0;
+    [[nodiscard]] virtual bool IsBindlessSupported() const = 0;
 
     [[nodiscard]] virtual std::unique_ptr<Buffer> CreateBuffer(
         const BufferDesc& desc,

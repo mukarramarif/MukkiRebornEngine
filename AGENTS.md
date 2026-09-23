@@ -24,6 +24,13 @@ must not expose backend types, and Vulkan types may only appear under `Renderer/
 - Multithreading: `Core/JobSystem` is the shared thread pool. glTF parsing runs asynchronously
   (`Assets/AsyncGltfLoader`) and the G-buffer draw calls are recorded into secondary command buffers
   on worker threads, then replayed from the primary command list with `ExecuteCommands`.
+- Bindless: descriptor indexing is a hard device requirement. Textures get a bindless index from the
+  device and are bound into a global update-after-bind `SampledImage` array set; shaders sample them
+  through `Texture2D textures[]` with `NonUniformResourceIndex`.
+- Profiling: Tracy (on-demand). Use the `MRE_PROFILE_*` macros from `Utilities/Profiling.h` for CPU
+  zones and `rhi::CommandList::BeginGpuZone/EndGpuZone` for GPU pass zones. Enabled via the
+  `*-tracy` CMake presets (`MRE_ENABLE_TRACY=ON`, `VCPKG_MANIFEST_FEATURES=tracy`); connect with the
+  Tracy GUI.
 - Build: CMake + vcpkg manifest (`vcpkg.json`), presets in `CMakePresets.json`.
 - Tests: GoogleTest under `Tests/`. CI: GitHub Actions. UI: ImGui (docking).
 

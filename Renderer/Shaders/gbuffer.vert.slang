@@ -14,6 +14,8 @@ struct ObjectPushConstants
     float4x4 model;
     float4 baseColorFactor;
     float4 params;
+    uint2 textureIndices;
+    uint2 samplerIndices;
 };
 
 [[vk::push_constant]] ConstantBuffer<ObjectPushConstants> gObject;

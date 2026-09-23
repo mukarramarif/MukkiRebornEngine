@@ -18,6 +18,7 @@ endif()
 
 option(MRE_BUILD_SANDBOX "Build the sandbox application" ON)
 option(MRE_BUILD_TESTS "Build the unit tests" ON)
+option(MRE_ENABLE_TRACY "Enable Tracy profiler instrumentation" OFF)
 
 find_package(Vulkan REQUIRED)
 find_package(glfw3 CONFIG REQUIRED)
@@ -25,6 +26,10 @@ find_package(glm CONFIG REQUIRED)
 find_package(VulkanMemoryAllocator CONFIG REQUIRED)
 find_package(imgui CONFIG REQUIRED)
 find_package(Threads REQUIRED)
+
+if(MRE_ENABLE_TRACY)
+    find_package(Tracy CONFIG REQUIRED)
+endif()
 
 find_path(MRE_TINYGLTF_INCLUDE_DIR NAMES tiny_gltf.h REQUIRED)
 find_path(MRE_STB_INCLUDE_DIR NAMES stb_image.h REQUIRED)
@@ -138,6 +143,11 @@ target_link_libraries(mukki_engine
         imgui::imgui
         Threads::Threads
 )
+
+if(MRE_ENABLE_TRACY)
+    target_compile_definitions(mukki_engine PUBLIC MRE_ENABLE_TRACY)
+    target_link_libraries(mukki_engine PUBLIC Tracy::TracyClient)
+endif()
 
 if(MRE_BUILD_SANDBOX)
     add_executable(mukki_sandbox

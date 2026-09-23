@@ -6,6 +6,7 @@
 #include "Utilities/Assert.h"
 #include "Utilities/Log.h"
 #include "Utilities/PathUtils.h"
+#include "Utilities/Profiling.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -38,6 +39,20 @@ constexpr Vertex kPlaneVertices[] = {
 constexpr std::uint32_t kPlaneIndices[] = {0, 1, 2, 0, 2, 3};
 
 constexpr std::uint32_t kWhitePixel = 0xFFFFFFFFu;
+
+rhi::AddressMode ToRhiAddressMode(GltfWrapMode mode)
+{
+    switch (mode)
+    {
+    case GltfWrapMode::ClampToEdge:
+        return rhi::AddressMode::ClampToEdge;
+    case GltfWrapMode::MirroredRepeat:
+        return rhi::AddressMode::MirroredRepeat;
+    case GltfWrapMode::Repeat:
+    default:
+        return rhi::AddressMode::Repeat;
+    }
+}
 
 } // namespace
 
@@ -81,9 +96,18 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
     const std::vector<rhi::DescriptorBinding> sceneBindings{
         rhi::DescriptorBinding{0, rhi::DescriptorType::UniformBuffer, rhi::ShaderStageMask::VertexFragment},
     };
-    const std::vector<rhi::DescriptorBinding> materialBindings{
-        rhi::DescriptorBinding{0, rhi::DescriptorType::CombinedImageSampler, rhi::ShaderStageMask::Fragment},
-        rhi::DescriptorBinding{1, rhi::DescriptorType::CombinedImageSampler, rhi::ShaderStageMask::Fragment},
+    const std::vector<rhi::DescriptorBinding> bindlessBindings{
+        rhi::DescriptorBinding{
+            0,
+            rhi::DescriptorType::SampledImage,
+            rhi::ShaderStageMask::Fragment,
+            rhi::kMaxBindlessTextures,
+            true},
+        rhi::DescriptorBinding{
+            1,
+            rhi::DescriptorType::Sampler,
+            rhi::ShaderStageMask::Fragment,
+            rhi::kMaxBindlessSamplers},
     };
     const std::vector<rhi::DescriptorBinding> lightingBindings{
         rhi::DescriptorBinding{0, rhi::DescriptorType::UniformBuffer, rhi::ShaderStageMask::VertexFragment},
@@ -92,12 +116,12 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
         rhi::DescriptorBinding{3, rhi::DescriptorType::CombinedImageSampler, rhi::ShaderStageMask::Fragment},
     };
     m_sceneSetLayout = device.CreateDescriptorSetLayout(sceneBindings);
-    m_materialSetLayout = device.CreateDescriptorSetLayout(materialBindings);
+    m_bindlessSetLayout = device.CreateDescriptorSetLayout(bindlessBindings);
     m_lightingSetLayout = device.CreateDescriptorSetLayout(lightingBindings);
 
-    m_defaultMaterialSet = device.CreateDescriptorSet(*m_materialSetLayout);
-    m_defaultMaterialSet->BindTexture(0, *m_whiteTexture, *m_gbufferSampler);
-    m_defaultMaterialSet->BindTexture(1, *m_whiteTexture, *m_gbufferSampler);
+    m_bindlessSet = device.CreateDescriptorSet(*m_bindlessSetLayout);
+    m_bindlessSet->BindTexture(0, *m_whiteTexture, m_whiteTexture->GetBindlessIndex());
+    static_cast<void>(GetSamplerIndex(rhi::AddressMode::ClampToEdge, rhi::AddressMode::ClampToEdge));
 
     const std::uint32_t framesInFlight = device.GetFramesInFlight();
     m_uniformBuffers.reserve(framesInFlight);
@@ -147,7 +171,6 @@ void DeferredRenderer::Shutdown()
     m_lightingSets.clear();
     m_sceneSets.clear();
     m_materials.clear();
-    m_defaultMaterialSet.reset();
     m_lightingPipeline.reset();
     m_gbufferPipeline.reset();
     m_lightingFragmentShader.reset();
@@ -157,9 +180,12 @@ void DeferredRenderer::Shutdown()
     m_sceneDrawItems.clear();
     m_gbufferSecondaries.clear();
     m_lightingSetLayout.reset();
-    m_materialSetLayout.reset();
+    m_bindlessSetLayout.reset();
     m_sceneSetLayout.reset();
+    m_bindlessSet.reset();
     m_whiteTexture.reset();
+    m_bindlessSamplers.clear();
+    m_samplerCache.clear();
     m_gbufferSampler.reset();
     m_planeIndexBuffer = nullptr;
     m_planeVertexBuffer = nullptr;
@@ -238,6 +264,7 @@ bool DeferredRenderer::PollModelLoad()
 
 bool DeferredRenderer::UploadModel(const std::filesystem::path& path, GltfModel& model)
 {
+    MRE_PROFILE_ZONE_N("UploadModel");
     MRE_ASSERT(m_device != nullptr, "DeferredRenderer requires a device");
 
     m_device->WaitIdle();
@@ -276,23 +303,34 @@ bool DeferredRenderer::UploadModel(const std::filesystem::path& path, GltfModel&
         return m_device->CreateTexture(textureDesc);
     };
 
+    const auto textureImageIndex = [&model](int textureIndex) {
+        if (textureIndex < 0 || textureIndex >= static_cast<int>(model.textures.size()))
+        {
+            return -1;
+        }
+        return model.textures[static_cast<std::size_t>(textureIndex)].imageIndex;
+    };
+
     m_materials.reserve(model.materials.size());
     for (const GltfMaterial& source : model.materials)
     {
         Material material{};
-        material.baseColorTexture = createTextureFromImage(source.baseColorImage, rhi::Format::R8G8B8A8Srgb);
+        material.baseColorTexture =
+            createTextureFromImage(textureImageIndex(source.baseColorTexture), rhi::Format::R8G8B8A8Srgb);
         material.metallicRoughnessTexture =
-            createTextureFromImage(source.metallicRoughnessImage, rhi::Format::R8G8B8A8Unorm);
+            createTextureFromImage(textureImageIndex(source.metallicRoughnessTexture), rhi::Format::R8G8B8A8Unorm);
 
-        material.descriptorSet = m_device->CreateDescriptorSet(*m_materialSetLayout);
-        material.descriptorSet->BindTexture(
-            0,
-            material.baseColorTexture != nullptr ? *material.baseColorTexture : *m_whiteTexture,
-            *m_gbufferSampler);
-        material.descriptorSet->BindTexture(
-            1,
-            material.metallicRoughnessTexture != nullptr ? *material.metallicRoughnessTexture : *m_whiteTexture,
-            *m_gbufferSampler);
+        if (material.baseColorTexture != nullptr)
+        {
+            m_bindlessSet->BindTexture(0, *material.baseColorTexture, material.baseColorTexture->GetBindlessIndex());
+        }
+        if (material.metallicRoughnessTexture != nullptr)
+        {
+            m_bindlessSet->BindTexture(
+                0,
+                *material.metallicRoughnessTexture,
+                material.metallicRoughnessTexture->GetBindlessIndex());
+        }
 
         m_materials.push_back(std::move(material));
     }
@@ -332,6 +370,9 @@ bool DeferredRenderer::UploadModel(const std::filesystem::path& path, GltfModel&
             item.firstIndex = 0;
             item.pushConstants.model = fit * node.worldTransform;
 
+            const std::uint32_t whiteIndex = m_whiteTexture->GetBindlessIndex();
+            item.pushConstants.textureIndices = glm::uvec2{whiteIndex, whiteIndex};
+
             if (primitive.materialIndex >= 0 &&
                 primitive.materialIndex < static_cast<int>(m_materials.size()))
             {
@@ -342,13 +383,37 @@ bool DeferredRenderer::UploadModel(const std::filesystem::path& path, GltfModel&
                     material.metallicFactor,
                     0.0f,
                     0.0f};
-                item.materialSet = m_materials[static_cast<std::size_t>(primitive.materialIndex)].descriptorSet.get();
+
+                const Material& gpuMaterial = m_materials[static_cast<std::size_t>(primitive.materialIndex)];
+                if (gpuMaterial.baseColorTexture != nullptr)
+                {
+                    item.pushConstants.textureIndices.x = gpuMaterial.baseColorTexture->GetBindlessIndex();
+                }
+                if (gpuMaterial.metallicRoughnessTexture != nullptr)
+                {
+                    item.pushConstants.textureIndices.y = gpuMaterial.metallicRoughnessTexture->GetBindlessIndex();
+                }
+
+                if (material.baseColorTexture >= 0 &&
+                    material.baseColorTexture < static_cast<int>(model.textures.size()))
+                {
+                    const GltfTexture& texture = model.textures[static_cast<std::size_t>(material.baseColorTexture)];
+                    item.pushConstants.samplerIndices.x =
+                        GetSamplerIndex(ToRhiAddressMode(texture.wrapS), ToRhiAddressMode(texture.wrapT));
+                }
+                if (material.metallicRoughnessTexture >= 0 &&
+                    material.metallicRoughnessTexture < static_cast<int>(model.textures.size()))
+                {
+                    const GltfTexture& texture =
+                        model.textures[static_cast<std::size_t>(material.metallicRoughnessTexture)];
+                    item.pushConstants.samplerIndices.y =
+                        GetSamplerIndex(ToRhiAddressMode(texture.wrapS), ToRhiAddressMode(texture.wrapT));
+                }
             }
             else
             {
                 item.pushConstants.baseColorFactor = glm::vec4{0.8f, 0.8f, 0.8f, 1.0f};
                 item.pushConstants.params = glm::vec4{0.6f, 0.0f, 0.0f, 0.0f};
-                item.materialSet = m_defaultMaterialSet.get();
             }
 
             m_modelDrawItems.push_back(item);
@@ -397,6 +462,7 @@ void DeferredRenderer::Render(
     const glm::mat4& viewProjection,
     const glm::vec3& cameraPosition)
 {
+    MRE_PROFILE_ZONE_N("DeferredRenderer::Render");
     MRE_ASSERT(m_initialized, "DeferredRenderer::Render called before DeferredRenderer::Init");
     MRE_ASSERT(m_device != nullptr, "DeferredRenderer requires a device");
 
@@ -429,10 +495,6 @@ void DeferredRenderer::Render(
         {
             commandList.BindVertexBuffer(*item->vertexBuffer);
             commandList.BindIndexBuffer(*item->indexBuffer);
-            if (item->materialSet != nullptr)
-            {
-                commandList.BindDescriptorSet(1, *item->materialSet);
-            }
             commandList.SetPushConstants(
                 &item->pushConstants,
                 sizeof(ObjectPushConstants),
@@ -444,6 +506,8 @@ void DeferredRenderer::Render(
     const bool useSecondaries =
         m_jobSystem != nullptr && m_secondaryBatchCount > 1 && gbufferItems.size() > 1 &&
         frameIndex < m_gbufferSecondaries.size();
+
+    commandList.BeginGpuZone("GBuffer");
 
     if (useSecondaries)
     {
@@ -466,9 +530,12 @@ void DeferredRenderer::Render(
         commandList.BeginRendering(gbufferDesc);
         commandList.BindPipeline(*m_gbufferPipeline);
         commandList.BindDescriptorSet(0, *m_sceneSets[frameIndex]);
+        commandList.BindDescriptorSet(1, *m_bindlessSet);
         drawItems(gbufferItems);
         commandList.EndRendering();
     }
+
+    commandList.EndGpuZone();
 
     if (m_lightingSetsDirty)
     {
@@ -476,11 +543,13 @@ void DeferredRenderer::Render(
         m_lightingSetsDirty = false;
     }
 
+    commandList.BeginGpuZone("Lighting");
     commandList.BeginSwapchainRendering(rhi::ClearColor{0.0f, 0.0f, 0.0f, 1.0f}, true);
     commandList.BindPipeline(*m_lightingPipeline);
     commandList.BindDescriptorSet(0, *m_lightingSets[frameIndex]);
     commandList.Draw(3);
     commandList.EndSwapchainRendering();
+    commandList.EndGpuZone();
 }
 
 std::uint32_t DeferredRenderer::RecordGBufferSecondaries(
@@ -488,6 +557,7 @@ std::uint32_t DeferredRenderer::RecordGBufferSecondaries(
     const rhi::RenderingDesc& desc,
     const std::vector<const DrawItem*>& items)
 {
+    MRE_PROFILE_ZONE_N("RecordGBufferSecondaries");
     MRE_ASSERT(m_jobSystem != nullptr, "RecordGBufferSecondaries requires a job system");
     MRE_ASSERT(frameIndex < m_gbufferSecondaries.size(), "Frame index out of range");
     MRE_ASSERT(!items.empty(), "RecordGBufferSecondaries requires draw items");
@@ -542,16 +612,15 @@ void DeferredRenderer::RecordGBufferBatch(
     secondary.BeginSecondary(desc);
     secondary.BindPipeline(*m_gbufferPipeline);
     secondary.BindDescriptorSet(0, *m_sceneSets[frameIndex]);
+    secondary.BindDescriptorSet(1, *m_bindlessSet);
+
+    secondary.BeginGpuZone("GBufferBatch");
 
     for (std::size_t index = begin; index < end; ++index)
     {
         const DrawItem& item = *items[index];
         secondary.BindVertexBuffer(*item.vertexBuffer);
         secondary.BindIndexBuffer(*item.indexBuffer);
-        if (item.materialSet != nullptr)
-        {
-            secondary.BindDescriptorSet(1, *item.materialSet);
-        }
         secondary.SetPushConstants(
             &item.pushConstants,
             sizeof(ObjectPushConstants),
@@ -559,6 +628,7 @@ void DeferredRenderer::RecordGBufferBatch(
         secondary.DrawIndexed(item.indexCount, item.firstIndex);
     }
 
+    secondary.EndGpuZone();
     secondary.End();
 }
 
@@ -599,7 +669,7 @@ bool DeferredRenderer::CreatePipelines(rhi::Device& device, const std::filesyste
     gbufferPipelineDesc.cullMode = rhi::CullMode::None;
     gbufferPipelineDesc.pushConstantSize = sizeof(ObjectPushConstants);
     gbufferPipelineDesc.pushConstantStages = rhi::ShaderStageMask::VertexFragment;
-    gbufferPipelineDesc.descriptorSetLayouts = {m_sceneSetLayout.get(), m_materialSetLayout.get()};
+    gbufferPipelineDesc.descriptorSetLayouts = {m_sceneSetLayout.get(), m_bindlessSetLayout.get()};
     gbufferPipelineDesc.colorFormats = {
         rhi::Format::R8G8B8A8Unorm,
         rhi::Format::R8G8B8A8Unorm,
@@ -633,10 +703,11 @@ bool DeferredRenderer::CreateScene()
     ground.indexBuffer = m_planeIndexBuffer;
     ground.indexCount = static_cast<std::uint32_t>(std::size(kPlaneIndices));
     ground.firstIndex = 0;
-    ground.materialSet = m_defaultMaterialSet.get();
     ground.pushConstants.model = glm::mat4{1.0f};
     ground.pushConstants.baseColorFactor = glm::vec4{0.35f, 0.35f, 0.38f, 1.0f};
     ground.pushConstants.params = glm::vec4{0.9f, 0.0f, 0.0f, 0.0f};
+    const std::uint32_t whiteIndex = m_whiteTexture->GetBindlessIndex();
+    ground.pushConstants.textureIndices = glm::uvec2{whiteIndex, whiteIndex};
     m_sceneDrawItems.push_back(ground);
 
     MRE_ASSERT(m_planeVertexBuffer != nullptr, "Failed to create the ground plane vertex buffer");
@@ -671,6 +742,36 @@ void DeferredRenderer::UpdateUniforms(
     m_sceneUniform.viewProjection = viewProjection;
     m_sceneUniform.cameraPosition = glm::vec4{cameraPosition, 1.0f};
     m_uniformBuffers[frameIndex]->Write(&m_sceneUniform, sizeof(SceneUniform));
+}
+
+std::uint32_t DeferredRenderer::GetSamplerIndex(rhi::AddressMode addressModeU, rhi::AddressMode addressModeV)
+{
+    MRE_ASSERT(m_device != nullptr, "DeferredRenderer requires a device");
+    MRE_ASSERT(m_bindlessSet != nullptr, "DeferredRenderer requires a bindless descriptor set");
+
+    const std::uint32_t key =
+        (static_cast<std::uint32_t>(addressModeU) << 2) | static_cast<std::uint32_t>(addressModeV);
+
+    const auto existing = m_samplerCache.find(key);
+    if (existing != m_samplerCache.end())
+    {
+        return existing->second;
+    }
+
+    MRE_ASSERT(m_bindlessSamplers.size() < rhi::kMaxBindlessSamplers, "Bindless sampler limit reached");
+
+    rhi::SamplerDesc desc{};
+    desc.addressModeU = addressModeU;
+    desc.addressModeV = addressModeV;
+
+    std::unique_ptr<rhi::Sampler> sampler = m_device->CreateSampler(desc);
+    MRE_ASSERT(sampler != nullptr, "Failed to create a bindless sampler");
+
+    const std::uint32_t index = static_cast<std::uint32_t>(m_bindlessSamplers.size());
+    m_bindlessSet->BindSampler(1, *sampler, index);
+    m_samplerCache.emplace(key, index);
+    m_bindlessSamplers.push_back(std::move(sampler));
+    return index;
 }
 
 } // namespace mukki

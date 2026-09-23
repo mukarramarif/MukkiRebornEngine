@@ -140,4 +140,21 @@ vk::CullModeFlags ToVkCullMode(rhi::CullMode mode)
     MRE_UNREACHABLE();
 }
 
+vk::DescriptorType ToVkDescriptorType(rhi::DescriptorType type)
+{
+    switch (type)
+    {
+    case rhi::DescriptorType::UniformBuffer:
+        return vk::DescriptorType::eUniformBuffer;
+    case rhi::DescriptorType::CombinedImageSampler:
+        return vk::DescriptorType::eCombinedImageSampler;
+    case rhi::DescriptorType::SampledImage:
+        return vk::DescriptorType::eSampledImage;
+    case rhi::DescriptorType::Sampler:
+        return vk::DescriptorType::eSampler;
+    }
+
+    MRE_UNREACHABLE();
+}
+
 } // namespace mukki::vulkan

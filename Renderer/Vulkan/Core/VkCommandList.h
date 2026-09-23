@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 #include <vulkan/vulkan.hpp>
@@ -8,6 +9,7 @@
 
 #include "Renderer/RHI/CommandList.h"
 #include "Renderer/RHI/Resources.h"
+#include "Utilities/ProfilingVulkan.h"
 
 namespace mukki::vulkan
 {
@@ -47,10 +49,16 @@ public:
     void SetPushConstants(const void* data, std::uint32_t size, rhi::ShaderStageMask stages) override;
     void Draw(std::uint32_t vertexCount, std::uint32_t firstVertex) override;
     void DrawIndexed(std::uint32_t indexCount, std::uint32_t firstIndex) override;
+    void BeginGpuZone(const char* name) override;
+    void EndGpuZone() override;
 
     [[nodiscard]] bool IsSecondary() const override { return m_secondary; }
     void BeginSecondary(const rhi::RenderingDesc& desc) override;
     void ExecuteCommands(const std::vector<const rhi::CommandList*>& secondaryCommandLists) override;
+
+#ifdef MRE_ENABLE_TRACY
+    void SetTracyContext(tracy::VkCtx* context) { m_tracyContext = context; }
+#endif
 
     [[nodiscard]] const vk::raii::CommandBuffer& GetHandle() const { return m_commandBuffer; }
     [[nodiscard]] bool WasSwapchainRendered() const { return m_renderedThisFrame; }
@@ -60,6 +68,10 @@ private:
 
     vk::raii::CommandPool m_commandPool{nullptr};
     vk::raii::CommandBuffer m_commandBuffer{nullptr};
+#ifdef MRE_ENABLE_TRACY
+    std::optional<tracy::VkCtxScope> m_gpuZoneScope{};
+    tracy::VkCtx* m_tracyContext = nullptr;
+#endif
     vk::Image m_swapchainImage{nullptr};
     vk::ImageView m_swapchainImageView{nullptr};
     vk::Extent2D m_swapchainExtent{0, 0};

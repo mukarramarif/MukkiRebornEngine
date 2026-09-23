@@ -2,6 +2,7 @@
 
 #include "Utilities/Assert.h"
 #include "Utilities/Log.h"
+#include "Utilities/Profiling.h"
 
 #include <algorithm>
 #include <string>
@@ -20,9 +21,13 @@ namespace
 
 void SetWorkerThreadName(std::uint32_t index)
 {
+    const std::string name = "Worker " + std::to_string(index);
+    MRE_PROFILE_SET_THREAD_NAME(name.c_str());
+    (void)name;
+
 #ifdef _WIN32
-    const std::wstring name = L"mukki worker " + std::to_wstring(index);
-    SetThreadDescription(GetCurrentThread(), name.c_str());
+    const std::wstring wideName = L"mukki worker " + std::to_wstring(index);
+    SetThreadDescription(GetCurrentThread(), wideName.c_str());
 #else
     (void)index;
 #endif
@@ -95,7 +100,10 @@ void JobSystem::WorkerLoop()
         }
 
         MRE_ASSERT(job != nullptr, "JobSystem dequeued an empty job");
-        job();
+        {
+            MRE_PROFILE_ZONE_N("Job");
+            job();
+        }
 
         {
             std::lock_guard lock{m_mutex};

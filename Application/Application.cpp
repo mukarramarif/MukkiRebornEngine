@@ -3,6 +3,7 @@
 #include "Core/Time.h"
 #include "Utilities/Assert.h"
 #include "Utilities/Log.h"
+#include "Utilities/Profiling.h"
 
 #include <algorithm>
 
@@ -39,18 +40,28 @@ void Application::Run()
 {
     MRE_ASSERT(m_initialized, "Application::Run called before Application::Init");
 
+    MRE_PROFILE_SET_THREAD_NAME("MainThread");
+
     Clock clock{};
     m_running = true;
 
     while (m_running && !m_window.ShouldClose())
     {
+        MRE_PROFILE_FRAME_N("Main");
+
         m_window.PollEvents();
         m_input.Update();
         m_keybinds.Update(m_input.GetState());
 
         const float deltaTime = std::min(clock.Tick(), kMaxFrameTime);
-        OnUpdate(deltaTime);
-        OnRender();
+        {
+            MRE_PROFILE_ZONE_N("Update");
+            OnUpdate(deltaTime);
+        }
+        {
+            MRE_PROFILE_ZONE_N("Render");
+            OnRender();
+        }
     }
 
     MRE_INFO("Application loop finished after {:.2f} seconds", clock.GetElapsedSeconds());

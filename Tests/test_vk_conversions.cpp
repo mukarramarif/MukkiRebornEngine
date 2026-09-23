@@ -39,4 +39,16 @@ TEST(VkConversions, PresentModes)
     EXPECT_EQ(mukki::vulkan::ToVkPresentMode(mukki::rhi::PresentMode::Immediate), vk::PresentModeKHR::eImmediate);
 }
 
+TEST(VkConversions, DescriptorTypes)
+{
+    using mukki::rhi::DescriptorType;
+
+    EXPECT_EQ(mukki::vulkan::ToVkDescriptorType(DescriptorType::UniformBuffer), vk::DescriptorType::eUniformBuffer);
+    EXPECT_EQ(
+        mukki::vulkan::ToVkDescriptorType(DescriptorType::CombinedImageSampler),
+        vk::DescriptorType::eCombinedImageSampler);
+    EXPECT_EQ(mukki::vulkan::ToVkDescriptorType(DescriptorType::SampledImage), vk::DescriptorType::eSampledImage);
+    EXPECT_EQ(mukki::vulkan::ToVkDescriptorType(DescriptorType::Sampler), vk::DescriptorType::eSampler);
+}
+
 } // namespace

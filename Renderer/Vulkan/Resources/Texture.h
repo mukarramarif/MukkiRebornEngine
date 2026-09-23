@@ -27,6 +27,9 @@ public:
     [[nodiscard]] std::uint32_t GetHeight() const override { return m_desc.height; }
     [[nodiscard]] rhi::Format GetFormat() const override { return m_desc.format; }
     [[nodiscard]] rhi::TextureUsage GetUsage() const override { return m_desc.usage; }
+    [[nodiscard]] std::uint32_t GetBindlessIndex() const override { return m_bindlessIndex; }
+
+    void SetBindlessIndex(std::uint32_t index) { m_bindlessIndex = index; }
 
     [[nodiscard]] vk::Image GetImage() const { return m_image; }
     [[nodiscard]] vk::ImageView GetImageView() const { return *m_view; }
@@ -41,6 +44,7 @@ private:
     vk::raii::ImageView m_view{nullptr};
     mutable vk::ImageLayout m_layout = vk::ImageLayout::eUndefined;
     rhi::TextureDesc m_desc{};
+    std::uint32_t m_bindlessIndex = 0;
 };
 
 } // namespace mukki::vulkan

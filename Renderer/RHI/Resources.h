@@ -83,7 +83,12 @@ enum class DescriptorType : std::uint8_t
 {
     UniformBuffer = 0,
     CombinedImageSampler,
+    SampledImage,
+    Sampler,
 };
+
+inline constexpr std::uint32_t kMaxBindlessTextures = 4096;
+inline constexpr std::uint32_t kMaxBindlessSamplers = 16;
 
 struct Extent2D
 {
@@ -144,6 +149,7 @@ public:
     [[nodiscard]] virtual std::uint32_t GetHeight() const = 0;
     [[nodiscard]] virtual Format GetFormat() const = 0;
     [[nodiscard]] virtual TextureUsage GetUsage() const = 0;
+    [[nodiscard]] virtual std::uint32_t GetBindlessIndex() const = 0;
 
 protected:
     Texture() = default;
@@ -153,7 +159,8 @@ struct SamplerDesc
 {
     Filter minFilter = Filter::Linear;
     Filter magFilter = Filter::Linear;
-    AddressMode addressMode = AddressMode::ClampToEdge;
+    AddressMode addressModeU = AddressMode::ClampToEdge;
+    AddressMode addressModeV = AddressMode::ClampToEdge;
 };
 
 class Sampler
@@ -207,6 +214,8 @@ struct DescriptorBinding
     std::uint32_t binding = 0;
     DescriptorType type = DescriptorType::UniformBuffer;
     ShaderStageMask stages = ShaderStageMask::VertexFragment;
+    std::uint32_t arrayCount = 1;
+    bool updateAfterBind = false;
 };
 
 class DescriptorSetLayout
@@ -235,6 +244,9 @@ public:
         std::uint64_t offset = 0,
         std::uint64_t range = 0) = 0;
     virtual void BindTexture(std::uint32_t binding, const Texture& texture, const Sampler& sampler) = 0;
+    virtual void BindTexture(std::uint32_t binding, const Texture& texture, std::uint32_t arrayIndex) = 0;
+    virtual void BindSampler(std::uint32_t binding, const Sampler& sampler) = 0;
+    virtual void BindSampler(std::uint32_t binding, const Sampler& sampler, std::uint32_t arrayIndex) = 0;
 
 protected:
     DescriptorSet() = default;

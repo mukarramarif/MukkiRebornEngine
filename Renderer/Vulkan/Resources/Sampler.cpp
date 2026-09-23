@@ -32,16 +32,16 @@ vk::SamplerAddressMode ToVkAddressMode(rhi::AddressMode mode)
 VkSampler::VkSampler(const vk::raii::Device& device, const rhi::SamplerDesc& desc)
 {
     const vk::SamplerCreateInfo createInfo = vk::SamplerCreateInfo{}
-                                                 .setMagFilter(ToVkFilter(desc.magFilter))
-                                                 .setMinFilter(ToVkFilter(desc.minFilter))
-                                                 .setMipmapMode(vk::SamplerMipmapMode::eNearest)
-                                                 .setAddressModeU(ToVkAddressMode(desc.addressMode))
-                                                 .setAddressModeV(ToVkAddressMode(desc.addressMode))
-                                                 .setAddressModeW(ToVkAddressMode(desc.addressMode))
-                                                 .setAnisotropyEnable(false)
-                                                 .setCompareEnable(false)
-                                                 .setBorderColor(vk::BorderColor::eFloatOpaqueBlack)
-                                                 .setUnnormalizedCoordinates(false);
+                                                  .setMagFilter(ToVkFilter(desc.magFilter))
+                                                  .setMinFilter(ToVkFilter(desc.minFilter))
+                                                  .setMipmapMode(vk::SamplerMipmapMode::eNearest)
+                                                  .setAddressModeU(ToVkAddressMode(desc.addressModeU))
+                                                  .setAddressModeV(ToVkAddressMode(desc.addressModeV))
+                                                  .setAddressModeW(ToVkAddressMode(desc.addressModeU))
+                                                  .setAnisotropyEnable(false)
+                                                  .setCompareEnable(false)
+                                                  .setBorderColor(vk::BorderColor::eFloatOpaqueBlack)
+                                                  .setUnnormalizedCoordinates(false);
 
     m_sampler = vk::raii::Sampler{device, createInfo};
 }

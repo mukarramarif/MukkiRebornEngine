@@ -33,8 +33,18 @@ TEST(GltfLoader, LoadsDamagedHelmet)
     EXPECT_FALSE(model.nodes.empty());
     EXPECT_FALSE(model.materials.empty());
     EXPECT_FALSE(model.images.empty());
-    EXPECT_GE(model.materials[0].baseColorImage, 0);
-    EXPECT_LT(model.materials[0].baseColorImage, static_cast<int>(model.images.size()));
+    EXPECT_FALSE(model.textures.empty());
+    EXPECT_GE(model.materials[0].baseColorTexture, 0);
+    EXPECT_LT(model.materials[0].baseColorTexture, static_cast<int>(model.textures.size()));
+    EXPECT_GE(model.materials[0].metallicRoughnessTexture, 0);
+    EXPECT_LT(model.materials[0].metallicRoughnessTexture, static_cast<int>(model.textures.size()));
+
+    // DamagedHelmet's textures use the default sampler, which wraps (UVs range beyond [0, 1]).
+    for (const mukki::GltfTexture& texture : model.textures)
+    {
+        EXPECT_EQ(texture.wrapS, mukki::GltfWrapMode::Repeat);
+        EXPECT_EQ(texture.wrapT, mukki::GltfWrapMode::Repeat);
+    }
 }
 
 TEST(GltfLoader, LoadsNonAsciiPath)

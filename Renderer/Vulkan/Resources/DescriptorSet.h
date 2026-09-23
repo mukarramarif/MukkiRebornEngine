@@ -36,6 +36,9 @@ public:
         std::uint64_t offset,
         std::uint64_t range) override;
     void BindTexture(std::uint32_t binding, const rhi::Texture& texture, const rhi::Sampler& sampler) override;
+    void BindTexture(std::uint32_t binding, const rhi::Texture& texture, std::uint32_t arrayIndex) override;
+    void BindSampler(std::uint32_t binding, const rhi::Sampler& sampler) override;
+    void BindSampler(std::uint32_t binding, const rhi::Sampler& sampler, std::uint32_t arrayIndex) override;
 
     [[nodiscard]] vk::DescriptorSet GetHandle() const { return *m_set; }
 

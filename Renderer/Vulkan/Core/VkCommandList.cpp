@@ -7,6 +7,7 @@
 #include "Renderer/Vulkan/Resources/Texture.h"
 #include "Utilities/Assert.h"
 
+#include <cstring>
 #include <utility>
 #include <vector>
 
@@ -69,6 +70,10 @@ void VkCommandList::Init(const vk::raii::Device& device, std::uint32_t queueFami
 
 void VkCommandList::Shutdown()
 {
+#ifdef MRE_ENABLE_TRACY
+    m_gpuZoneScope.reset();
+    m_tracyContext = nullptr;
+#endif
     m_commandBuffer = vk::raii::CommandBuffer{nullptr};
     m_commandPool = vk::raii::CommandPool{nullptr};
     m_swapchainImage = nullptr;
@@ -120,6 +125,17 @@ void VkCommandList::End()
 {
     MRE_ASSERT(m_recording, "VkCommandList::End called without Begin");
     MRE_ASSERT(m_secondary || !m_rendering, "VkCommandList::End called while a rendering scope is open");
+#ifdef MRE_ENABLE_TRACY
+    MRE_ASSERT(!m_gpuZoneScope.has_value(), "VkCommandList::End called with an open GPU zone");
+#endif
+
+#ifdef MRE_ENABLE_TRACY
+    if (!m_secondary && m_tracyContext != nullptr)
+    {
+        // Collect must run while the command buffer is still recording.
+        m_tracyContext->Collect(static_cast<VkCommandBuffer>(*m_commandBuffer));
+    }
+#endif
 
     m_commandBuffer.end();
     m_recording = false;
@@ -425,6 +441,41 @@ void VkCommandList::ExecuteCommands(const std::vector<const rhi::CommandList*>& 
     }
 
     m_commandBuffer.executeCommands(commandBuffers);
+}
+
+void VkCommandList::BeginGpuZone(const char* name)
+{
+    MRE_ASSERT(m_recording, "VkCommandList::BeginGpuZone called outside of a recording scope");
+    MRE_ASSERT(name != nullptr, "VkCommandList::BeginGpuZone requires a zone name");
+
+#ifdef MRE_ENABLE_TRACY
+    MRE_ASSERT(!m_gpuZoneScope.has_value(), "VkCommandList::BeginGpuZone called with an open GPU zone");
+    MRE_ASSERT(m_tracyContext != nullptr, "VkCommandList::BeginGpuZone requires a Tracy context");
+
+    m_gpuZoneScope.emplace(
+        m_tracyContext,
+        __LINE__,
+        __FILE__,
+        std::strlen(__FILE__),
+        __FUNCTION__,
+        std::strlen(__FUNCTION__),
+        name,
+        std::strlen(name),
+        static_cast<VkCommandBuffer>(*m_commandBuffer),
+        true);
+#else
+    (void)name;
+#endif
+}
+
+void VkCommandList::EndGpuZone()
+{
+    MRE_ASSERT(m_recording, "VkCommandList::EndGpuZone called outside of a recording scope");
+
+#ifdef MRE_ENABLE_TRACY
+    MRE_ASSERT(m_gpuZoneScope.has_value(), "VkCommandList::EndGpuZone called without an open GPU zone");
+    m_gpuZoneScope.reset();
+#endif
 }
 
 void VkCommandList::BindPipeline(const rhi::Pipeline& pipeline)

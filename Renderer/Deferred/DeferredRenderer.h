@@ -4,9 +4,11 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <glm/mat4x4.hpp>
+#include <glm/vec2.hpp>
 #include <glm/vec3.hpp>
 #include <glm/vec4.hpp>
 
@@ -34,6 +36,8 @@ struct ObjectPushConstants
     glm::mat4 model{1.0f};
     glm::vec4 baseColorFactor{1.0f};
     glm::vec4 params{0.0f};
+    glm::uvec2 textureIndices{0u};
+    glm::uvec2 samplerIndices{0u};
 };
 
 class DeferredRenderer
@@ -79,7 +83,6 @@ private:
         rhi::Buffer* indexBuffer = nullptr;
         std::uint32_t indexCount = 0;
         std::uint32_t firstIndex = 0;
-        rhi::DescriptorSet* materialSet = nullptr;
         ObjectPushConstants pushConstants{};
     };
 
@@ -87,7 +90,6 @@ private:
     {
         std::unique_ptr<rhi::Texture> baseColorTexture{};
         std::unique_ptr<rhi::Texture> metallicRoughnessTexture{};
-        std::unique_ptr<rhi::DescriptorSet> descriptorSet{};
     };
 
     bool CreatePipelines(rhi::Device& device, const std::filesystem::path& shaderDirectory);
@@ -95,6 +97,7 @@ private:
     void CreateLightingSets(rhi::Device& device);
     void UpdateUniforms(std::uint32_t frameIndex, const glm::mat4& viewProjection, const glm::vec3& cameraPosition);
     bool UploadModel(const std::filesystem::path& path, GltfModel& model);
+    [[nodiscard]] std::uint32_t GetSamplerIndex(rhi::AddressMode addressModeU, rhi::AddressMode addressModeV);
     [[nodiscard]] std::uint32_t RecordGBufferSecondaries(
         std::uint32_t frameIndex,
         const rhi::RenderingDesc& desc,
@@ -116,11 +119,13 @@ private:
     rhi::Buffer* m_planeVertexBuffer = nullptr;
     rhi::Buffer* m_planeIndexBuffer = nullptr;
     std::unique_ptr<rhi::Sampler> m_gbufferSampler{};
+    std::vector<std::unique_ptr<rhi::Sampler>> m_bindlessSamplers{};
+    std::unordered_map<std::uint32_t, std::uint32_t> m_samplerCache{};
     std::unique_ptr<rhi::Texture> m_whiteTexture{};
     std::unique_ptr<rhi::DescriptorSetLayout> m_sceneSetLayout{};
-    std::unique_ptr<rhi::DescriptorSetLayout> m_materialSetLayout{};
+    std::unique_ptr<rhi::DescriptorSetLayout> m_bindlessSetLayout{};
     std::unique_ptr<rhi::DescriptorSetLayout> m_lightingSetLayout{};
-    std::unique_ptr<rhi::DescriptorSet> m_defaultMaterialSet{};
+    std::unique_ptr<rhi::DescriptorSet> m_bindlessSet{};
     std::vector<std::unique_ptr<rhi::DescriptorSet>> m_sceneSets{};
     std::vector<std::unique_ptr<rhi::DescriptorSet>> m_lightingSets{};
     std::vector<Material> m_materials{};
