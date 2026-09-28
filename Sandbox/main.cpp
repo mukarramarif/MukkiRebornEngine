@@ -407,6 +407,18 @@ private:
             m_renderer->UnloadModel();
         }
 
+        ImGui::SeparatorText("Transform");
+        float modelScale = m_renderer->GetModelScale();
+        if (ImGui::SliderFloat("Uniform scale", &modelScale, 0.1f, 10.0f, "%.2f"))
+        {
+            m_renderer->SetModelScale(modelScale);
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Reset"))
+        {
+            m_renderer->SetModelScale(1.0f);
+        }
+
         ImGui::Separator();
         ImGui::Text("Vertices: %llu", static_cast<unsigned long long>(m_renderer->GetModelVertexCount()));
         ImGui::Text("Triangles: %llu", static_cast<unsigned long long>(m_renderer->GetModelTriangleCount()));

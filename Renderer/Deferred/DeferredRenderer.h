@@ -91,6 +91,11 @@ public:
     void SetLights(std::span<const Light> lights);
     [[nodiscard]] std::uint32_t GetLightCount() const;
 
+    // Uniform scale applied to the loaded glTF model about the world origin. The ground plane is
+    // not affected.
+    void SetModelScale(float scale);
+    [[nodiscard]] float GetModelScale() const { return m_modelScale; }
+
     // Replaces the lit image with a heatmap of the clustered light counts for debugging.
     void SetClusterDebugView(bool enabled) { m_clusterDebugView = enabled; }
     [[nodiscard]] bool IsClusterDebugViewEnabled() const { return m_clusterDebugView; }
@@ -132,6 +137,7 @@ private:
     bool CreateClusterResources(rhi::Device& device);
     void CreateLightingSets(rhi::Device& device);
     void UpdateUniforms(std::uint32_t frameIndex, const FrameView& view);
+    void ApplyModelScale();
     bool UploadModel(const std::filesystem::path& path, GltfModel& model);
     [[nodiscard]] std::uint32_t GetSamplerIndex(rhi::AddressMode addressModeU, rhi::AddressMode addressModeV);
     [[nodiscard]] std::uint32_t RecordGBufferSecondaries(
@@ -177,6 +183,7 @@ private:
     std::unique_ptr<rhi::Pipeline> m_clusterCullingPipeline{};
     std::vector<DrawItem> m_sceneDrawItems{};
     std::vector<DrawItem> m_modelDrawItems{};
+    std::vector<glm::mat4> m_modelBaseTransforms{};
     std::vector<std::unique_ptr<rhi::Buffer>> m_modelVertexBuffers{};
     std::vector<std::unique_ptr<rhi::Buffer>> m_modelIndexBuffers{};
     std::vector<std::vector<std::unique_ptr<rhi::CommandList>>> m_gbufferSecondaries{};
@@ -193,6 +200,7 @@ private:
     std::string m_modelName{};
     std::uint64_t m_modelVertexCount = 0;
     std::uint64_t m_modelTriangleCount = 0;
+    float m_modelScale = 1.0f;
     std::uint32_t m_secondaryBatchCount = 1;
     bool m_lightingSetsDirty = true;
     bool m_clusterDebugView = false;

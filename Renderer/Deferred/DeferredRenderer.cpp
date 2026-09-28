@@ -222,7 +222,9 @@ void DeferredRenderer::Shutdown()
     m_gbuffer.Shutdown();
     m_device = nullptr;
     m_jobSystem = nullptr;
+    m_modelScale = 1.0f;
     m_lightingSetsDirty = true;
+    m_clusterDebugView = false;
     m_initialized = false;
 }
 
@@ -453,8 +455,11 @@ bool DeferredRenderer::UploadModel(const std::filesystem::path& path, GltfModel&
             }
 
             m_modelDrawItems.push_back(item);
+            m_modelBaseTransforms.push_back(item.pushConstants.model);
         }
     }
+
+    ApplyModelScale();
 
     m_modelName = PathToUtf8(path.filename());
     m_modelVertexCount = model.vertexCount;
@@ -485,12 +490,33 @@ void DeferredRenderer::UnloadModel()
 {
     m_asyncLoader.Reset();
     m_modelDrawItems.clear();
+    m_modelBaseTransforms.clear();
     m_modelVertexBuffers.clear();
     m_modelIndexBuffers.clear();
     m_materials.clear();
     m_modelName.clear();
     m_modelVertexCount = 0;
     m_modelTriangleCount = 0;
+}
+
+void DeferredRenderer::SetModelScale(float scale)
+{
+    MRE_ASSERT(scale > 0.0f, "Model scale must be greater than zero");
+    m_modelScale = std::clamp(scale, 0.01f, 100.0f);
+    ApplyModelScale();
+}
+
+void DeferredRenderer::ApplyModelScale()
+{
+    MRE_ASSERT(
+        m_modelBaseTransforms.size() == m_modelDrawItems.size(),
+        "Model draw items and base transforms are out of sync");
+
+    const glm::mat4 scaleMatrix = glm::scale(glm::mat4{1.0f}, glm::vec3{m_modelScale});
+    for (std::size_t index = 0; index < m_modelDrawItems.size(); ++index)
+    {
+        m_modelDrawItems[index].pushConstants.model = scaleMatrix * m_modelBaseTransforms[index];
+    }
 }
 
 void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& view)
