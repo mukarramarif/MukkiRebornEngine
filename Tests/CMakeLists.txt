@@ -11,6 +11,8 @@ add_executable(mukki_tests
     test_log.cpp
     test_path_utils.cpp
     test_resources.cpp
+    test_scene_binary.cpp
+    test_scene_json.cpp
     test_vk_conversions.cpp
 )
 target_compile_definitions(mukki_tests PRIVATE MRE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/..")

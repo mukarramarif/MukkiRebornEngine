@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -24,6 +25,7 @@ namespace mukki
 {
 
 class JobSystem;
+struct SceneDescription;
 
 struct SceneUniform
 {
@@ -105,6 +107,12 @@ public:
     bool PollModelLoad();
     void UnloadModel();
 
+    // Loads every glTF object and light from a scene description. Models referenced more than once
+    // are loaded and uploaded only once. Replaces the current models and lights; the ground plane
+    // is kept.
+    bool LoadScene(const SceneDescription& scene);
+    void ClearScene();
+
     [[nodiscard]] bool IsInitialized() const { return m_initialized; }
     [[nodiscard]] bool IsModelLoading() const { return m_asyncLoader.IsLoading(); }
     [[nodiscard]] bool HasModel() const { return !m_modelDrawItems.empty(); }
@@ -132,13 +140,28 @@ private:
         std::unique_ptr<rhi::Texture> metallicRoughnessTexture{};
     };
 
+    struct ModelResources
+    {
+        std::string name{};
+        std::vector<Material> materials{};
+        std::vector<std::unique_ptr<rhi::Buffer>> vertexBuffers{};
+        std::vector<std::unique_ptr<rhi::Buffer>> indexBuffers{};
+        std::vector<DrawItem> drawItems{};
+        std::uint64_t vertexCount = 0;
+        std::uint64_t triangleCount = 0;
+    };
+
     bool CreatePipelines(rhi::Device& device, const std::filesystem::path& shaderDirectory);
     bool CreateScene();
     bool CreateClusterResources(rhi::Device& device);
     void CreateLightingSets(rhi::Device& device);
     void UpdateUniforms(std::uint32_t frameIndex, const FrameView& view);
     void ApplyModelScale();
-    bool UploadModel(const std::filesystem::path& path, GltfModel& model);
+    [[nodiscard]] std::optional<std::size_t> UploadModel(const std::filesystem::path& path, GltfModel& model);
+    [[nodiscard]] std::optional<std::size_t> LoadModelResources(const std::filesystem::path& path);
+    void AddModelInstance(std::size_t modelIndex, const glm::mat4& transform);
+    void ClearModelInstances();
+    void ClearModels();
     [[nodiscard]] std::uint32_t GetSamplerIndex(rhi::AddressMode addressModeU, rhi::AddressMode addressModeV);
     [[nodiscard]] std::uint32_t RecordGBufferSecondaries(
         std::uint32_t frameIndex,
@@ -172,7 +195,6 @@ private:
     std::vector<std::unique_ptr<rhi::DescriptorSet>> m_sceneSets{};
     std::vector<std::unique_ptr<rhi::DescriptorSet>> m_lightingSets{};
     std::vector<std::unique_ptr<rhi::DescriptorSet>> m_clusterSets{};
-    std::vector<Material> m_materials{};
     std::unique_ptr<rhi::Shader> m_gbufferVertexShader{};
     std::unique_ptr<rhi::Shader> m_gbufferFragmentShader{};
     std::unique_ptr<rhi::Shader> m_lightingVertexShader{};
@@ -184,8 +206,8 @@ private:
     std::vector<DrawItem> m_sceneDrawItems{};
     std::vector<DrawItem> m_modelDrawItems{};
     std::vector<glm::mat4> m_modelBaseTransforms{};
-    std::vector<std::unique_ptr<rhi::Buffer>> m_modelVertexBuffers{};
-    std::vector<std::unique_ptr<rhi::Buffer>> m_modelIndexBuffers{};
+    std::vector<std::unique_ptr<ModelResources>> m_models{};
+    std::unordered_map<std::string, std::size_t> m_modelCache{};
     std::vector<std::vector<std::unique_ptr<rhi::CommandList>>> m_gbufferSecondaries{};
     std::vector<std::unique_ptr<rhi::Buffer>> m_lightBuffers{};
     std::vector<std::unique_ptr<rhi::Buffer>> m_clusterUniformBuffers{};

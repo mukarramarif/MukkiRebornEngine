@@ -3,6 +3,7 @@
 #include "Assets/GltfLoader.h"
 #include "Core/JobSystem.h"
 #include "Renderer/RHI/Device.h"
+#include "Scene/SceneDescription.h"
 #include "Utilities/Assert.h"
 #include "Utilities/Log.h"
 #include "Utilities/PathUtils.h"
@@ -188,7 +189,6 @@ void DeferredRenderer::Shutdown()
     m_lightingSets.clear();
     m_clusterSets.clear();
     m_sceneSets.clear();
-    m_materials.clear();
     m_clusterCullingPipeline.reset();
     m_lightingPipeline.reset();
     m_gbufferPipeline.reset();
@@ -272,7 +272,81 @@ bool DeferredRenderer::LoadModel(const std::filesystem::path& path)
         return false;
     }
 
-    return UploadModel(path, model);
+    m_device->WaitIdle();
+    ClearModelInstances();
+    ClearModels();
+
+    const std::optional<std::size_t> modelIndex = UploadModel(path, model);
+    if (!modelIndex.has_value())
+    {
+        return false;
+    }
+
+    AddModelInstance(*modelIndex, glm::mat4{1.0f});
+    return true;
+}
+
+bool DeferredRenderer::LoadScene(const SceneDescription& scene)
+{
+    MRE_ASSERT(m_initialized, "DeferredRenderer::LoadScene called before DeferredRenderer::Init");
+    MRE_ASSERT(m_device != nullptr, "DeferredRenderer requires a device");
+
+    m_device->WaitIdle();
+    ClearModelInstances();
+    ClearModels();
+
+    std::vector<std::size_t> modelIndices{};
+    modelIndices.reserve(scene.objects.size());
+    for (const SceneObject& object : scene.objects)
+    {
+        const std::filesystem::path modelPath = ResolveModelPath(scene, object);
+        const std::optional<std::size_t> modelIndex = LoadModelResources(modelPath);
+        if (!modelIndex.has_value())
+        {
+            MRE_ERROR(
+                "Failed to load model '{}' for scene object '{}'",
+                PathToUtf8(modelPath),
+                object.name);
+            return false;
+        }
+        modelIndices.push_back(*modelIndex);
+    }
+
+    std::vector<Light> lights{};
+    lights.reserve(scene.lights.size());
+    for (const SceneLight& sceneLight : scene.lights)
+    {
+        lights.push_back(sceneLight.light);
+    }
+    SetLights(lights);
+
+    for (std::size_t index = 0; index < scene.objects.size(); ++index)
+    {
+        AddModelInstance(modelIndices[index], BuildObjectTransform(scene.objects[index]));
+    }
+
+    m_modelName = scene.name;
+    m_modelVertexCount = 0;
+    m_modelTriangleCount = 0;
+    for (const std::size_t modelIndex : modelIndices)
+    {
+        m_modelVertexCount += m_models[modelIndex]->vertexCount;
+        m_modelTriangleCount += m_models[modelIndex]->triangleCount;
+    }
+
+    MRE_INFO(
+        "Loaded scene '{}' ({} objects, {} lights, {} vertices)",
+        scene.name,
+        scene.objects.size(),
+        scene.lights.size(),
+        m_modelVertexCount);
+    return true;
+}
+
+void DeferredRenderer::ClearScene()
+{
+    UnloadModel();
+    SetLights({});
 }
 
 void DeferredRenderer::RequestModelLoad(const std::filesystem::path& path)
@@ -297,16 +371,29 @@ bool DeferredRenderer::PollModelLoad()
         return false;
     }
 
-    return UploadModel(result.path, result.model);
+    m_device->WaitIdle();
+    ClearModelInstances();
+    ClearModels();
+
+    const std::optional<std::size_t> modelIndex = UploadModel(result.path, result.model);
+    if (!modelIndex.has_value())
+    {
+        return false;
+    }
+
+    AddModelInstance(*modelIndex, glm::mat4{1.0f});
+    return true;
 }
 
-bool DeferredRenderer::UploadModel(const std::filesystem::path& path, GltfModel& model)
+std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::path& path, GltfModel& model)
 {
     MRE_PROFILE_ZONE_N("UploadModel");
     MRE_ASSERT(m_device != nullptr, "DeferredRenderer requires a device");
 
-    m_device->WaitIdle();
-    UnloadModel();
+    auto resources = std::make_unique<ModelResources>();
+    resources->name = PathToUtf8(path.filename());
+    resources->vertexCount = model.vertexCount;
+    resources->triangleCount = model.triangleCount;
 
     const glm::vec3 center = (model.minBounds + model.maxBounds) * 0.5f;
     const glm::vec3 extent = model.maxBounds - model.minBounds;
@@ -349,7 +436,7 @@ bool DeferredRenderer::UploadModel(const std::filesystem::path& path, GltfModel&
         return model.textures[static_cast<std::size_t>(textureIndex)].imageIndex;
     };
 
-    m_materials.reserve(model.materials.size());
+    resources->materials.reserve(model.materials.size());
     for (const GltfMaterial& source : model.materials)
     {
         Material material{};
@@ -370,21 +457,21 @@ bool DeferredRenderer::UploadModel(const std::filesystem::path& path, GltfModel&
                 material.metallicRoughnessTexture->GetBindlessIndex());
         }
 
-        m_materials.push_back(std::move(material));
+        resources->materials.push_back(std::move(material));
     }
 
-    m_modelVertexBuffers.reserve(model.primitives.size());
-    m_modelIndexBuffers.reserve(model.primitives.size());
+    resources->vertexBuffers.reserve(model.primitives.size());
+    resources->indexBuffers.reserve(model.primitives.size());
     for (const GltfPrimitive& primitive : model.primitives)
     {
         const std::uint64_t vertexBytes = sizeof(GltfVertex) * primitive.vertices.size();
         const std::uint64_t indexBytes = sizeof(std::uint32_t) * primitive.indices.size();
 
-        m_modelVertexBuffers.push_back(m_device->CreateBuffer(
+        resources->vertexBuffers.push_back(m_device->CreateBuffer(
             rhi::BufferDesc{vertexBytes, rhi::BufferUsage::Vertex, false},
             primitive.vertices.data(),
             vertexBytes));
-        m_modelIndexBuffers.push_back(m_device->CreateBuffer(
+        resources->indexBuffers.push_back(m_device->CreateBuffer(
             rhi::BufferDesc{indexBytes, rhi::BufferUsage::Index, false},
             primitive.indices.data(),
             indexBytes));
@@ -402,8 +489,8 @@ bool DeferredRenderer::UploadModel(const std::filesystem::path& path, GltfModel&
             const GltfPrimitive& primitive = model.primitives[primitiveIndex];
 
             DrawItem item{};
-            item.vertexBuffer = m_modelVertexBuffers[primitiveIndex].get();
-            item.indexBuffer = m_modelIndexBuffers[primitiveIndex].get();
+            item.vertexBuffer = resources->vertexBuffers[primitiveIndex].get();
+            item.indexBuffer = resources->indexBuffers[primitiveIndex].get();
             item.indexCount = static_cast<std::uint32_t>(primitive.indices.size());
             item.firstIndex = 0;
             item.pushConstants.model = fit * node.worldTransform;
@@ -412,7 +499,7 @@ bool DeferredRenderer::UploadModel(const std::filesystem::path& path, GltfModel&
             item.pushConstants.textureIndices = glm::uvec2{whiteIndex, whiteIndex};
 
             if (primitive.materialIndex >= 0 &&
-                primitive.materialIndex < static_cast<int>(m_materials.size()))
+                primitive.materialIndex < static_cast<int>(resources->materials.size()))
             {
                 const GltfMaterial& material = model.materials[static_cast<std::size_t>(primitive.materialIndex)];
                 item.pushConstants.baseColorFactor = material.baseColorFactor;
@@ -422,7 +509,7 @@ bool DeferredRenderer::UploadModel(const std::filesystem::path& path, GltfModel&
                     0.0f,
                     0.0f};
 
-                const Material& gpuMaterial = m_materials[static_cast<std::size_t>(primitive.materialIndex)];
+                const Material& gpuMaterial = resources->materials[static_cast<std::size_t>(primitive.materialIndex)];
                 if (gpuMaterial.baseColorTexture != nullptr)
                 {
                     item.pushConstants.textureIndices.x = gpuMaterial.baseColorTexture->GetBindlessIndex();
@@ -454,19 +541,12 @@ bool DeferredRenderer::UploadModel(const std::filesystem::path& path, GltfModel&
                 item.pushConstants.params = glm::vec4{0.6f, 0.0f, 0.0f, 0.0f};
             }
 
-            m_modelDrawItems.push_back(item);
-            m_modelBaseTransforms.push_back(item.pushConstants.model);
+            resources->drawItems.push_back(item);
         }
     }
 
-    ApplyModelScale();
-
-    m_modelName = PathToUtf8(path.filename());
-    m_modelVertexCount = model.vertexCount;
-    m_modelTriangleCount = model.triangleCount;
-
     std::size_t textureCount = 0;
-    for (const Material& material : m_materials)
+    for (const Material& material : resources->materials)
     {
         if (material.baseColorTexture != nullptr)
         {
@@ -478,22 +558,84 @@ bool DeferredRenderer::UploadModel(const std::filesystem::path& path, GltfModel&
         }
     }
 
+    const std::size_t modelIndex = m_models.size();
+    m_models.push_back(std::move(resources));
+
+    m_modelName = m_models[modelIndex]->name;
+    m_modelVertexCount = m_models[modelIndex]->vertexCount;
+    m_modelTriangleCount = m_models[modelIndex]->triangleCount;
+
     MRE_INFO(
         "Model '{}' uploaded ({} draw items, {} textures)",
         m_modelName,
-        m_modelDrawItems.size(),
+        m_models[modelIndex]->drawItems.size(),
         textureCount);
-    return true;
+    return modelIndex;
+}
+
+std::optional<std::size_t> DeferredRenderer::LoadModelResources(const std::filesystem::path& path)
+{
+    std::error_code absoluteError{};
+    const std::filesystem::path absolute = std::filesystem::absolute(path, absoluteError);
+    const std::string key =
+        PathToUtf8((absoluteError ? path : absolute).lexically_normal());
+
+    if (const auto existing = m_modelCache.find(key); existing != m_modelCache.end())
+    {
+        return existing->second;
+    }
+
+    GltfModel model{};
+    if (!LoadGltfModel(path, model))
+    {
+        return std::nullopt;
+    }
+
+    const std::optional<std::size_t> modelIndex = UploadModel(path, model);
+    if (modelIndex.has_value())
+    {
+        m_modelCache.emplace(key, *modelIndex);
+    }
+    return modelIndex;
+}
+
+void DeferredRenderer::AddModelInstance(std::size_t modelIndex, const glm::mat4& transform)
+{
+    MRE_ASSERT(modelIndex < m_models.size(), "Model index out of range");
+
+    const ModelResources& model = *m_models[modelIndex];
+    const glm::mat4 scaleMatrix = glm::scale(glm::mat4{1.0f}, glm::vec3{m_modelScale});
+    for (const DrawItem& source : model.drawItems)
+    {
+        DrawItem instance = source;
+        const glm::mat4 baseTransform = transform * source.pushConstants.model;
+        instance.pushConstants.model = scaleMatrix * baseTransform;
+        m_modelDrawItems.push_back(instance);
+        m_modelBaseTransforms.push_back(baseTransform);
+    }
+}
+
+void DeferredRenderer::ClearModelInstances()
+{
+    m_modelDrawItems.clear();
+    m_modelBaseTransforms.clear();
+}
+
+void DeferredRenderer::ClearModels()
+{
+    m_modelCache.clear();
+    m_models.clear();
 }
 
 void DeferredRenderer::UnloadModel()
 {
     m_asyncLoader.Reset();
-    m_modelDrawItems.clear();
-    m_modelBaseTransforms.clear();
-    m_modelVertexBuffers.clear();
-    m_modelIndexBuffers.clear();
-    m_materials.clear();
+    if (m_device != nullptr)
+    {
+        m_device->WaitIdle();
+    }
+    ClearModelInstances();
+    ClearModels();
     m_modelName.clear();
     m_modelVertexCount = 0;
     m_modelTriangleCount = 0;

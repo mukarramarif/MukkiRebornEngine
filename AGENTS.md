@@ -19,7 +19,13 @@ must not expose backend types, and Vulkan types may only appear under `Renderer/
 - 2 frames in flight, no MSAA initially.
 - Slang shaders compiled at build time with `slangc` (found through `$ENV{VULKAN_SDK}`).
 - The engine will be using tinygltf and ktx libraries for loading glTF and KTX2 assets, respectively. The engine will support PBR materials and textures, as well as animation and skinning. tinygltf is pinned to 2.9.3 via a `vcpkg.json` override and served from `overlay-ports/tinygltf` because the registry port hashes are stale after GitHub regenerated its release tarballs. Sample models live in the shallow `ThirdParty/glTF-Sample-Models` submodule.
-- Scenes created in the engine are to stored as json and loaded at runtime. The engine will support a scene graph and entity-component-system architecture for managing game objects and their components. The json will be serialized and deserialized using the nlohmann/json library.
+- Scenes: authored as JSON with nlohmann/json under `Scene/` (`SceneJson`), compiled offline or
+  in-tool into the little-endian `SceneBinary` bytecode (magic `MRES`), and loaded by the engine
+  from that bytecode at runtime. `SceneDescription` holds glTF object instances (model path plus
+  position/rotation/scale) and named lights. Compile with `mukki_scene_compiler <scene.json>
+  [scene.mres]`; the sandbox compiles and loads `Sandbox/Scenes/demo.scene.json`. `DeferredRenderer
+  ::LoadScene` loads/caches the referenced glTF models and instantiates them. A scene graph and
+  entity-component-system architecture is still planned.
 - Namespace `mukki`; PascalCase files/types/methods; `m_` prefixed members.
 - Multithreading: `Core/JobSystem` is the shared thread pool. glTF parsing runs asynchronously
   (`Assets/AsyncGltfLoader`) and the G-buffer draw calls are recorded into secondary command buffers

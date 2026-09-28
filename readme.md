@@ -39,8 +39,8 @@ git clone --recurse-submodules <repository-url>
 git submodule update --init --depth 1
 ```
 
-Without the submodule the engine still builds and tests pass, but the sandbox model browser is
-disabled.
+Without the submodule the engine still builds and tests pass, but the default demo scene cannot
+load its models.
 
 Shader compilation uses `slangc` from the Vulkan SDK, found through the `VULKAN_SDK` environment
 variable (or on `PATH`). If `slangc` is missing, CMake prints a warning, shader targets are skipped
@@ -92,14 +92,116 @@ copied next to the executable automatically.
 ```
 
 Pass `--frames N` to run a fixed number of frames and exit (used for smoke testing). Pass
-`--model <path>` to load a specific glTF/GLB file instead of the default sample model.
+`--model <path>` to load a specific glTF/GLB file instead of the default scene, or `--scene <path>`
+to load a JSON scene (compiled to bytecode next to the executable, see [Scenes](#scenes)).
 
 Controls: `WASD`/`QE` to move, mouse to look, `Shift` to move faster, `Tab` to toggle the cursor for
 UI interaction (or hold `Left Alt`), `Esc` to quit.
 
-The sandbox has a model browser window listing the sample models from the submodule (the `glTF` and
-`glTF-Binary` variants of `2.0/`), a G-buffer debug window, and an ImGui demo window. Loaded models
-are auto-fitted to the ground plane.
+The sandbox has a scene browser window listing the JSON scenes in `Sandbox/Scenes`, a scene window
+with the light editor, a G-buffer debug window, and an ImGui demo window. glTF objects loaded from a
+scene are auto-fitted to the ground plane.
+
+## Scenes
+
+Scenes are authored as JSON and compiled into compact little-endian bytecode (magic `MRES`) that the
+engine loads at runtime. The JSON is the source format; the bytecode is the only scene format the
+renderer reads.
+
+### Authoring
+
+A minimal scene:
+
+```json
+{
+  "name": "My Scene",
+  "assetRoot": "assets/models",
+  "objects": [
+    {
+      "name": "Helmet",
+      "model": "DamagedHelmet/glTF/DamagedHelmet.gltf",
+      "position": [0.0, 0.0, 0.0],
+      "rotation": [0.0, 45.0, 0.0],
+      "scale": [1.0, 1.0, 1.0]
+    }
+  ],
+  "lights": [
+    {
+      "name": "Sun",
+      "type": "directional",
+      "direction": [-0.4, -1.0, -0.3],
+      "color": [1.0, 0.97, 0.92],
+      "intensity": 0.6
+    },
+    {
+      "name": "Lamp",
+      "type": "point",
+      "position": [2.0, 2.0, 0.0],
+      "color": [1.0, 0.4, 0.2],
+      "intensity": 1.5,
+      "range": 5.0
+    },
+    {
+      "name": "Cone",
+      "type": "spot",
+      "position": [0.0, 3.5, 0.0],
+      "direction": [0.0, -1.0, 0.0],
+      "color": [0.3, 0.6, 1.0],
+      "intensity": 3.0,
+      "range": 9.0,
+      "innerConeAngle": 20.0,
+      "outerConeAngle": 35.0
+    }
+  ]
+}
+```
+
+- `assetRoot` is optional; relative `model` paths are resolved against it. It defaults to the
+  directory containing the JSON file.
+- `rotation` is Euler degrees applied in YXZ order. `position` and `scale` are in world units.
+- Light `type` is `directional`, `point` or `spot`; cone angles are degrees. Point and spot lights
+  use `range`, directional lights ignore `position`/`range`, and point lights ignore `direction`.
+- Up to 256 lights (`kMaxLights`) and any number of glTF objects are supported. Models referenced
+  more than once are loaded once and instanced.
+- `Sandbox/Scenes/demo.scene.json` is a complete example with 7 glTF objects and 25 lights.
+
+### Compiling
+
+`mukki_scene_compiler` converts a JSON scene into bytecode:
+
+```powershell
+# writes Sandbox\Scenes\demo.scene.mres
+.\build\windows-debug\Debug\mukki_scene_compiler.exe Sandbox\Scenes\demo.scene.json
+
+# explicit output and asset root override
+.\build\windows-debug\Debug\mukki_scene_compiler.exe scene.json out\scene.mres --asset-root assets\models
+```
+
+Without an output path the bytecode is written next to the JSON file, replacing the `.json` extension
+with `.mres`.
+
+### Loading scenes from the command line
+
+The sandbox compiles the JSON to bytecode next to the executable (`<exe>\scenes\<name>.mres`) and
+then loads only that bytecode:
+
+```powershell
+# default: Sandbox/Scenes/demo.scene.json -> <exe>\scenes\demo.scene.mres
+.\build\windows-debug\Debug\mukki_sandbox.exe
+
+# any scene JSON
+.\build\windows-debug\Debug\mukki_sandbox.exe --scene C:\scenes\city.scene.json
+
+# smoke test a scene for a fixed number of frames
+.\build\windows-debug\Debug\mukki_sandbox.exe --scene Sandbox\Scenes\demo.scene.json --frames 240
+```
+
+In the sandbox, the `Scenes` window browses and loads the JSON scenes found in `Sandbox/Scenes`
+(with a global transform scale). The `Scene` window lists the loaded objects and lights; selecting a
+light opens a `Type` dropdown (directional/point/spot) plus position, direction, color, `Strength`,
+range and cone controls. `Reload JSON -> bytecode` recompiles the source file, `Compile bytecode`
+writes the current in-memory edits to `<exe>\scenes\<name>.mres`, and `Save JSON` dumps them back to
+`<exe>\scenes\<name>.json`.
 
 ## Layout
 
@@ -109,11 +211,14 @@ are auto-fitted to the ground plane.
 - `Renderer/RHI/` - vendor-agnostic render hardware interface (device, command lists, resources)
 - `Renderer/Vulkan/` - Vulkan backend implementation
 - `Renderer/Deferred/` - deferred renderer (G-buffer, lighting, tonemapping)
+- `Renderer/Lighting/` - light types and the clustered light grid
 - `Renderer/Shaders/` - Slang shaders compiled at build time
 - `Renderer/BufferManager` - vertex/index/uniform buffer management
+- `Scene/` - scene description, JSON authoring (nlohmann/json) and `MRES` bytecode
+- `Tools/` - command line tools (`mukki_scene_compiler`)
 - `ThirdParty/` - submodules (glTF sample models)
 - `Utilities/` - logging, asserts, future containers and allocators
 - `Tests/` - GoogleTest unit tests
-- `Sandbox/` - sandbox executable
+- `Sandbox/` - sandbox executable and `Scenes/demo.scene.json`
 
 `Renderer/DX12/`, a render graph and KTX2 textures are planned.
