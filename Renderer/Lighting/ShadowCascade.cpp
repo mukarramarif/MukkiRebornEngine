@@ -13,6 +13,57 @@
 namespace mukki
 {
 
+glm::mat4 ComputeSpotShadowMatrix(const Light& light, float nearPlane)
+{
+    const float range = std::max(light.range, 0.1f);
+    const float outerCone = std::clamp(light.outerConeAngle, 0.01f, 1.4f);
+    const float fovY = std::min(2.0f * outerCone * 1.1f, 2.79f);
+    const float nearZ = std::clamp(nearPlane, 0.01f, range * 0.5f);
+
+    const float directionLength = glm::length(light.direction);
+    const glm::vec3 direction = directionLength > 1e-4f ? light.direction / directionLength
+                                                        : glm::vec3{0.0f, -1.0f, 0.0f};
+    const glm::vec3 up = std::abs(direction.y) > 0.99f ? glm::vec3{0.0f, 0.0f, 1.0f}
+                                                       : glm::vec3{0.0f, 1.0f, 0.0f};
+
+    const glm::mat4 view = glm::lookAt(light.position, light.position + direction, up);
+    const glm::mat4 projection = glm::perspective(fovY, 1.0f, nearZ, range);
+    return projection * view;
+}
+
+std::array<glm::mat4, kPointShadowFaceCount> ComputePointShadowMatrices(const Light& light, float nearPlane)
+{
+    const float range = std::max(light.range, 0.1f);
+    const float nearZ = std::clamp(nearPlane, 0.01f, range * 0.5f);
+
+    constexpr glm::vec3 kDirections[kPointShadowFaceCount] = {
+        {1.0f, 0.0f, 0.0f},
+        {-1.0f, 0.0f, 0.0f},
+        {0.0f, 1.0f, 0.0f},
+        {0.0f, -1.0f, 0.0f},
+        {0.0f, 0.0f, 1.0f},
+        {0.0f, 0.0f, -1.0f}};
+    constexpr glm::vec3 kUps[kPointShadowFaceCount] = {
+        {0.0f, -1.0f, 0.0f},
+        {0.0f, -1.0f, 0.0f},
+        {0.0f, 0.0f, 1.0f},
+        {0.0f, 0.0f, 1.0f},
+        {0.0f, -1.0f, 0.0f},
+        {0.0f, -1.0f, 0.0f}};
+
+    // 95 degrees: the faces overlap slightly so fragments near a cube edge still project inside.
+    const glm::mat4 projection = glm::perspective(1.6580628f, 1.0f, nearZ, range);
+
+    std::array<glm::mat4, kPointShadowFaceCount> matrices{};
+    for (std::uint32_t face = 0; face < kPointShadowFaceCount; ++face)
+    {
+        const glm::mat4 view =
+            glm::lookAt(light.position, light.position + kDirections[face], kUps[face]);
+        matrices[face] = projection * view;
+    }
+    return matrices;
+}
+
 std::vector<ShadowCascade> ComputeShadowCascades(
     const FrameView& view,
     const glm::vec3& lightDirection,

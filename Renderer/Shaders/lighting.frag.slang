@@ -19,7 +19,7 @@ struct GpuLight
 
 struct ShadowUniform
 {
-    float4x4 lightViewProjection[4];
+    float4x4 viewProjections[20]; // 4 cascades + 4 spots + 2 point lights * 6 faces
     float4 cascadeSplits;
     float4 params; // x: depthBias, y: normalBias, z: distance, w: enabled
 };
@@ -34,6 +34,8 @@ struct ShadowUniform
 [[vk::binding(7, 0)]] ConstantBuffer<ShadowUniform> gShadow;
 [[vk::binding(8, 0)]] Texture2DArray gShadowMap;
 [[vk::binding(9, 0)]] SamplerComparisonState gShadowSampler;
+[[vk::binding(10, 0)]] Texture2DArray gSpotShadowMap;
+[[vk::binding(11, 0)]] Texture2D gPointShadowMap;
 
 static const uint kMaxLightsPerCluster = 64;
 static const uint kLightTypeDirectional = 0;
@@ -41,6 +43,17 @@ static const uint kLightTypePoint = 1;
 static const float kPi = 3.14159265359;
 static const float kShadowMapSize = 1024.0;
 static const float kShadowCompareBiasScale = 0.0002;
+static const float kPerspectiveCompareBiasScale = 0.001;
+
+static const uint kShadowCascadeCount = 4;
+static const uint kMaxSpotShadowLights = 4;
+static const uint kSpotShadowOffset = kShadowCascadeCount;
+static const uint kPointShadowOffset = kSpotShadowOffset + kMaxSpotShadowLights;
+static const uint kPointShadowFaceCount = 6;
+static const float kPointShadowTileSize = 512.0;
+static const float kPointShadowAtlasColumns = 3.0;
+static const float kPointShadowAtlasWidth = 1536.0;  // 3 tiles wide
+static const float kPointShadowAtlasHeight = 2048.0; // 2 point lights * 2 tile rows
 
 float3 acesTonemap(float3 color)
 {
@@ -135,7 +148,7 @@ float sampleShadowFactor(float3 worldPosition, float3 normal)
     }
 
     const float3 offsetPosition = worldPosition + normal * gShadow.params.y;
-    const float4 lightClip = mul(gShadow.lightViewProjection[cascade], float4(offsetPosition, 1.0));
+    const float4 lightClip = mul(gShadow.viewProjections[cascade], float4(offsetPosition, 1.0));
     const float3 ndc = lightClip.xyz / max(abs(lightClip.w), 1e-6);
     const float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
 
@@ -158,6 +171,113 @@ float sampleShadowFactor(float3 worldPosition, float3 normal)
                 gShadowSampler,
                 float3(uv + float2(float(x), float(y)) * texel, float(cascade)),
                 compareDepth);
+        }
+    }
+
+    return shadow / 9.0;
+}
+
+float sampleSpotShadowFactor(uint shadowIndex, float3 worldPosition, float3 normal)
+{
+    const uint viewIndex = kSpotShadowOffset + shadowIndex;
+    const float3 offsetPosition = worldPosition + normal * gShadow.params.y;
+    const float4 lightClip = mul(gShadow.viewProjections[viewIndex], float4(offsetPosition, 1.0));
+
+    if (lightClip.w <= 0.0)
+    {
+        return 1.0;
+    }
+
+    const float3 ndc = lightClip.xyz / lightClip.w;
+    const float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    if (any(uv < 0.0) || any(uv > 1.0) || ndc.z < 0.0 || ndc.z > 1.0)
+    {
+        return 1.0;
+    }
+
+    const float compareDepth = ndc.z - gShadow.params.x * kPerspectiveCompareBiasScale;
+    const float2 texel = float2(1.0 / kShadowMapSize, 1.0 / kShadowMapSize);
+
+    float shadow = 0.0;
+    [unroll]
+    for (int y = -1; y <= 1; ++y)
+    {
+        [unroll]
+        for (int x = -1; x <= 1; ++x)
+        {
+            shadow += gSpotShadowMap.SampleCmpLevelZero(
+                gShadowSampler,
+                float3(uv + float2(float(x), float(y)) * texel, float(shadowIndex)),
+                compareDepth);
+        }
+    }
+
+    return shadow / 9.0;
+}
+
+// Face order matches the matrix order in ShadowCascade.cpp: +X, -X, +Y, -Y, +Z, -Z.
+uint selectPointShadowFace(float3 offset)
+{
+    const float3 absolute = abs(offset);
+    if (absolute.x >= absolute.y && absolute.x >= absolute.z)
+    {
+        return offset.x > 0.0 ? 0 : 1;
+    }
+    if (absolute.y >= absolute.z)
+    {
+        return offset.y > 0.0 ? 2 : 3;
+    }
+    return offset.z > 0.0 ? 4 : 5;
+}
+
+float samplePointShadowFactor(
+    uint shadowIndex,
+    float3 lightPosition,
+    float3 worldPosition,
+    float3 normal)
+{
+    const float3 offsetPosition = worldPosition + normal * gShadow.params.y;
+    const uint face = selectPointShadowFace(offsetPosition - lightPosition);
+    const uint viewIndex = kPointShadowOffset + shadowIndex * kPointShadowFaceCount + face;
+
+    const float4 lightClip = mul(gShadow.viewProjections[viewIndex], float4(offsetPosition, 1.0));
+    if (lightClip.w <= 0.0)
+    {
+        return 1.0;
+    }
+
+    const float3 ndc = lightClip.xyz / lightClip.w;
+    const float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    if (any(uv < 0.0) || any(uv > 1.0) || ndc.z < 0.0 || ndc.z > 1.0)
+    {
+        return 1.0;
+    }
+
+    // Map the face UV into its atlas tile and clamp each PCF tap inside the tile so neighbouring
+    // faces never bleed into the filter.
+    const uint tileColumn = face % uint(kPointShadowAtlasColumns);
+    const uint tileRow = shadowIndex * 2u + face / uint(kPointShadowAtlasColumns);
+    const float2 atlasSize = float2(kPointShadowAtlasWidth, kPointShadowAtlasHeight);
+    const float2 tileOrigin = float2(float(tileColumn), float(tileRow)) * kPointShadowTileSize;
+    const float2 tileMinUv = (tileOrigin + 0.5) / atlasSize;
+    const float2 tileMaxUv = (tileOrigin + kPointShadowTileSize - 0.5) / atlasSize;
+    const float2 atlasUv = (tileOrigin + uv * kPointShadowTileSize) / atlasSize;
+    const float2 texel = 1.0 / atlasSize;
+
+    const float compareDepth = ndc.z - gShadow.params.x * kPerspectiveCompareBiasScale;
+
+    float shadow = 0.0;
+    [unroll]
+    for (int y = -1; y <= 1; ++y)
+    {
+        [unroll]
+        for (int x = -1; x <= 1; ++x)
+        {
+            const float2 tapUv = clamp(
+                atlasUv + float2(float(x), float(y)) * texel,
+                tileMinUv,
+                tileMaxUv);
+            shadow += gPointShadowMap.SampleCmpLevelZero(gShadowSampler, tapUv, compareDepth);
         }
     }
 
@@ -252,6 +372,24 @@ float4 fragmentMain(VertexOutput input) : SV_Target
                 const float spotFalloff = saturate(
                     (spotCosine - light.params.z) / max(light.params.y - light.params.z, 1e-4));
                 radiance *= spotFalloff * spotFalloff;
+            }
+        }
+
+        const uint shadowSlot = uint(light.params.w + 0.5);
+        if (shadowSlot > 0)
+        {
+            const uint shadowIndex = shadowSlot - 1;
+            if (type == kLightTypePoint)
+            {
+                radiance *= samplePointShadowFactor(
+                    shadowIndex,
+                    light.positionRange.xyz,
+                    worldPosition.xyz,
+                    normal);
+            }
+            else if (type != kLightTypeDirectional)
+            {
+                radiance *= sampleSpotShadowFactor(shadowIndex, worldPosition.xyz, normal);
             }
         }
 

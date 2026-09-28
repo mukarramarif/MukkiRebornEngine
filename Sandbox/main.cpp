@@ -685,10 +685,11 @@ private:
         changed |= ImGui::SliderFloat("Normal bias", &settings.normalBias, 0.0f, 1.0f, "%.3f");
 
         ImGui::Text(
-            "%u cascades, %ux%u shadow map",
+            "%u cascades at %u, %u spot maps, %u point atlases",
             static_cast<unsigned>(settings.cascadeCount),
             static_cast<unsigned>(settings.resolution),
-            static_cast<unsigned>(settings.resolution));
+            static_cast<unsigned>(mukki::kMaxSpotShadowLights),
+            static_cast<unsigned>(mukki::kMaxPointShadowLights));
 
         if (changed)
         {
@@ -759,13 +760,23 @@ private:
             }
         }
 
-        if (light.type == mukki::LightType::Directional)
+        if (ImGui::Checkbox("Casts shadows", &light.castShadows))
         {
-            if (ImGui::Checkbox("Casts shadows", &light.castShadows))
-            {
-                m_sceneLightsDirty = true;
-            }
-            ImGui::TextUnformatted("(the first shadow-casting directional light is used)");
+            m_sceneLightsDirty = true;
+        }
+        switch (light.type)
+        {
+        case mukki::LightType::Directional:
+            ImGui::TextUnformatted("(only the first shadow-casting directional light is used)");
+            break;
+        case mukki::LightType::Spot:
+            ImGui::Text("(up to %u spot shadow maps)", static_cast<unsigned>(mukki::kMaxSpotShadowLights));
+            break;
+        case mukki::LightType::Point:
+            ImGui::Text(
+                "(up to %u point shadow slots, six faces each)",
+                static_cast<unsigned>(mukki::kMaxPointShadowLights));
+            break;
         }
 
         if (ImGui::ColorEdit3("Color", &light.color.x))

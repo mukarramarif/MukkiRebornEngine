@@ -21,6 +21,7 @@
 #include "Renderer/Lighting/ClusterGrid.h"
 #include "Renderer/Lighting/Light.h"
 #include "Renderer/Lighting/ShadowCascade.h"
+#include "Renderer/RHI/CommandList.h"
 #include "Renderer/RHI/Resources.h"
 
 namespace mukki
@@ -140,6 +141,12 @@ private:
         std::unique_ptr<rhi::Texture> metallicRoughnessTexture{};
     };
 
+    struct SceneObjectBounds
+    {
+        glm::vec3 center{0.0f};
+        float radius = 0.0f;
+    };
+
     struct ModelResources
     {
         std::string name{};
@@ -147,6 +154,7 @@ private:
         std::vector<std::unique_ptr<rhi::Buffer>> vertexBuffers{};
         std::vector<std::unique_ptr<rhi::Buffer>> indexBuffers{};
         std::vector<DrawItem> drawItems{};
+        SceneObjectBounds fittedBounds{};
         std::uint64_t vertexCount = 0;
         std::uint64_t triangleCount = 0;
     };
@@ -157,19 +165,38 @@ private:
         std::size_t firstDrawItem = 0;
         std::size_t drawItemCount = 0;
         glm::mat4 transform{1.0f};
+        SceneObjectBounds bounds{};
     };
 
     struct ShadowPushConstants
     {
         ObjectPushConstants object{};
-        std::uint32_t cascadeIndex = 0;
+        std::uint32_t viewIndex = 0;
     };
 
     struct ShadowUniform
     {
-        glm::mat4 lightViewProjection[kShadowCascadeCount]{};
+        glm::mat4 viewProjections[kMaxShadowViews]{}; // cascades, spot maps, point cube faces
         glm::vec4 cascadeSplits{0.0f}; // x, y, z: split distances between cascades
         glm::vec4 params{0.0f};        // x: depthBias, y: normalBias, z: distance, w: enabled
+    };
+
+    // One shadow map render view: a cascade layer, a spot layer or a point cube face (rendered
+    // into a tile of the point shadow atlas).
+    struct ShadowView
+    {
+        std::uint32_t viewIndex = 0;
+        rhi::Texture* texture = nullptr;
+        std::uint32_t layer = 0;
+        rhi::RenderArea area{};
+        std::vector<const DrawItem*> items{};
+    };
+
+    struct ShadowCullItem
+    {
+        const DrawItem* item = nullptr;
+        glm::vec3 center{0.0f};
+        float radius = 0.0f;
     };
 
     bool CreatePipelines(rhi::Device& device, const std::filesystem::path& shaderDirectory);
@@ -180,15 +207,16 @@ private:
     void UpdateUniforms(std::uint32_t frameIndex, const FrameView& view);
     void UpdateShadowUniforms(std::uint32_t frameIndex, const FrameView& view);
     [[nodiscard]] const Light* FindShadowLight() const;
-    [[nodiscard]] std::uint32_t RecordShadowSecondaries(
+    void BuildShadowCullItems();
+    void BuildShadowViews();
+    [[nodiscard]] std::vector<const DrawItem*> CollectShadowItems(
+        const glm::vec3& lightPosition,
+        float range) const;
+    void RecordShadowViews(std::uint32_t frameIndex);
+    void RecordShadowView(
         std::uint32_t frameIndex,
-        const std::vector<const DrawItem*>& items);
-    void RecordShadowBatch(
-        std::uint32_t frameIndex,
+        std::uint32_t shadowViewIndex,
         const std::vector<const DrawItem*>& items,
-        std::size_t begin,
-        std::size_t end,
-        std::uint32_t cascadeIndex,
         rhi::CommandList& secondary,
         const rhi::RenderingDesc& desc);
     void ApplyModelScale();
@@ -228,10 +256,16 @@ private:
     std::unique_ptr<rhi::DescriptorSetLayout> m_clusterSetLayout{};
     std::unique_ptr<rhi::DescriptorSetLayout> m_shadowSetLayout{};
     std::unique_ptr<rhi::Texture> m_shadowMap{};
+    std::unique_ptr<rhi::Texture> m_spotShadowMap{};
+    std::unique_ptr<rhi::Texture> m_pointShadowMap{};
     std::unique_ptr<rhi::Sampler> m_shadowSampler{};
     std::vector<std::unique_ptr<rhi::DescriptorSet>> m_shadowSets{};
     std::vector<std::unique_ptr<rhi::Buffer>> m_shadowUniformBuffers{};
     std::vector<std::vector<std::unique_ptr<rhi::CommandList>>> m_shadowSecondaries{};
+    std::vector<ShadowView> m_shadowViews{};
+    std::vector<ShadowCullItem> m_shadowCullItems{};
+    std::vector<Light> m_spotShadowLights{};
+    std::vector<Light> m_pointShadowLights{};
     std::unique_ptr<rhi::DescriptorSet> m_bindlessSet{};
     std::vector<std::unique_ptr<rhi::DescriptorSet>> m_sceneSets{};
     std::vector<std::unique_ptr<rhi::DescriptorSet>> m_lightingSets{};

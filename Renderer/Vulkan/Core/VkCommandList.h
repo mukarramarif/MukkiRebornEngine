@@ -67,7 +67,7 @@ public:
     [[nodiscard]] bool WasSwapchainRendered() const { return m_renderedThisFrame; }
 
 private:
-    void SetViewportAndScissor(const vk::Extent2D& extent);
+    void SetViewportAndScissor(std::uint32_t x, std::uint32_t y, std::uint32_t width, std::uint32_t height);
 
     vk::raii::CommandPool m_commandPool{nullptr};
     vk::raii::CommandBuffer m_commandBuffer{nullptr};

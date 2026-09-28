@@ -186,7 +186,7 @@ void VkCommandList::BeginSwapchainRendering(const rhi::ClearColor& clearColor, b
                                                 .setColorAttachments(colorAttachment);
 
     m_commandBuffer.beginRendering(renderingInfo);
-    SetViewportAndScissor(m_swapchainExtent);
+    SetViewportAndScissor(0, 0, m_swapchainExtent.width, m_swapchainExtent.height);
 
     m_rendering = true;
     m_renderingSwapchain = true;
@@ -312,8 +312,17 @@ void VkCommandList::BeginRendering(const rhi::RenderingDesc& desc)
         }
     }
 
+    const bool hasArea = desc.area.width > 0 && desc.area.height > 0;
+    const vk::Rect2D renderArea = hasArea
+        ? vk::Rect2D{
+              vk::Offset2D{
+                  static_cast<std::int32_t>(desc.area.x),
+                  static_cast<std::int32_t>(desc.area.y)},
+              vk::Extent2D{desc.area.width, desc.area.height}}
+        : vk::Rect2D{vk::Offset2D{0, 0}, extent};
+
     vk::RenderingInfo renderingInfo = vk::RenderingInfo{}
-                                          .setRenderArea(vk::Rect2D{vk::Offset2D{0, 0}, extent})
+                                          .setRenderArea(renderArea)
                                           .setLayerCount(1)
                                           .setColorAttachments(colorAttachments);
     if (desc.secondaryCommandBuffers)
@@ -326,7 +335,11 @@ void VkCommandList::BeginRendering(const rhi::RenderingDesc& desc)
     }
 
     m_commandBuffer.beginRendering(renderingInfo);
-    SetViewportAndScissor(extent);
+    SetViewportAndScissor(
+        static_cast<std::uint32_t>(renderArea.offset.x),
+        static_cast<std::uint32_t>(renderArea.offset.y),
+        renderArea.extent.width,
+        renderArea.extent.height);
 
     m_rendering = true;
     m_renderingSwapchain = false;
@@ -429,7 +442,13 @@ void VkCommandList::BeginSecondary(const rhi::RenderingDesc& desc)
     m_hasBoundPipeline = false;
     m_boundPipelineLayout = vk::PipelineLayout{nullptr};
     m_boundPipelineBindPoint = vk::PipelineBindPoint::eGraphics;
-    SetViewportAndScissor(extent);
+
+    const bool hasArea = desc.area.width > 0 && desc.area.height > 0;
+    SetViewportAndScissor(
+        hasArea ? desc.area.x : 0,
+        hasArea ? desc.area.y : 0,
+        hasArea ? desc.area.width : extent.width,
+        hasArea ? desc.area.height : extent.height);
 }
 
 void VkCommandList::ExecuteCommands(const std::vector<const rhi::CommandList*>& secondaryCommandLists)
@@ -589,18 +608,26 @@ void VkCommandList::SetDepthBias(float constantFactor, float slopeFactor, float 
     m_commandBuffer.setDepthBias(constantFactor, clamp, slopeFactor);
 }
 
-void VkCommandList::SetViewportAndScissor(const vk::Extent2D& extent)
+void VkCommandList::SetViewportAndScissor(
+    std::uint32_t x,
+    std::uint32_t y,
+    std::uint32_t width,
+    std::uint32_t height)
 {
     const vk::Viewport viewport = vk::Viewport{}
-                                      .setX(0.0f)
-                                      .setY(0.0f)
-                                      .setWidth(static_cast<float>(extent.width))
-                                      .setHeight(static_cast<float>(extent.height))
+                                      .setX(static_cast<float>(x))
+                                      .setY(static_cast<float>(y))
+                                      .setWidth(static_cast<float>(width))
+                                      .setHeight(static_cast<float>(height))
                                       .setMinDepth(0.0f)
                                       .setMaxDepth(1.0f);
     m_commandBuffer.setViewport(0, viewport);
 
-    const vk::Rect2D scissor = vk::Rect2D{}.setOffset(vk::Offset2D{0, 0}).setExtent(extent);
+    const vk::Rect2D scissor = vk::Rect2D{}
+                                   .setOffset(vk::Offset2D{
+                                       static_cast<std::int32_t>(x),
+                                       static_cast<std::int32_t>(y)})
+                                   .setExtent(vk::Extent2D{width, height});
     m_commandBuffer.setScissor(0, scissor);
 }
 

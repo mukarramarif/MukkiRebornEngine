@@ -10,12 +10,12 @@ struct ObjectPushConstants
 struct ShadowPushConstants
 {
     ObjectPushConstants object;
-    uint cascadeIndex;
+    uint viewIndex;
 };
 
 struct ShadowUniform
 {
-    float4x4 lightViewProjection[4];
+    float4x4 viewProjections[20]; // 4 cascades + 4 spots + 2 point lights * 6 faces
     float4 cascadeSplits;
     float4 params; // x: depthBias, y: normalBias, z: distance, w: enabled
 };
@@ -32,5 +32,5 @@ struct VertexInput
 float4 vertexMain(VertexInput input) : SV_Position
 {
     const float4 worldPosition = mul(gPush.object.model, float4(input.position, 1.0));
-    return mul(gShadow.lightViewProjection[gPush.cascadeIndex], worldPosition);
+    return mul(gShadow.viewProjections[gPush.viewIndex], worldPosition);
 }

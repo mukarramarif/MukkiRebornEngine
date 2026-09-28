@@ -198,19 +198,25 @@ then loads only that bytecode:
 
 ### Shadows
 
-The renderer implements cascaded shadow maps for directional lights:
+The renderer implements shadow mapping for all light types:
 
-- 4 cascades at 1024x1024 (`D32Sfloat`) with exponential/uniform blended splits, sphere-fitted
-  ortho projections and texel snapping to avoid shimmering.
-- The cascades are rendered in the shadow pass, recorded into secondary command buffers on worker
-  threads like the G-buffer pass.
-- The lighting pass selects the cascade by view depth and filters with hardware comparison
-  samplers (3x3 PCF), plus a whole-shadow-map normal bias.
-- The first directional light with `"castShadows": true` (JSON, default `true`) casts shadows.
-- Spot and point light shadows are not implemented yet.
+- **Directional**: 4 cascades at 1024x1024 (`D32Sfloat`) with exponential/uniform blended splits,
+  sphere-fitted ortho projections and texel snapping to avoid shimmering. The first directional
+  light with `"castShadows": true` (JSON, default `true`) is used.
+- **Spot**: up to 4 perspective shadow maps (1024x1024) in a `Texture2DArray`; the projection
+  covers the light cone plus a small margin.
+- **Point**: up to 2 lights, each with six 512x512 perspective faces packed into a 2D atlas
+  (1536x2048). The lighting pass picks the face from the major axis of the light-to-fragment
+  vector and filters inside the atlas tile.
+- All shadow views are rendered in one shadow pass, recorded into secondary command buffers on
+  worker threads like the G-buffer pass. Spot and point views cull objects by light range using
+  per-instance bounding spheres.
+- The lighting pass filters with hardware comparison samplers (3x3 PCF) and a whole-shadow-map
+  normal bias.
 
 The `Scene` window exposes `Enabled`, `Distance`, `Depth bias` and `Normal bias` sliders for
-tuning, and the directional light editor has a `Casts shadows` checkbox.
+tuning, and every light editor has a `Casts shadows` checkbox (subject to the spot/point slot
+budgets above).
 
 In the sandbox, the `Scenes` window browses and loads the JSON scenes found in `Sandbox/Scenes`
 (with a global transform scale). The `Scene` window lists the loaded objects and lights:

@@ -10,6 +10,7 @@
 #include "Utilities/Profiling.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <future>
@@ -31,6 +32,14 @@ struct Vertex
     glm::vec3 normal{0.0f};
     glm::vec2 uv{0.0f};
 };
+
+float MaximumScale(const glm::mat4& transform)
+{
+    return std::max(
+        {glm::length(glm::vec3{transform[0]}),
+         glm::length(glm::vec3{transform[1]}),
+         glm::length(glm::vec3{transform[2]})});
+}
 
 constexpr Vertex kPlaneVertices[] = {
     {{-10.0f, 0.0f, -10.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f}},
@@ -124,6 +133,8 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
         rhi::DescriptorBinding{7, rhi::DescriptorType::UniformBuffer, rhi::ShaderStageMask::Fragment},
         rhi::DescriptorBinding{8, rhi::DescriptorType::SampledImage, rhi::ShaderStageMask::Fragment},
         rhi::DescriptorBinding{9, rhi::DescriptorType::Sampler, rhi::ShaderStageMask::Fragment},
+        rhi::DescriptorBinding{10, rhi::DescriptorType::SampledImage, rhi::ShaderStageMask::Fragment},
+        rhi::DescriptorBinding{11, rhi::DescriptorType::SampledImage, rhi::ShaderStageMask::Fragment},
     };
     const std::vector<rhi::DescriptorBinding> clusterBindings{
         rhi::DescriptorBinding{0, rhi::DescriptorType::UniformBuffer, rhi::ShaderStageMask::Compute},
@@ -177,9 +188,8 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
             m_gbufferSecondaries[frame].push_back(device.CreateSecondaryCommandList());
         }
 
-        const std::uint32_t shadowBatchCount = m_secondaryBatchCount * kShadowCascadeCount;
-        m_shadowSecondaries[frame].reserve(shadowBatchCount);
-        for (std::uint32_t batch = 0; batch < shadowBatchCount; ++batch)
+        m_shadowSecondaries[frame].reserve(kMaxShadowViews);
+        for (std::uint32_t view = 0; view < kMaxShadowViews; ++view)
         {
             m_shadowSecondaries[frame].push_back(device.CreateSecondaryCommandList());
         }
@@ -221,8 +231,14 @@ void DeferredRenderer::Shutdown()
     m_gbufferSecondaries.clear();
     m_shadowSecondaries.clear();
     m_shadowMap.reset();
+    m_spotShadowMap.reset();
+    m_pointShadowMap.reset();
     m_shadowSampler.reset();
     m_shadowUniformBuffers.clear();
+    m_shadowViews.clear();
+    m_shadowCullItems.clear();
+    m_spotShadowLights.clear();
+    m_pointShadowLights.clear();
     m_lightBuffers.clear();
     m_clusterUniformBuffers.clear();
     m_clusterCountBuffers.clear();
@@ -430,6 +446,11 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
                           glm::scale(glm::mat4{1.0f}, glm::vec3{scale}) *
                           glm::translate(glm::mat4{1.0f}, -center);
 
+    const glm::vec3 fittedMin = glm::vec3{fit * glm::vec4{model.minBounds, 1.0f}};
+    const glm::vec3 fittedMax = glm::vec3{fit * glm::vec4{model.maxBounds, 1.0f}};
+    resources->fittedBounds.center = (fittedMin + fittedMax) * 0.5f;
+    resources->fittedBounds.radius = glm::length(fittedMax - fittedMin) * 0.5f;
+
     const auto createTextureFromImage = [this, &model](int imageIndex, rhi::Format format) {
         std::unique_ptr<rhi::Texture> texture{};
         if (imageIndex < 0 || imageIndex >= static_cast<int>(model.images.size()))
@@ -635,6 +656,8 @@ void DeferredRenderer::AddModelInstance(std::size_t modelIndex, const glm::mat4&
     sceneObject.modelIndex = modelIndex;
     sceneObject.firstDrawItem = m_modelDrawItems.size();
     sceneObject.transform = transform;
+    sceneObject.bounds.center = glm::vec3{transform * glm::vec4{model.fittedBounds.center, 1.0f}};
+    sceneObject.bounds.radius = model.fittedBounds.radius * MaximumScale(transform);
 
     for (const DrawItem& source : model.drawItems)
     {
@@ -657,6 +680,8 @@ void DeferredRenderer::UpdateSceneObjectTransform(std::size_t objectIndex, const
     sceneObject.transform = transform;
 
     const ModelResources& model = *m_models[sceneObject.modelIndex];
+    sceneObject.bounds.center = glm::vec3{transform * glm::vec4{model.fittedBounds.center, 1.0f}};
+    sceneObject.bounds.radius = model.fittedBounds.radius * MaximumScale(transform);
     MRE_ASSERT(
         sceneObject.firstDrawItem + sceneObject.drawItemCount <= m_modelDrawItems.size(),
         "Scene object draw items are out of range");
@@ -749,55 +774,60 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
         gbufferItems.push_back(&item);
     }
 
-    const bool shadowsActive = m_shadowSettings.enabled && FindShadowLight() != nullptr &&
-                               !gbufferItems.empty() && m_shadowMap != nullptr;
-    if (shadowsActive)
+    BuildShadowCullItems();
+    BuildShadowViews();
+
+    if (!m_shadowViews.empty())
     {
         commandList.BeginGpuZone("ShadowPass");
 
-        rhi::RenderingDesc shadowDesc{};
-        shadowDesc.depthAttachment.texture = m_shadowMap.get();
-        shadowDesc.depthAttachment.clearDepth = 1.0f;
-        shadowDesc.depthAttachment.clear = true;
-
         const bool useShadowSecondaries =
-            m_jobSystem != nullptr && m_secondaryBatchCount > 1 && gbufferItems.size() > 1 &&
-            frameIndex < m_shadowSecondaries.size();
+            m_jobSystem != nullptr && frameIndex < m_shadowSecondaries.size() &&
+            m_shadowViews.size() <= m_shadowSecondaries[frameIndex].size();
 
         if (useShadowSecondaries)
         {
-            const std::uint32_t batchCount = RecordShadowSecondaries(frameIndex, gbufferItems);
-            shadowDesc.secondaryCommandBuffers = true;
+            RecordShadowViews(frameIndex);
 
-            for (std::uint32_t cascade = 0; cascade < kShadowCascadeCount; ++cascade)
+            for (std::size_t index = 0; index < m_shadowViews.size(); ++index)
             {
-                std::vector<const rhi::CommandList*> secondaries{};
-                secondaries.reserve(batchCount);
-                for (std::uint32_t batch = 0; batch < batchCount; ++batch)
-                {
-                    secondaries.push_back(
-                        m_shadowSecondaries[frameIndex][cascade * m_secondaryBatchCount + batch].get());
-                }
+                const ShadowView& shadowView = m_shadowViews[index];
 
-                shadowDesc.depthAttachment.layer = cascade;
+                rhi::RenderingDesc shadowDesc{};
+                shadowDesc.depthAttachment.texture = shadowView.texture;
+                shadowDesc.depthAttachment.clearDepth = 1.0f;
+                shadowDesc.depthAttachment.clear = true;
+                shadowDesc.depthAttachment.layer = shadowView.layer;
+                shadowDesc.area = shadowView.area;
+                shadowDesc.secondaryCommandBuffers = true;
+
                 commandList.BeginRendering(shadowDesc);
-                commandList.ExecuteCommands(secondaries);
+                commandList.ExecuteCommands({m_shadowSecondaries[frameIndex][index].get()});
                 commandList.EndRendering();
             }
         }
         else
         {
-            for (std::uint32_t cascade = 0; cascade < kShadowCascadeCount; ++cascade)
+            for (const ShadowView& shadowView : m_shadowViews)
             {
-                shadowDesc.depthAttachment.layer = cascade;
+                rhi::RenderingDesc shadowDesc{};
+                shadowDesc.depthAttachment.texture = shadowView.texture;
+                shadowDesc.depthAttachment.clearDepth = 1.0f;
+                shadowDesc.depthAttachment.clear = true;
+                shadowDesc.depthAttachment.layer = shadowView.layer;
+                shadowDesc.area = shadowView.area;
+
                 commandList.BeginRendering(shadowDesc);
                 commandList.BindPipeline(*m_shadowPipeline);
                 commandList.BindDescriptorSet(0, *m_shadowSets[frameIndex]);
-                commandList.SetDepthBias(m_shadowSettings.depthBias, m_shadowSettings.depthBias * 1.5f, 0.0f);
+                commandList.SetDepthBias(
+                    m_shadowSettings.depthBias,
+                    m_shadowSettings.depthBias * 1.5f,
+                    0.0f);
 
                 ShadowPushConstants pushConstants{};
-                pushConstants.cascadeIndex = cascade;
-                for (const DrawItem* item : gbufferItems)
+                pushConstants.viewIndex = shadowView.viewIndex;
+                for (const DrawItem* item : shadowView.items)
                 {
                     pushConstants.object = item->pushConstants;
                     commandList.BindVertexBuffer(*item->vertexBuffer);
@@ -970,93 +1000,188 @@ void DeferredRenderer::RecordGBufferBatch(
     secondary.End();
 }
 
-std::uint32_t DeferredRenderer::RecordShadowSecondaries(
-    std::uint32_t frameIndex,
-    const std::vector<const DrawItem*>& items)
+void DeferredRenderer::BuildShadowCullItems()
 {
-    MRE_PROFILE_ZONE_N("RecordShadowSecondaries");
-    MRE_ASSERT(m_jobSystem != nullptr, "RecordShadowSecondaries requires a job system");
-    MRE_ASSERT(frameIndex < m_shadowSecondaries.size(), "Frame index out of range");
-    MRE_ASSERT(!items.empty(), "RecordShadowSecondaries requires draw items");
+    m_shadowCullItems.clear();
 
-    const std::uint32_t batchCount = std::min(
-        m_secondaryBatchCount,
-        static_cast<std::uint32_t>(items.size()));
-    MRE_ASSERT(batchCount > 0, "RecordShadowSecondaries requires at least one batch");
-    MRE_ASSERT(
-        static_cast<std::size_t>(batchCount) * kShadowCascadeCount <= m_shadowSecondaries[frameIndex].size(),
-        "Not enough shadow secondary command lists were allocated");
-
-    rhi::RenderingDesc desc{};
-    desc.depthAttachment.texture = m_shadowMap.get();
-    desc.depthAttachment.clearDepth = 1.0f;
-    desc.depthAttachment.clear = true;
-
-    const std::size_t itemsPerBatch = (items.size() + batchCount - 1) / batchCount;
-
-    std::vector<std::future<void>> futures{};
-    futures.reserve(static_cast<std::size_t>(batchCount) * kShadowCascadeCount);
-
-    for (std::uint32_t cascade = 0; cascade < kShadowCascadeCount; ++cascade)
+    // The ground plane spans 20x20 world units around the origin.
+    constexpr float kGroundRadius = 14.15f;
+    for (const DrawItem& item : m_sceneDrawItems)
     {
-        for (std::uint32_t batch = 0; batch < batchCount; ++batch)
+        m_shadowCullItems.push_back(ShadowCullItem{&item, glm::vec3{0.0f}, kGroundRadius});
+    }
+
+    for (const SceneObjectInstance& instance : m_objectInstances)
+    {
+        for (std::size_t index = 0; index < instance.drawItemCount; ++index)
         {
-            const std::size_t begin = static_cast<std::size_t>(batch) * itemsPerBatch;
-            const std::size_t end = std::min(begin + itemsPerBatch, items.size());
-            if (begin >= end)
+            m_shadowCullItems.push_back(ShadowCullItem{
+                &m_modelDrawItems[instance.firstDrawItem + index],
+                instance.bounds.center,
+                instance.bounds.radius});
+        }
+    }
+}
+
+std::vector<const DeferredRenderer::DrawItem*> DeferredRenderer::CollectShadowItems(
+    const glm::vec3& lightPosition,
+    float range) const
+{
+    std::vector<const DrawItem*> items{};
+    for (const ShadowCullItem& cullItem : m_shadowCullItems)
+    {
+        const float distance = glm::length(cullItem.center - lightPosition);
+        if (distance - cullItem.radius <= range)
+        {
+            items.push_back(cullItem.item);
+        }
+    }
+    return items;
+}
+
+void DeferredRenderer::BuildShadowViews()
+{
+    m_shadowViews.clear();
+
+    if (!m_shadowSettings.enabled)
+    {
+        return;
+    }
+
+    // Directional cascades cover the whole scene; spot and point faces are culled by light range.
+    if (FindShadowLight() != nullptr && m_shadowMap != nullptr)
+    {
+        for (std::uint32_t cascade = 0; cascade < kShadowCascadeCount; ++cascade)
+        {
+            ShadowView view{};
+            view.viewIndex = cascade;
+            view.texture = m_shadowMap.get();
+            view.layer = cascade;
+            view.items.reserve(m_shadowCullItems.size());
+            for (const ShadowCullItem& cullItem : m_shadowCullItems)
             {
-                break;
+                view.items.push_back(cullItem.item);
+            }
+            m_shadowViews.push_back(std::move(view));
+        }
+    }
+
+    if (m_spotShadowMap != nullptr)
+    {
+        for (std::size_t slot = 0; slot < m_spotShadowLights.size(); ++slot)
+        {
+            const Light& light = m_spotShadowLights[slot];
+
+            ShadowView view{};
+            view.viewIndex = kSpotShadowOffset + static_cast<std::uint32_t>(slot);
+            view.texture = m_spotShadowMap.get();
+            view.layer = static_cast<std::uint32_t>(slot);
+            view.items = CollectShadowItems(light.position, light.range);
+            m_shadowViews.push_back(std::move(view));
+        }
+    }
+
+    if (m_pointShadowMap != nullptr)
+    {
+        // Each point light owns a 3x2 tile block in the atlas; the six faces are rendered into the
+        // tiles with a sub-rect render area.
+        constexpr std::uint32_t kFaceRows = kPointShadowAtlasRows / kMaxPointShadowLights;
+
+        for (std::size_t slot = 0; slot < m_pointShadowLights.size(); ++slot)
+        {
+            const Light& light = m_pointShadowLights[slot];
+            std::vector<const DrawItem*> items = CollectShadowItems(light.position, light.range);
+            if (items.empty())
+            {
+                continue;
             }
 
-            rhi::CommandList* secondary =
-                m_shadowSecondaries[frameIndex][cascade * m_secondaryBatchCount + batch].get();
-            futures.push_back(m_jobSystem->Submit(
-                [this, frameIndex, secondary, &items, begin, end, cascade, &desc]() {
-                    RecordShadowBatch(frameIndex, items, begin, end, cascade, *secondary, desc);
-                }));
+            for (std::uint32_t face = 0; face < kPointShadowFaceCount; ++face)
+            {
+                const std::uint32_t column = face % kPointShadowAtlasColumns;
+                const std::uint32_t row =
+                    static_cast<std::uint32_t>(slot) * kFaceRows + face / kPointShadowAtlasColumns;
+
+                ShadowView view{};
+                view.viewIndex = kPointShadowOffset +
+                                 static_cast<std::uint32_t>(slot) * kPointShadowFaceCount + face;
+                view.texture = m_pointShadowMap.get();
+                view.area = rhi::RenderArea{
+                    column * kPointShadowTileSize,
+                    row * kPointShadowTileSize,
+                    kPointShadowTileSize,
+                    kPointShadowTileSize};
+                view.items = items;
+                m_shadowViews.push_back(std::move(view));
+            }
         }
+    }
+}
+
+void DeferredRenderer::RecordShadowViews(std::uint32_t frameIndex)
+{
+    MRE_PROFILE_ZONE_N("RecordShadowViews");
+    MRE_ASSERT(m_jobSystem != nullptr, "RecordShadowViews requires a job system");
+    MRE_ASSERT(frameIndex < m_shadowSecondaries.size(), "Frame index out of range");
+    MRE_ASSERT(
+        m_shadowViews.size() <= m_shadowSecondaries[frameIndex].size(),
+        "Not enough shadow secondary command lists were allocated");
+
+    std::vector<std::future<void>> futures{};
+    futures.reserve(m_shadowViews.size());
+
+    for (std::size_t index = 0; index < m_shadowViews.size(); ++index)
+    {
+        const ShadowView& view = m_shadowViews[index];
+        rhi::CommandList* secondary = m_shadowSecondaries[frameIndex][index].get();
+
+        rhi::RenderingDesc desc{};
+        desc.depthAttachment.texture = view.texture;
+        desc.depthAttachment.clearDepth = 1.0f;
+        desc.depthAttachment.clear = true;
+        desc.depthAttachment.layer = view.layer;
+        desc.area = view.area;
+
+        futures.push_back(m_jobSystem->Submit([this, frameIndex, secondary, &view, desc]() {
+            RecordShadowView(frameIndex, view.viewIndex, view.items, *secondary, desc);
+        }));
     }
 
     for (std::future<void>& future : futures)
     {
         future.get();
     }
-
-    return batchCount;
 }
 
-void DeferredRenderer::RecordShadowBatch(
+void DeferredRenderer::RecordShadowView(
     std::uint32_t frameIndex,
+    std::uint32_t shadowViewIndex,
     const std::vector<const DrawItem*>& items,
-    std::size_t begin,
-    std::size_t end,
-    std::uint32_t cascadeIndex,
     rhi::CommandList& secondary,
     const rhi::RenderingDesc& desc)
 {
-    MRE_ASSERT(m_shadowPipeline != nullptr, "RecordShadowBatch requires the shadow pipeline");
+    MRE_ASSERT(m_shadowPipeline != nullptr, "RecordShadowView requires the shadow pipeline");
     MRE_ASSERT(frameIndex < m_shadowSets.size(), "Frame index out of range");
 
     secondary.BeginSecondary(desc);
     secondary.BindPipeline(*m_shadowPipeline);
     secondary.BindDescriptorSet(0, *m_shadowSets[frameIndex]);
     secondary.SetDepthBias(m_shadowSettings.depthBias, m_shadowSettings.depthBias * 1.5f, 0.0f);
-    secondary.BeginGpuZone("ShadowBatch");
+    secondary.BeginGpuZone("ShadowView");
 
     ShadowPushConstants pushConstants{};
-    pushConstants.cascadeIndex = cascadeIndex;
+    pushConstants.viewIndex = shadowViewIndex;
 
-    for (std::size_t index = begin; index < end; ++index)
+    for (const DrawItem* item : items)
     {
-        const DrawItem& item = *items[index];
-        pushConstants.object = item.pushConstants;
-        secondary.BindVertexBuffer(*item.vertexBuffer);
-        secondary.BindIndexBuffer(*item.indexBuffer);
+        pushConstants.object = item->pushConstants;
+        secondary.BindVertexBuffer(*item->vertexBuffer);
+        secondary.BindIndexBuffer(*item->indexBuffer);
         secondary.SetPushConstants(
             &pushConstants,
             sizeof(ShadowPushConstants),
             rhi::ShaderStageMask::Vertex);
-        secondary.DrawIndexed(item.indexCount, item.firstIndex);
+        secondary.DrawIndexed(item->indexCount, item->firstIndex);
     }
 
     secondary.EndGpuZone();
@@ -1203,6 +1328,8 @@ void DeferredRenderer::CreateLightingSets(rhi::Device& device)
         lightingSet->BindBuffer(7, *m_shadowUniformBuffers[frame]);
         lightingSet->BindTexture(8, *m_shadowMap, 0u);
         lightingSet->BindSampler(9, *m_shadowSampler);
+        lightingSet->BindTexture(10, *m_spotShadowMap, 0u);
+        lightingSet->BindTexture(11, *m_pointShadowMap, 0u);
         m_lightingSets.push_back(std::move(lightingSet));
     }
 }
@@ -1224,6 +1351,33 @@ bool DeferredRenderer::CreateShadowResources(rhi::Device& device)
     if (m_shadowMap == nullptr)
     {
         MRE_CRITICAL("Failed to create the shadow map array");
+        return false;
+    }
+
+    const rhi::TextureDesc spotShadowDesc{
+        kSpotShadowResolution,
+        kSpotShadowResolution,
+        rhi::Format::D32Sfloat,
+        rhi::TextureUsage::DepthAttachment,
+        nullptr,
+        0,
+        kMaxSpotShadowLights};
+    m_spotShadowMap = device.CreateTexture(spotShadowDesc);
+    if (m_spotShadowMap == nullptr)
+    {
+        MRE_CRITICAL("Failed to create the spot shadow map array");
+        return false;
+    }
+
+    const rhi::TextureDesc pointShadowDesc{
+        kPointShadowAtlasWidth,
+        kPointShadowAtlasHeight,
+        rhi::Format::D32Sfloat,
+        rhi::TextureUsage::DepthAttachment};
+    m_pointShadowMap = device.CreateTexture(pointShadowDesc);
+    if (m_pointShadowMap == nullptr)
+    {
+        MRE_CRITICAL("Failed to create the point shadow atlas");
         return false;
     }
 
@@ -1258,10 +1412,16 @@ bool DeferredRenderer::CreateShadowResources(rhi::Device& device)
     }
 
     MRE_INFO(
-        "Shadow map array created ({}x{}, {} cascades)",
+        "Shadow maps created ({}x{} x{} cascades, {}x{} x{} spots, {}x{} atlas for {} point lights)",
         kShadowResolution,
         kShadowResolution,
-        kShadowCascadeCount);
+        kShadowCascadeCount,
+        kSpotShadowResolution,
+        kSpotShadowResolution,
+        kMaxSpotShadowLights,
+        kPointShadowAtlasWidth,
+        kPointShadowAtlasHeight,
+        kMaxPointShadowLights);
     return true;
 }
 
@@ -1352,6 +1512,9 @@ void DeferredRenderer::UpdateUniforms(std::uint32_t frameIndex, const FrameView&
         ? 1.0f / std::abs(view.projection[1][1])
         : std::tan(view.fovYRadians * 0.5f);
 
+    m_spotShadowLights.clear();
+    m_pointShadowLights.clear();
+
     m_gpuLights.clear();
     m_gpuLights.reserve(m_lights.size());
     for (const Light& light : m_lights)
@@ -1360,7 +1523,27 @@ void DeferredRenderer::UpdateUniforms(std::uint32_t frameIndex, const FrameView&
         {
             break;
         }
-        m_gpuLights.push_back(ToGpuLight(light));
+
+        // Assign the limited spot/point shadow slots in submission order. The slot index is stored
+        // in GpuLight::params.w (biased by one so zero means "no shadow").
+        std::uint32_t shadowSlotPlusOne = 0;
+        if (m_shadowSettings.enabled && light.castShadows)
+        {
+            if (light.type == LightType::Spot && m_spotShadowLights.size() < kMaxSpotShadowLights)
+            {
+                shadowSlotPlusOne = static_cast<std::uint32_t>(m_spotShadowLights.size()) + 1;
+                m_spotShadowLights.push_back(light);
+            }
+            else if (light.type == LightType::Point && m_pointShadowLights.size() < kMaxPointShadowLights)
+            {
+                shadowSlotPlusOne = static_cast<std::uint32_t>(m_pointShadowLights.size()) + 1;
+                m_pointShadowLights.push_back(light);
+            }
+        }
+
+        GpuLight gpuLight = ToGpuLight(light);
+        gpuLight.params.w = static_cast<float>(shadowSlotPlusOne);
+        m_gpuLights.push_back(gpuLight);
     }
 
     m_sceneUniform.viewProjection = view.viewProjection;
@@ -1426,26 +1609,47 @@ void DeferredRenderer::UpdateShadowUniforms(std::uint32_t frameIndex, const Fram
 
     m_shadowUniform = ShadowUniform{};
 
-    const Light* shadowLight = FindShadowLight();
-    if (m_shadowSettings.enabled && shadowLight != nullptr)
+    if (m_shadowSettings.enabled)
     {
-        const std::vector<ShadowCascade> cascades =
-            ComputeShadowCascades(view, shadowLight->direction, m_shadowSettings);
-
-        for (std::size_t index = 0; index < cascades.size() && index < kShadowCascadeCount; ++index)
+        const Light* shadowLight = FindShadowLight();
+        if (shadowLight != nullptr)
         {
-            m_shadowUniform.lightViewProjection[index] = cascades[index].lightViewProjection;
-            if (index + 1 < cascades.size())
+            const std::vector<ShadowCascade> cascades =
+                ComputeShadowCascades(view, shadowLight->direction, m_shadowSettings);
+
+            for (std::size_t index = 0; index < cascades.size() && index < kShadowCascadeCount; ++index)
             {
-                m_shadowUniform.cascadeSplits[static_cast<glm::length_t>(index)] = cascades[index].splitFar;
+                m_shadowUniform.viewProjections[index] = cascades[index].lightViewProjection;
+                if (index + 1 < cascades.size())
+                {
+                    m_shadowUniform.cascadeSplits[static_cast<glm::length_t>(index)] =
+                        cascades[index].splitFar;
+                }
             }
+
+            m_shadowUniform.params = glm::vec4{
+                m_shadowSettings.depthBias,
+                m_shadowSettings.normalBias,
+                cascades.empty() ? m_shadowSettings.distance : cascades.back().splitFar,
+                1.0f};
         }
 
-        m_shadowUniform.params = glm::vec4{
-            m_shadowSettings.depthBias,
-            m_shadowSettings.normalBias,
-            cascades.empty() ? m_shadowSettings.distance : cascades.back().splitFar,
-            1.0f};
+        for (std::size_t index = 0; index < m_spotShadowLights.size(); ++index)
+        {
+            m_shadowUniform.viewProjections[kSpotShadowOffset + index] =
+                ComputeSpotShadowMatrix(m_spotShadowLights[index], kShadowNearPlane);
+        }
+
+        for (std::size_t index = 0; index < m_pointShadowLights.size(); ++index)
+        {
+            const std::array<glm::mat4, kPointShadowFaceCount> faces =
+                ComputePointShadowMatrices(m_pointShadowLights[index], kShadowNearPlane);
+            for (std::uint32_t face = 0; face < kPointShadowFaceCount; ++face)
+            {
+                m_shadowUniform.viewProjections[kPointShadowOffset + index * kPointShadowFaceCount + face] =
+                    faces[face];
+            }
+        }
     }
 
     m_shadowUniformBuffers[frameIndex]->Write(&m_shadowUniform, sizeof(ShadowUniform));

@@ -174,6 +174,74 @@ TEST(ShadowCascades, RelativeProjectionIsInvariantUnderCameraMotion)
     }
 }
 
+TEST(ShadowCascades, SpotProjectionCoversTheCone)
+{
+    mukki::Light light{};
+    light.type = mukki::LightType::Spot;
+    light.position = glm::vec3{0.0f, 4.0f, 0.0f};
+    light.direction = glm::vec3{0.0f, -1.0f, 0.0f};
+    light.range = 12.0f;
+    light.outerConeAngle = 0.5f;
+
+    const glm::mat4 matrix = mukki::ComputeSpotShadowMatrix(light, mukki::kShadowNearPlane);
+
+    const auto project = [&matrix](const glm::vec3& point) {
+        const glm::vec4 clip = matrix * glm::vec4{point, 1.0f};
+        EXPECT_GT(clip.w, 0.0f);
+        return glm::vec3{clip} / clip.w;
+    };
+
+    const glm::vec3 onAxis = light.position + light.direction * 6.0f;
+    const glm::vec3 axisNdc = project(onAxis);
+    EXPECT_NEAR(axisNdc.x, 0.0f, 1e-3f);
+    EXPECT_NEAR(axisNdc.y, 0.0f, 1e-3f);
+    EXPECT_GT(axisNdc.z, 0.0f);
+    EXPECT_LT(axisNdc.z, 1.0f);
+
+    const float coneAngle = light.outerConeAngle;
+    const glm::vec3 edgeDirection{glm::sin(coneAngle), -glm::cos(coneAngle), 0.0f};
+    const glm::vec3 edgeNdc = project(light.position + edgeDirection * 6.0f);
+    EXPECT_GE(edgeNdc.x, -1.0f);
+    EXPECT_LE(edgeNdc.x, 1.0f);
+    EXPECT_GE(edgeNdc.y, -1.0f);
+    EXPECT_LE(edgeNdc.y, 1.0f);
+
+    const glm::vec3 outsideDirection{glm::sin(coneAngle * 1.6f), -glm::cos(coneAngle * 1.6f), 0.0f};
+    const glm::vec3 outsideNdc = project(light.position + outsideDirection * 6.0f);
+    EXPECT_GT(std::abs(outsideNdc.x), 1.0f);
+}
+
+TEST(ShadowCascades, PointFacesProjectAlongTheirAxes)
+{
+    mukki::Light light{};
+    light.type = mukki::LightType::Point;
+    light.position = glm::vec3{1.0f, 3.0f, -2.0f};
+    light.range = 10.0f;
+
+    const std::array<glm::mat4, mukki::kPointShadowFaceCount> matrices =
+        mukki::ComputePointShadowMatrices(light, mukki::kShadowNearPlane);
+
+    constexpr glm::vec3 kDirections[mukki::kPointShadowFaceCount] = {
+        {1.0f, 0.0f, 0.0f},
+        {-1.0f, 0.0f, 0.0f},
+        {0.0f, 1.0f, 0.0f},
+        {0.0f, -1.0f, 0.0f},
+        {0.0f, 0.0f, 1.0f},
+        {0.0f, 0.0f, -1.0f}};
+
+    for (std::uint32_t face = 0; face < mukki::kPointShadowFaceCount; ++face)
+    {
+        const glm::vec3 point = light.position + kDirections[face] * 4.0f;
+        const glm::vec4 clip = matrices[face] * glm::vec4{point, 1.0f};
+        ASSERT_GT(clip.w, 0.0f) << "face " << face;
+        const glm::vec3 ndc = glm::vec3{clip} / clip.w;
+        EXPECT_NEAR(ndc.x, 0.0f, 1e-3f) << "face " << face;
+        EXPECT_NEAR(ndc.y, 0.0f, 1e-3f) << "face " << face;
+        EXPECT_GT(ndc.z, 0.0f) << "face " << face;
+        EXPECT_LT(ndc.z, 1.0f) << "face " << face;
+    }
+}
+
 TEST(ShadowCascades, ClampsCascadeCountAndIsDeterministic)
 {
     const mukki::FrameView view = MakeView();

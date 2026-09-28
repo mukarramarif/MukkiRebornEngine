@@ -23,10 +23,21 @@ struct DepthAttachment
     std::uint32_t layer = 0;
 };
 
+struct RenderArea
+{
+    std::uint32_t x = 0;
+    std::uint32_t y = 0;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+};
+
 struct RenderingDesc
 {
     std::vector<ColorAttachment> colorAttachments{};
     DepthAttachment depthAttachment{};
+    // Optional sub-rectangle of the attachments used as render area, viewport and scissor. A zero
+    // width or height targets the whole attachment (used for atlas tiles).
+    RenderArea area{};
     bool secondaryCommandBuffers = false;
 };
 
