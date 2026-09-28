@@ -3,6 +3,7 @@
 #include "Renderer/Vulkan/Core/VkConversions.h"
 #include "Utilities/Assert.h"
 #include "Utilities/Log.h"
+#include "Utilities/Profiling.h"
 
 #include <algorithm>
 #include <array>
@@ -41,6 +42,26 @@ bool VkDevice::Init(const rhi::DeviceDesc& desc)
 
     m_resourceAllocator.Init(m_device, m_allocator, *m_graphicsQueue, m_graphicsQueueFamily);
 
+#ifdef MRE_ENABLE_TRACY
+    MRE_ASSERT(!m_commandLists.empty(), "Tracy calibration requires at least one command list");
+    m_tracyContext = tracy::CreateVkContext(
+        static_cast<::VkPhysicalDevice>(*m_physicalDevice),
+        static_cast<::VkDevice>(*m_device),
+        static_cast<::VkQueue>(*m_graphicsQueue),
+        static_cast<::VkCommandBuffer>(*m_commandLists.front()->GetHandle()),
+        nullptr,
+        nullptr);
+    if (m_tracyContext != nullptr)
+    {
+        m_tracyContext->Name("Mukki", 5);
+        for (std::unique_ptr<VkCommandList>& commandList : m_commandLists)
+        {
+            commandList->SetTracyContext(m_tracyContext);
+        }
+        MRE_INFO("Tracy Vulkan context created");
+    }
+#endif
+
     m_initialized = true;
     MRE_INFO("Vulkan device initialized");
     return true;
@@ -54,6 +75,13 @@ void VkDevice::Shutdown()
     }
 
     m_commandLists.clear();
+#ifdef MRE_ENABLE_TRACY
+    if (m_tracyContext != nullptr)
+    {
+        tracy::DestroyVkContext(m_tracyContext);
+        m_tracyContext = nullptr;
+    }
+#endif
     m_frameSync.Shutdown();
     m_swapchain.reset();
     m_resourceAllocator.Shutdown();
@@ -70,17 +98,22 @@ void VkDevice::Shutdown()
     m_physicalDevice = vk::raii::PhysicalDevice{nullptr};
     m_swapchainInfo = rhi::SwapchainInfo{};
     m_requestedExtent = rhi::Extent2D{};
+    m_descriptorIndexingFeatures = vk::PhysicalDeviceDescriptorIndexingFeatures{};
+    m_descriptorIndexingProperties = vk::PhysicalDeviceDescriptorIndexingProperties{};
     m_graphicsQueueFamily = 0;
     m_apiVersion = VK_API_VERSION_1_3;
     m_framesInFlight = 2;
     m_frameIndex = 0;
     m_currentImageIndex = 0;
+    m_nextBindlessIndex = 0;
+    m_descriptorIndexingSupported = false;
     m_swapchainDirty = false;
     m_initialized = false;
 }
 
 bool VkDevice::BeginFrame()
 {
+    MRE_PROFILE_ZONE_N("VkDevice::BeginFrame");
     MRE_ASSERT(m_initialized, "VkDevice::BeginFrame called before VkDevice::Init");
 
     if (m_swapchainDirty)
@@ -130,6 +163,7 @@ bool VkDevice::BeginFrame()
 
 void VkDevice::EndFrame()
 {
+    MRE_PROFILE_ZONE_N("VkDevice::EndFrame");
     MRE_ASSERT(m_initialized, "VkDevice::EndFrame called before VkDevice::Init");
 
     VkCommandList& commandList = *m_commandLists[m_frameIndex];
@@ -190,6 +224,7 @@ void VkDevice::EndFrame()
 
 void VkDevice::WaitIdle()
 {
+    MRE_PROFILE_ZONE_N("VkDevice::WaitIdle");
     MRE_ASSERT(m_initialized, "VkDevice::WaitIdle called before VkDevice::Init");
     m_device.waitIdle();
 }
@@ -223,6 +258,9 @@ std::unique_ptr<rhi::CommandList> VkDevice::CreateSecondaryCommandList()
 
     auto commandList = std::make_unique<VkCommandList>();
     commandList->Init(m_device, m_graphicsQueueFamily, true);
+#ifdef MRE_ENABLE_TRACY
+    commandList->SetTracyContext(m_tracyContext);
+#endif
     return commandList;
 }
 
@@ -243,7 +281,18 @@ std::unique_ptr<rhi::Buffer> VkDevice::CreateBuffer(
 std::unique_ptr<rhi::Texture> VkDevice::CreateTexture(const rhi::TextureDesc& desc)
 {
     MRE_ASSERT(m_initialized, "VkDevice::CreateTexture called before VkDevice::Init");
-    return m_resourceAllocator.CreateTexture(desc);
+
+    std::unique_ptr<rhi::Texture> texture = m_resourceAllocator.CreateTexture(desc);
+    if (texture != nullptr)
+    {
+        MRE_ASSERT(
+            m_nextBindlessIndex < rhi::kMaxBindlessTextures,
+            "Bindless texture limit of {} reached",
+            rhi::kMaxBindlessTextures);
+        static_cast<VkTexture*>(texture.get())->SetBindlessIndex(m_nextBindlessIndex++);
+    }
+
+    return texture;
 }
 
 std::unique_ptr<rhi::Sampler> VkDevice::CreateSampler(const rhi::SamplerDesc& desc)
@@ -301,6 +350,8 @@ bool VkDevice::PickPhysicalDevice()
     vk::raii::PhysicalDevice best{nullptr};
     std::uint32_t bestFamily = 0;
     std::uint32_t bestApiVersion = 0;
+    vk::PhysicalDeviceDescriptorIndexingFeatures bestIndexingFeatures{};
+    vk::PhysicalDeviceDescriptorIndexingProperties bestIndexingProperties{};
 
     for (const vk::raii::PhysicalDevice& candidate : devices)
     {
@@ -309,6 +360,24 @@ bool VkDevice::PickPhysicalDevice()
         {
             continue;
         }
+
+        vk::PhysicalDeviceVulkan12Features features12{};
+        vk::PhysicalDeviceFeatures2 features2{};
+        features2.pNext = &features12;
+        (*candidate).getFeatures2(&features2);
+
+        if (!features12.descriptorIndexing)
+        {
+            MRE_WARN(
+                "Physical device '{}' does not support descriptor indexing, skipping",
+                properties.deviceName.data());
+            continue;
+        }
+
+        vk::PhysicalDeviceDescriptorIndexingFeatures indexingFeatures{};
+        vk::PhysicalDeviceFeatures2 indexingFeatures2{};
+        indexingFeatures2.pNext = &indexingFeatures;
+        (*candidate).getFeatures2(&indexingFeatures2);
 
         const std::vector<vk::QueueFamilyProperties> families = candidate.getQueueFamilyProperties();
         std::uint32_t graphicsFamily = 0;
@@ -358,22 +427,34 @@ bool VkDevice::PickPhysicalDevice()
 
         if (score > bestScore)
         {
+            vk::PhysicalDeviceDescriptorIndexingProperties indexingProperties{};
+            vk::PhysicalDeviceProperties2 properties2{};
+            properties2.pNext = &indexingProperties;
+            (*candidate).getProperties2(&properties2);
+
             bestScore = score;
             best = candidate;
             bestFamily = graphicsFamily;
             bestApiVersion = std::min(properties.apiVersion, VK_API_VERSION_1_4);
+            bestIndexingFeatures = indexingFeatures;
+            bestIndexingProperties = indexingProperties;
         }
     }
 
     if (*best == nullptr)
     {
-        MRE_CRITICAL("No suitable Vulkan physical device found (Vulkan 1.3, graphics and present queue required)");
+        MRE_CRITICAL(
+            "No suitable Vulkan physical device found "
+            "(Vulkan 1.3, descriptor indexing, graphics and present queue required)");
         return false;
     }
 
     m_physicalDevice = best;
     m_graphicsQueueFamily = bestFamily;
     m_apiVersion = bestApiVersion;
+    m_descriptorIndexingFeatures = bestIndexingFeatures;
+    m_descriptorIndexingProperties = bestIndexingProperties;
+    m_descriptorIndexingSupported = true;
 
     const vk::PhysicalDeviceProperties properties = best.getProperties();
     MRE_INFO(
@@ -382,6 +463,10 @@ bool VkDevice::PickPhysicalDevice()
         VK_API_VERSION_MAJOR(bestApiVersion),
         VK_API_VERSION_MINOR(bestApiVersion),
         VK_API_VERSION_PATCH(bestApiVersion));
+    MRE_INFO(
+        "Descriptor indexing supported ({} update-after-bind sampled images per set, {} per stage)",
+        m_descriptorIndexingProperties.maxDescriptorSetUpdateAfterBindSampledImages,
+        m_descriptorIndexingProperties.maxPerStageDescriptorUpdateAfterBindSampledImages);
 
     return true;
 }
@@ -400,10 +485,21 @@ bool VkDevice::CreateLogicalDevice()
 
     vk::PhysicalDeviceVulkan12Features features12{};
     features12.timelineSemaphore = true;
+    features12.descriptorIndexing = true;
+    features12.shaderSampledImageArrayNonUniformIndexing = true;
+    features12.shaderUniformBufferArrayNonUniformIndexing = true;
+    features12.shaderStorageBufferArrayNonUniformIndexing = true;
+    features12.descriptorBindingUniformBufferUpdateAfterBind = true;
+    features12.descriptorBindingSampledImageUpdateAfterBind = true;
+    features12.descriptorBindingStorageBufferUpdateAfterBind = true;
+    features12.descriptorBindingPartiallyBound = true;
+    features12.runtimeDescriptorArray = true;
 
     vk::PhysicalDeviceVulkan13Features features13{};
     features13.dynamicRendering = true;
     features13.synchronization2 = true;
+
+    MRE_ASSERT(m_descriptorIndexingSupported, "The selected physical device must support descriptor indexing");
 
     features11.pNext = &features12;
     features12.pNext = &features13;
@@ -456,15 +552,21 @@ bool VkDevice::CreateAllocator()
 
 bool VkDevice::CreateDescriptorPool()
 {
-    const std::array<vk::DescriptorPoolSize, 2> poolSizes{
+    const std::array<vk::DescriptorPoolSize, 5> poolSizes{
         vk::DescriptorPoolSize{vk::DescriptorType::eUniformBuffer, 256},
+        vk::DescriptorPoolSize{vk::DescriptorType::eStorageBuffer, 256},
         vk::DescriptorPoolSize{vk::DescriptorType::eCombinedImageSampler, 256},
+        vk::DescriptorPoolSize{vk::DescriptorType::eSampledImage, rhi::kMaxBindlessTextures},
+        vk::DescriptorPoolSize{vk::DescriptorType::eSampler, 64},
     };
 
-    const vk::DescriptorPoolCreateInfo createInfo = vk::DescriptorPoolCreateInfo{}
-                                                        .setFlags(vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet)
-                                                        .setMaxSets(512)
-                                                        .setPoolSizes(poolSizes);
+    const vk::DescriptorPoolCreateInfo createInfo =
+        vk::DescriptorPoolCreateInfo{}
+            .setFlags(
+                vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet |
+                vk::DescriptorPoolCreateFlagBits::eUpdateAfterBind)
+            .setMaxSets(512)
+            .setPoolSizes(poolSizes);
     m_descriptorPool = vk::raii::DescriptorPool{m_device, createInfo};
     return true;
 }

@@ -82,8 +82,14 @@ enum class AddressMode : std::uint8_t
 enum class DescriptorType : std::uint8_t
 {
     UniformBuffer = 0,
+    StorageBuffer,
     CombinedImageSampler,
+    SampledImage,
+    Sampler,
 };
+
+inline constexpr std::uint32_t kMaxBindlessTextures = 4096;
+inline constexpr std::uint32_t kMaxBindlessSamplers = 16;
 
 struct Extent2D
 {
@@ -130,6 +136,7 @@ struct TextureDesc
     TextureUsage usage = TextureUsage::Sampled;
     const void* initialData = nullptr;
     std::uint64_t initialDataSize = 0;
+    std::uint32_t arrayLayers = 1;
 };
 
 class Texture
@@ -144,16 +151,33 @@ public:
     [[nodiscard]] virtual std::uint32_t GetHeight() const = 0;
     [[nodiscard]] virtual Format GetFormat() const = 0;
     [[nodiscard]] virtual TextureUsage GetUsage() const = 0;
+    [[nodiscard]] virtual std::uint32_t GetArrayLayers() const = 0;
+    [[nodiscard]] virtual std::uint32_t GetBindlessIndex() const = 0;
 
 protected:
     Texture() = default;
+};
+
+enum class CompareOp : std::uint8_t
+{
+    Never = 0,
+    Less,
+    Equal,
+    LessEqual,
+    Greater,
+    NotEqual,
+    GreaterEqual,
+    Always,
 };
 
 struct SamplerDesc
 {
     Filter minFilter = Filter::Linear;
     Filter magFilter = Filter::Linear;
-    AddressMode addressMode = AddressMode::ClampToEdge;
+    AddressMode addressModeU = AddressMode::ClampToEdge;
+    AddressMode addressModeV = AddressMode::ClampToEdge;
+    bool compareEnable = false;
+    CompareOp compareOp = CompareOp::LessEqual;
 };
 
 class Sampler
@@ -194,12 +218,21 @@ class VertexLayout
 public:
     void AddAttribute(std::uint32_t location, Format format);
 
+    // Overrides the vertex binding stride for pipelines that only consume a prefix of the vertex
+    // format (for example a depth-only shadow pipeline). Attribute offsets keep using the stride
+    // derived from the added attributes.
+    void SetBindingStride(std::uint32_t stride) { m_bindingStride = stride; }
+
     [[nodiscard]] const std::vector<VertexAttribute>& GetAttributes() const { return m_attributes; }
-    [[nodiscard]] std::uint32_t GetStride() const { return m_stride; }
+    [[nodiscard]] std::uint32_t GetStride() const
+    {
+        return m_bindingStride != 0 ? m_bindingStride : m_stride;
+    }
 
 private:
     std::vector<VertexAttribute> m_attributes{};
     std::uint32_t m_stride = 0;
+    std::uint32_t m_bindingStride = 0;
 };
 
 struct DescriptorBinding
@@ -207,6 +240,8 @@ struct DescriptorBinding
     std::uint32_t binding = 0;
     DescriptorType type = DescriptorType::UniformBuffer;
     ShaderStageMask stages = ShaderStageMask::VertexFragment;
+    std::uint32_t arrayCount = 1;
+    bool updateAfterBind = false;
 };
 
 class DescriptorSetLayout
@@ -235,6 +270,9 @@ public:
         std::uint64_t offset = 0,
         std::uint64_t range = 0) = 0;
     virtual void BindTexture(std::uint32_t binding, const Texture& texture, const Sampler& sampler) = 0;
+    virtual void BindTexture(std::uint32_t binding, const Texture& texture, std::uint32_t arrayIndex) = 0;
+    virtual void BindSampler(std::uint32_t binding, const Sampler& sampler) = 0;
+    virtual void BindSampler(std::uint32_t binding, const Sampler& sampler, std::uint32_t arrayIndex) = 0;
 
 protected:
     DescriptorSet() = default;
@@ -244,11 +282,17 @@ struct PipelineDesc
 {
     const Shader* vertexShader = nullptr;
     const Shader* fragmentShader = nullptr;
+    const Shader* computeShader = nullptr;
     std::string_view vertexEntryPoint = "vertexMain";
     std::string_view fragmentEntryPoint = "fragmentMain";
+    std::string_view computeEntryPoint = "computeMain";
     VertexLayout vertexLayout{};
     bool depthTest = false;
     bool depthWrite = false;
+    bool depthBiasEnable = false;
+    float depthBiasConstant = 0.0f;
+    float depthBiasSlope = 0.0f;
+    float depthBiasClamp = 0.0f;
     bool blend = false;
     CullMode cullMode = CullMode::Back;
     std::uint32_t pushConstantSize = 0;
@@ -265,6 +309,8 @@ public:
 
     Pipeline(const Pipeline&) = delete;
     Pipeline& operator=(const Pipeline&) = delete;
+
+    [[nodiscard]] virtual bool IsCompute() const = 0;
 
 protected:
     Pipeline() = default;

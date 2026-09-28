@@ -9,10 +9,25 @@
       "version": "2.9.3"
     }
   ],
+  "features": {
+    "tracy": {
+      "description": "Tracy profiler instrumentation (on-demand)",
+      "dependencies": [
+        {
+          "name": "tracy",
+          "default-features": false,
+          "features": [
+            "on-demand"
+          ]
+        }
+      ]
+    }
+  },
   "dependencies": [
     "glfw3",
     "glm",
     "gtest",
+    "nlohmann-json",
     "tinygltf",
     "vulkan",
     "vulkan-memory-allocator",

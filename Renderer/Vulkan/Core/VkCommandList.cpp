@@ -7,6 +7,7 @@
 #include "Renderer/Vulkan/Resources/Texture.h"
 #include "Utilities/Assert.h"
 
+#include <cstring>
 #include <utility>
 #include <vector>
 
@@ -23,7 +24,8 @@ vk::ImageMemoryBarrier2 MakeImageBarrier(
     vk::PipelineStageFlags2 srcStage,
     vk::AccessFlags2 srcAccess,
     vk::PipelineStageFlags2 dstStage,
-    vk::AccessFlags2 dstAccess)
+    vk::AccessFlags2 dstAccess,
+    std::uint32_t layerCount = 1)
 {
     vk::ImageMemoryBarrier2 barrier{};
     barrier.srcStageMask = srcStage;
@@ -40,7 +42,7 @@ vk::ImageMemoryBarrier2 MakeImageBarrier(
                                    .setBaseMipLevel(0)
                                    .setLevelCount(1)
                                    .setBaseArrayLayer(0)
-                                   .setLayerCount(1);
+                                   .setLayerCount(layerCount);
     return barrier;
 }
 
@@ -69,6 +71,10 @@ void VkCommandList::Init(const vk::raii::Device& device, std::uint32_t queueFami
 
 void VkCommandList::Shutdown()
 {
+#ifdef MRE_ENABLE_TRACY
+    m_gpuZoneScope.reset();
+    m_tracyContext = nullptr;
+#endif
     m_commandBuffer = vk::raii::CommandBuffer{nullptr};
     m_commandPool = vk::raii::CommandPool{nullptr};
     m_swapchainImage = nullptr;
@@ -76,6 +82,7 @@ void VkCommandList::Shutdown()
     m_swapchainExtent = vk::Extent2D{0, 0};
     m_swapchainImageLayout = vk::ImageLayout::eUndefined;
     m_boundPipelineLayout = vk::PipelineLayout{nullptr};
+    m_boundPipelineBindPoint = vk::PipelineBindPoint::eGraphics;
     m_renderingColorTextures.clear();
     m_renderingDepthTexture = nullptr;
     m_swapchainImageIndex = 0;
@@ -101,6 +108,7 @@ void VkCommandList::SetSwapchainTarget(
     m_renderedThisFrame = false;
     m_hasBoundPipeline = false;
     m_boundPipelineLayout = vk::PipelineLayout{nullptr};
+    m_boundPipelineBindPoint = vk::PipelineBindPoint::eGraphics;
 }
 
 void VkCommandList::Begin()
@@ -114,12 +122,24 @@ void VkCommandList::Begin()
     m_renderedThisFrame = false;
     m_hasBoundPipeline = false;
     m_boundPipelineLayout = vk::PipelineLayout{nullptr};
+    m_boundPipelineBindPoint = vk::PipelineBindPoint::eGraphics;
 }
 
 void VkCommandList::End()
 {
     MRE_ASSERT(m_recording, "VkCommandList::End called without Begin");
     MRE_ASSERT(m_secondary || !m_rendering, "VkCommandList::End called while a rendering scope is open");
+#ifdef MRE_ENABLE_TRACY
+    MRE_ASSERT(!m_gpuZoneScope.has_value(), "VkCommandList::End called with an open GPU zone");
+#endif
+
+#ifdef MRE_ENABLE_TRACY
+    if (!m_secondary && m_tracyContext != nullptr)
+    {
+        // Collect must run while the command buffer is still recording.
+        m_tracyContext->Collect(static_cast<VkCommandBuffer>(*m_commandBuffer));
+    }
+#endif
 
     m_commandBuffer.end();
     m_recording = false;
@@ -166,7 +186,7 @@ void VkCommandList::BeginSwapchainRendering(const rhi::ClearColor& clearColor, b
                                                 .setColorAttachments(colorAttachment);
 
     m_commandBuffer.beginRendering(renderingInfo);
-    SetViewportAndScissor(m_swapchainExtent);
+    SetViewportAndScissor(0, 0, m_swapchainExtent.width, m_swapchainExtent.height);
 
     m_rendering = true;
     m_renderingSwapchain = true;
@@ -199,7 +219,9 @@ void VkCommandList::BeginRendering(const rhi::RenderingDesc& desc)
 {
     MRE_ASSERT(m_recording, "VkCommandList::BeginRendering called outside of a recording scope");
     MRE_ASSERT(!m_rendering, "VkCommandList::BeginRendering called while a rendering scope is open");
-    MRE_ASSERT(!desc.colorAttachments.empty(), "BeginRendering requires at least one color attachment");
+    MRE_ASSERT(
+        !desc.colorAttachments.empty() || desc.depthAttachment.texture != nullptr,
+        "BeginRendering requires at least one color or depth attachment");
 
     std::vector<vk::RenderingAttachmentInfo> colorAttachments{};
     colorAttachments.reserve(desc.colorAttachments.size());
@@ -224,13 +246,14 @@ void VkCommandList::BeginRendering(const rhi::RenderingDesc& desc)
                                : vk::PipelineStageFlagBits2::eNone,
                 wasInitialized ? vk::AccessFlagBits2::eColorAttachmentWrite : vk::AccessFlagBits2::eNone,
                 vk::PipelineStageFlagBits2::eColorAttachmentOutput,
-                vk::AccessFlagBits2::eColorAttachmentWrite);
+                vk::AccessFlagBits2::eColorAttachmentWrite,
+                texture->GetArrayLayers());
             m_commandBuffer.pipelineBarrier2(vk::DependencyInfo{}.setImageMemoryBarriers(barrier));
             texture->SetLayout(vk::ImageLayout::eColorAttachmentOptimal);
         }
 
         colorAttachments.push_back(vk::RenderingAttachmentInfo{}
-                                       .setImageView(texture->GetImageView())
+                                       .setImageView(texture->GetLayerView(0))
                                        .setImageLayout(vk::ImageLayout::eColorAttachmentOptimal)
                                        .setLoadOp(attachment.clear ? vk::AttachmentLoadOp::eClear
                                                                    : vk::AttachmentLoadOp::eLoad)
@@ -266,13 +289,14 @@ void VkCommandList::BeginRendering(const rhi::RenderingDesc& desc)
                 wasInitialized ? vk::AccessFlagBits2::eDepthStencilAttachmentWrite
                                : vk::AccessFlagBits2::eNone,
                 vk::PipelineStageFlagBits2::eEarlyFragmentTests | vk::PipelineStageFlagBits2::eLateFragmentTests,
-                vk::AccessFlagBits2::eDepthStencilAttachmentWrite);
+                vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+                depthTexture->GetArrayLayers());
             m_commandBuffer.pipelineBarrier2(vk::DependencyInfo{}.setImageMemoryBarriers(barrier));
             depthTexture->SetLayout(vk::ImageLayout::eDepthAttachmentOptimal);
         }
 
         depthAttachmentInfo = vk::RenderingAttachmentInfo{}
-                                  .setImageView(depthTexture->GetImageView())
+                                  .setImageView(depthTexture->GetLayerView(desc.depthAttachment.layer))
                                   .setImageLayout(vk::ImageLayout::eDepthAttachmentOptimal)
                                   .setLoadOp(desc.depthAttachment.clear ? vk::AttachmentLoadOp::eClear
                                                                         : vk::AttachmentLoadOp::eLoad)
@@ -288,8 +312,17 @@ void VkCommandList::BeginRendering(const rhi::RenderingDesc& desc)
         }
     }
 
+    const bool hasArea = desc.area.width > 0 && desc.area.height > 0;
+    const vk::Rect2D renderArea = hasArea
+        ? vk::Rect2D{
+              vk::Offset2D{
+                  static_cast<std::int32_t>(desc.area.x),
+                  static_cast<std::int32_t>(desc.area.y)},
+              vk::Extent2D{desc.area.width, desc.area.height}}
+        : vk::Rect2D{vk::Offset2D{0, 0}, extent};
+
     vk::RenderingInfo renderingInfo = vk::RenderingInfo{}
-                                          .setRenderArea(vk::Rect2D{vk::Offset2D{0, 0}, extent})
+                                          .setRenderArea(renderArea)
                                           .setLayerCount(1)
                                           .setColorAttachments(colorAttachments);
     if (desc.secondaryCommandBuffers)
@@ -302,7 +335,11 @@ void VkCommandList::BeginRendering(const rhi::RenderingDesc& desc)
     }
 
     m_commandBuffer.beginRendering(renderingInfo);
-    SetViewportAndScissor(extent);
+    SetViewportAndScissor(
+        static_cast<std::uint32_t>(renderArea.offset.x),
+        static_cast<std::uint32_t>(renderArea.offset.y),
+        renderArea.extent.width,
+        renderArea.extent.height);
 
     m_rendering = true;
     m_renderingSwapchain = false;
@@ -324,7 +361,8 @@ void VkCommandList::EndRendering()
             vk::PipelineStageFlagBits2::eColorAttachmentOutput,
             vk::AccessFlagBits2::eColorAttachmentWrite,
             vk::PipelineStageFlagBits2::eFragmentShader,
-            vk::AccessFlagBits2::eShaderSampledRead);
+            vk::AccessFlagBits2::eShaderSampledRead,
+            texture->GetArrayLayers());
         m_commandBuffer.pipelineBarrier2(vk::DependencyInfo{}.setImageMemoryBarriers(barrier));
         texture->SetLayout(vk::ImageLayout::eShaderReadOnlyOptimal);
     }
@@ -339,7 +377,8 @@ void VkCommandList::EndRendering()
             vk::PipelineStageFlagBits2::eEarlyFragmentTests | vk::PipelineStageFlagBits2::eLateFragmentTests,
             vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
             vk::PipelineStageFlagBits2::eFragmentShader,
-            vk::AccessFlagBits2::eShaderSampledRead);
+            vk::AccessFlagBits2::eShaderSampledRead,
+            m_renderingDepthTexture->GetArrayLayers());
         m_commandBuffer.pipelineBarrier2(vk::DependencyInfo{}.setImageMemoryBarriers(barrier));
         m_renderingDepthTexture->SetLayout(vk::ImageLayout::eShaderReadOnlyOptimal);
     }
@@ -353,7 +392,9 @@ void VkCommandList::BeginSecondary(const rhi::RenderingDesc& desc)
 {
     MRE_ASSERT(m_secondary, "VkCommandList::BeginSecondary requires a secondary command list");
     MRE_ASSERT(!m_recording, "VkCommandList::BeginSecondary called while already recording");
-    MRE_ASSERT(!desc.colorAttachments.empty(), "BeginSecondary requires at least one color attachment");
+    MRE_ASSERT(
+        !desc.colorAttachments.empty() || desc.depthAttachment.texture != nullptr,
+        "BeginSecondary requires at least one color or depth attachment");
 
     std::vector<vk::Format> colorFormats{};
     colorFormats.reserve(desc.colorAttachments.size());
@@ -381,7 +422,7 @@ void VkCommandList::BeginSecondary(const rhi::RenderingDesc& desc)
 
     vk::CommandBufferInheritanceRenderingInfo inheritanceRenderingInfo{};
     inheritanceRenderingInfo.colorAttachmentCount = static_cast<std::uint32_t>(colorFormats.size());
-    inheritanceRenderingInfo.pColorAttachmentFormats = colorFormats.data();
+    inheritanceRenderingInfo.pColorAttachmentFormats = colorFormats.empty() ? nullptr : colorFormats.data();
     inheritanceRenderingInfo.depthAttachmentFormat = depthFormat;
     inheritanceRenderingInfo.stencilAttachmentFormat = vk::Format::eUndefined;
     inheritanceRenderingInfo.rasterizationSamples = vk::SampleCountFlagBits::e1;
@@ -400,7 +441,14 @@ void VkCommandList::BeginSecondary(const rhi::RenderingDesc& desc)
     m_renderingSwapchain = false;
     m_hasBoundPipeline = false;
     m_boundPipelineLayout = vk::PipelineLayout{nullptr};
-    SetViewportAndScissor(extent);
+    m_boundPipelineBindPoint = vk::PipelineBindPoint::eGraphics;
+
+    const bool hasArea = desc.area.width > 0 && desc.area.height > 0;
+    SetViewportAndScissor(
+        hasArea ? desc.area.x : 0,
+        hasArea ? desc.area.y : 0,
+        hasArea ? desc.area.width : extent.width,
+        hasArea ? desc.area.height : extent.height);
 }
 
 void VkCommandList::ExecuteCommands(const std::vector<const rhi::CommandList*>& secondaryCommandLists)
@@ -427,12 +475,49 @@ void VkCommandList::ExecuteCommands(const std::vector<const rhi::CommandList*>& 
     m_commandBuffer.executeCommands(commandBuffers);
 }
 
+void VkCommandList::BeginGpuZone(const char* name)
+{
+    MRE_ASSERT(m_recording, "VkCommandList::BeginGpuZone called outside of a recording scope");
+    MRE_ASSERT(name != nullptr, "VkCommandList::BeginGpuZone requires a zone name");
+
+#ifdef MRE_ENABLE_TRACY
+    MRE_ASSERT(!m_gpuZoneScope.has_value(), "VkCommandList::BeginGpuZone called with an open GPU zone");
+    MRE_ASSERT(m_tracyContext != nullptr, "VkCommandList::BeginGpuZone requires a Tracy context");
+
+    m_gpuZoneScope.emplace(
+        m_tracyContext,
+        __LINE__,
+        __FILE__,
+        std::strlen(__FILE__),
+        __FUNCTION__,
+        std::strlen(__FUNCTION__),
+        name,
+        std::strlen(name),
+        static_cast<VkCommandBuffer>(*m_commandBuffer),
+        true);
+#else
+    (void)name;
+#endif
+}
+
+void VkCommandList::EndGpuZone()
+{
+    MRE_ASSERT(m_recording, "VkCommandList::EndGpuZone called outside of a recording scope");
+
+#ifdef MRE_ENABLE_TRACY
+    MRE_ASSERT(m_gpuZoneScope.has_value(), "VkCommandList::EndGpuZone called without an open GPU zone");
+    m_gpuZoneScope.reset();
+#endif
+}
+
 void VkCommandList::BindPipeline(const rhi::Pipeline& pipeline)
 {
     MRE_ASSERT(m_recording, "VkCommandList::BindPipeline called outside of a recording scope");
 
     const auto& vkPipeline = static_cast<const VkPipeline&>(pipeline);
-    m_commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, vkPipeline.GetHandle());
+    m_boundPipelineBindPoint = vkPipeline.IsCompute() ? vk::PipelineBindPoint::eCompute
+                                                      : vk::PipelineBindPoint::eGraphics;
+    m_commandBuffer.bindPipeline(m_boundPipelineBindPoint, vkPipeline.GetHandle());
     m_boundPipelineLayout = vkPipeline.GetLayout();
     m_hasBoundPipeline = true;
 }
@@ -444,7 +529,7 @@ void VkCommandList::BindDescriptorSet(std::uint32_t setIndex, const rhi::Descrip
 
     const auto& vkDescriptorSet = static_cast<const VkDescriptorSet&>(descriptorSet);
     const vk::DescriptorSet handle = vkDescriptorSet.GetHandle();
-    m_commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, m_boundPipelineLayout, setIndex, handle, {});
+    m_commandBuffer.bindDescriptorSets(m_boundPipelineBindPoint, m_boundPipelineLayout, setIndex, handle, {});
 }
 
 void VkCommandList::BindVertexBuffer(const rhi::Buffer& buffer)
@@ -491,18 +576,58 @@ void VkCommandList::DrawIndexed(std::uint32_t indexCount, std::uint32_t firstInd
     m_commandBuffer.drawIndexed(indexCount, 1, firstIndex, 0, 0);
 }
 
-void VkCommandList::SetViewportAndScissor(const vk::Extent2D& extent)
+void VkCommandList::Dispatch(std::uint32_t groupCountX, std::uint32_t groupCountY, std::uint32_t groupCountZ)
+{
+    MRE_ASSERT(m_recording, "VkCommandList::Dispatch called outside of a recording scope");
+    MRE_ASSERT(!m_rendering, "VkCommandList::Dispatch cannot be called inside a rendering scope");
+    MRE_ASSERT(m_hasBoundPipeline, "VkCommandList::Dispatch requires a bound pipeline");
+    MRE_ASSERT(
+        m_boundPipelineBindPoint == vk::PipelineBindPoint::eCompute,
+        "VkCommandList::Dispatch requires a bound compute pipeline");
+
+    m_commandBuffer.dispatch(groupCountX, groupCountY, groupCountZ);
+}
+
+void VkCommandList::ShaderMemoryBarrier(rhi::ShaderStageMask before, rhi::ShaderStageMask after)
+{
+    MRE_ASSERT(m_recording, "VkCommandList::ShaderMemoryBarrier called outside of a recording scope");
+
+    const vk::MemoryBarrier2 barrier = vk::MemoryBarrier2{}
+                                           .setSrcStageMask(ToVkPipelineStageFlags2(before))
+                                           .setSrcAccessMask(vk::AccessFlagBits2::eShaderWrite)
+                                           .setDstStageMask(ToVkPipelineStageFlags2(after))
+                                           .setDstAccessMask(vk::AccessFlagBits2::eShaderRead);
+    m_commandBuffer.pipelineBarrier2(vk::DependencyInfo{}.setMemoryBarriers(barrier));
+}
+
+void VkCommandList::SetDepthBias(float constantFactor, float slopeFactor, float clamp)
+{
+    MRE_ASSERT(m_recording, "VkCommandList::SetDepthBias called outside of a recording scope");
+    MRE_ASSERT(m_hasBoundPipeline, "VkCommandList::SetDepthBias requires a bound pipeline");
+
+    m_commandBuffer.setDepthBias(constantFactor, clamp, slopeFactor);
+}
+
+void VkCommandList::SetViewportAndScissor(
+    std::uint32_t x,
+    std::uint32_t y,
+    std::uint32_t width,
+    std::uint32_t height)
 {
     const vk::Viewport viewport = vk::Viewport{}
-                                      .setX(0.0f)
-                                      .setY(0.0f)
-                                      .setWidth(static_cast<float>(extent.width))
-                                      .setHeight(static_cast<float>(extent.height))
+                                      .setX(static_cast<float>(x))
+                                      .setY(static_cast<float>(y))
+                                      .setWidth(static_cast<float>(width))
+                                      .setHeight(static_cast<float>(height))
                                       .setMinDepth(0.0f)
                                       .setMaxDepth(1.0f);
     m_commandBuffer.setViewport(0, viewport);
 
-    const vk::Rect2D scissor = vk::Rect2D{}.setOffset(vk::Offset2D{0, 0}).setExtent(extent);
+    const vk::Rect2D scissor = vk::Rect2D{}
+                                   .setOffset(vk::Offset2D{
+                                       static_cast<std::int32_t>(x),
+                                       static_cast<std::int32_t>(y)})
+                                   .setExtent(vk::Extent2D{width, height});
     m_commandBuffer.setScissor(0, scissor);
 }
 

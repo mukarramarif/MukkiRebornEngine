@@ -14,15 +14,6 @@ namespace mukki::vulkan
 
 VkPipeline::VkPipeline(const vk::raii::Device& device, const rhi::PipelineDesc& desc)
 {
-    MRE_ASSERT(desc.vertexShader != nullptr, "PipelineDesc requires a vertex shader");
-    MRE_ASSERT(desc.fragmentShader != nullptr, "PipelineDesc requires a fragment shader");
-    MRE_ASSERT(!desc.colorFormats.empty(), "PipelineDesc requires at least one color format");
-
-    const auto* vertexShader = static_cast<const VkShader*>(desc.vertexShader);
-    const auto* fragmentShader = static_cast<const VkShader*>(desc.fragmentShader);
-    MRE_ASSERT(vertexShader->GetStage() == rhi::ShaderStage::Vertex, "The vertex shader has the wrong stage");
-    MRE_ASSERT(fragmentShader->GetStage() == rhi::ShaderStage::Fragment, "The fragment shader has the wrong stage");
-
     vk::PipelineLayoutCreateInfo layoutInfo{};
     const vk::PushConstantRange pushConstantRange = vk::PushConstantRange{}
                                                         .setStageFlags(ToVkShaderStageMask(desc.pushConstantStages))
@@ -46,6 +37,37 @@ VkPipeline::VkPipeline(const vk::raii::Device& device, const rhi::PipelineDesc& 
     }
 
     m_layout = vk::raii::PipelineLayout{device, layoutInfo};
+
+    if (desc.computeShader != nullptr)
+    {
+        const auto* computeShader = static_cast<const VkShader*>(desc.computeShader);
+        MRE_ASSERT(computeShader->GetStage() == rhi::ShaderStage::Compute, "The compute shader has the wrong stage");
+
+        const std::string computeEntryPoint{desc.computeEntryPoint};
+        const vk::PipelineShaderStageCreateInfo computeStage = vk::PipelineShaderStageCreateInfo{}
+                                                                   .setStage(vk::ShaderStageFlagBits::eCompute)
+                                                                   .setModule(computeShader->GetHandle())
+                                                                   .setPName(computeEntryPoint.c_str());
+        const vk::ComputePipelineCreateInfo pipelineInfo =
+            vk::ComputePipelineCreateInfo{}.setStage(computeStage).setLayout(*m_layout);
+
+        std::vector<vk::raii::Pipeline> pipelines = device.createComputePipelines(nullptr, pipelineInfo);
+        MRE_ASSERT(pipelines.size() == 1, "Expected exactly one compute pipeline");
+        m_pipeline = std::move(pipelines.front());
+        m_isCompute = true;
+        return;
+    }
+
+    MRE_ASSERT(desc.vertexShader != nullptr, "PipelineDesc requires a vertex shader");
+    MRE_ASSERT(desc.fragmentShader != nullptr, "PipelineDesc requires a fragment shader");
+    MRE_ASSERT(
+        !desc.colorFormats.empty() || desc.depthFormat != rhi::Format::Undefined,
+        "PipelineDesc requires at least one color format or a depth format");
+
+    const auto* vertexShader = static_cast<const VkShader*>(desc.vertexShader);
+    const auto* fragmentShader = static_cast<const VkShader*>(desc.fragmentShader);
+    MRE_ASSERT(vertexShader->GetStage() == rhi::ShaderStage::Vertex, "The vertex shader has the wrong stage");
+    MRE_ASSERT(fragmentShader->GetStage() == rhi::ShaderStage::Fragment, "The fragment shader has the wrong stage");
 
     const std::string vertexEntryPoint{desc.vertexEntryPoint};
     const std::string fragmentEntryPoint{desc.fragmentEntryPoint};
@@ -90,7 +112,10 @@ VkPipeline::VkPipeline(const vk::raii::Device& device, const rhi::PipelineDesc& 
                                                                             .setTopology(vk::PrimitiveTopology::eTriangleList)
                                                                             .setPrimitiveRestartEnable(false);
 
-    const std::array<vk::DynamicState, 2> dynamicStates{vk::DynamicState::eViewport, vk::DynamicState::eScissor};
+    const std::array<vk::DynamicState, 3> dynamicStates{
+        vk::DynamicState::eViewport,
+        vk::DynamicState::eScissor,
+        vk::DynamicState::eDepthBias};
     const vk::PipelineDynamicStateCreateInfo dynamicState = vk::PipelineDynamicStateCreateInfo{}.setDynamicStates(
         dynamicStates);
 
@@ -105,7 +130,10 @@ VkPipeline::VkPipeline(const vk::raii::Device& device, const rhi::PipelineDesc& 
             .setPolygonMode(vk::PolygonMode::eFill)
             .setCullMode(ToVkCullMode(desc.cullMode))
             .setFrontFace(vk::FrontFace::eCounterClockwise)
-            .setDepthBiasEnable(false)
+            .setDepthBiasEnable(desc.depthBiasEnable)
+            .setDepthBiasConstantFactor(desc.depthBiasConstant)
+            .setDepthBiasSlopeFactor(desc.depthBiasSlope)
+            .setDepthBiasClamp(desc.depthBiasClamp)
             .setLineWidth(1.0f);
 
     const vk::PipelineMultisampleStateCreateInfo multisampleState = vk::PipelineMultisampleStateCreateInfo{}

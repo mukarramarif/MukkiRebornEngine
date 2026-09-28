@@ -20,12 +20,24 @@ struct DepthAttachment
     const Texture* texture = nullptr;
     float clearDepth = 1.0f;
     bool clear = true;
+    std::uint32_t layer = 0;
+};
+
+struct RenderArea
+{
+    std::uint32_t x = 0;
+    std::uint32_t y = 0;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
 };
 
 struct RenderingDesc
 {
     std::vector<ColorAttachment> colorAttachments{};
     DepthAttachment depthAttachment{};
+    // Optional sub-rectangle of the attachments used as render area, viewport and scissor. A zero
+    // width or height targets the whole attachment (used for atlas tiles).
+    RenderArea area{};
     bool secondaryCommandBuffers = false;
 };
 
@@ -52,6 +64,20 @@ public:
     virtual void SetPushConstants(const void* data, std::uint32_t size, ShaderStageMask stages) = 0;
     virtual void Draw(std::uint32_t vertexCount, std::uint32_t firstVertex = 0) = 0;
     virtual void DrawIndexed(std::uint32_t indexCount, std::uint32_t firstIndex = 0) = 0;
+    virtual void Dispatch(std::uint32_t groupCountX, std::uint32_t groupCountY, std::uint32_t groupCountZ) = 0;
+
+    // Memory dependency between shader stages, used when compute-produced storage data is read by
+    // a later stage within the same command buffer.
+    virtual void ShaderMemoryBarrier(ShaderStageMask before, ShaderStageMask after) = 0;
+
+    // Dynamic depth bias for the currently bound graphics pipeline. Pipelines must be created with
+    // depthBiasEnable for the values to take effect.
+    virtual void SetDepthBias(float constantFactor, float slopeFactor, float clamp = 0.0f) = 0;
+
+    // GPU timestamp zone markers, used by profilers such as Tracy. Zone names must remain
+    // valid for the duration of the recording scope and zones must be balanced pairs.
+    virtual void BeginGpuZone(const char* name) = 0;
+    virtual void EndGpuZone() = 0;
 
     // Secondary command buffers inherit the active rendering scope of the primary command list that
     // executes them. They can be recorded on worker threads and replayed with ExecuteCommands.

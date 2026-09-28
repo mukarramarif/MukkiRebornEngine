@@ -3,6 +3,7 @@
 #include "Utilities/Assert.h"
 #include "Utilities/Log.h"
 #include "Utilities/PathUtils.h"
+#include "Utilities/Profiling.h"
 
 #include <algorithm>
 #include <cstring>
@@ -271,6 +272,20 @@ void ConvertImageToRgba(const tinygltf::Image& source, GltfImage& out)
     }
 }
 
+GltfWrapMode ConvertWrapMode(int wrap)
+{
+    switch (wrap)
+    {
+    case TINYGLTF_TEXTURE_WRAP_CLAMP_TO_EDGE:
+        return GltfWrapMode::ClampToEdge;
+    case TINYGLTF_TEXTURE_WRAP_MIRRORED_REPEAT:
+        return GltfWrapMode::MirroredRepeat;
+    case TINYGLTF_TEXTURE_WRAP_REPEAT:
+    default:
+        return GltfWrapMode::Repeat;
+    }
+}
+
 glm::mat4 GetNodeLocalTransform(const tinygltf::Node& node)
 {
     if (node.matrix.size() == 16)
@@ -357,6 +372,8 @@ void TraverseNode(
 
 bool LoadGltfModel(const std::filesystem::path& path, GltfModel& model)
 {
+    MRE_PROFILE_ZONE_N("LoadGltfModel");
+
     std::error_code errorCode{};
     if (!std::filesystem::exists(path, errorCode))
     {
@@ -425,6 +442,19 @@ bool LoadGltfModel(const std::filesystem::path& path, GltfModel& model)
         model.images.push_back(std::move(converted));
     }
 
+    for (const tinygltf::Texture& texture : gltf.textures)
+    {
+        GltfTexture converted{};
+        converted.imageIndex = texture.source;
+        if (texture.sampler >= 0 && texture.sampler < static_cast<int>(gltf.samplers.size()))
+        {
+            const tinygltf::Sampler& sampler = gltf.samplers[static_cast<std::size_t>(texture.sampler)];
+            converted.wrapS = ConvertWrapMode(sampler.wrapS);
+            converted.wrapT = ConvertWrapMode(sampler.wrapT);
+        }
+        model.textures.push_back(converted);
+    }
+
     for (const tinygltf::Material& material : gltf.materials)
     {
         GltfMaterial converted{};
@@ -441,18 +471,17 @@ bool LoadGltfModel(const std::filesystem::path& path, GltfModel& model)
         converted.roughnessFactor = static_cast<float>(material.pbrMetallicRoughness.roughnessFactor);
         converted.doubleSided = material.doubleSided;
 
-        const int textureIndex = material.pbrMetallicRoughness.baseColorTexture.index;
-        if (textureIndex >= 0 && textureIndex < static_cast<int>(gltf.textures.size()))
+        const int baseColorTextureIndex = material.pbrMetallicRoughness.baseColorTexture.index;
+        if (baseColorTextureIndex >= 0 && baseColorTextureIndex < static_cast<int>(gltf.textures.size()))
         {
-            converted.baseColorImage = gltf.textures[static_cast<std::size_t>(textureIndex)].source;
+            converted.baseColorTexture = baseColorTextureIndex;
         }
 
         const int metalRoughnessTextureIndex = material.pbrMetallicRoughness.metallicRoughnessTexture.index;
         if (metalRoughnessTextureIndex >= 0 &&
             metalRoughnessTextureIndex < static_cast<int>(gltf.textures.size()))
         {
-            converted.metallicRoughnessImage =
-                gltf.textures[static_cast<std::size_t>(metalRoughnessTextureIndex)].source;
+            converted.metallicRoughnessTexture = metalRoughnessTextureIndex;
         }
 
         model.materials.push_back(converted);

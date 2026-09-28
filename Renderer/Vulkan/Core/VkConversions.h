@@ -13,6 +13,8 @@ namespace mukki::vulkan
 [[nodiscard]] vk::BufferUsageFlags ToVkBufferUsage(rhi::BufferUsage usage);
 [[nodiscard]] vk::ShaderStageFlagBits ToVkShaderStage(rhi::ShaderStage stage);
 [[nodiscard]] vk::ShaderStageFlags ToVkShaderStageMask(rhi::ShaderStageMask mask);
+[[nodiscard]] vk::PipelineStageFlags2 ToVkPipelineStageFlags2(rhi::ShaderStageMask mask);
 [[nodiscard]] vk::CullModeFlags ToVkCullMode(rhi::CullMode mode);
+[[nodiscard]] vk::DescriptorType ToVkDescriptorType(rhi::DescriptorType type);
 
 } // namespace mukki::vulkan

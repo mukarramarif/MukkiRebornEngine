@@ -19,6 +19,7 @@
 #include "Renderer/Vulkan/Resources/DescriptorSet.h"
 #include "Renderer/Vulkan/Resources/Sampler.h"
 #include "Renderer/Vulkan/Resources/Texture.h"
+#include "Utilities/ProfilingVulkan.h"
 
 namespace mukki::vulkan
 {
@@ -45,6 +46,7 @@ public:
     [[nodiscard]] const rhi::SwapchainInfo& GetSwapchainInfo() const override;
     [[nodiscard]] std::uint32_t GetFrameIndex() const override { return m_frameIndex; }
     [[nodiscard]] std::uint32_t GetFramesInFlight() const override { return m_framesInFlight; }
+    [[nodiscard]] bool IsBindlessSupported() const override { return m_descriptorIndexingSupported; }
 
     [[nodiscard]] std::unique_ptr<rhi::Buffer> CreateBuffer(
         const rhi::BufferDesc& desc,
@@ -68,6 +70,14 @@ public:
     [[nodiscard]] const vk::raii::Queue& GetGraphicsQueue() const { return m_graphicsQueue; }
     [[nodiscard]] std::uint32_t GetGraphicsQueueFamily() const { return m_graphicsQueueFamily; }
     [[nodiscard]] VmaAllocator GetAllocator() const { return m_allocator; }
+    [[nodiscard]] const vk::PhysicalDeviceDescriptorIndexingFeatures& GetDescriptorIndexingFeatures() const
+    {
+        return m_descriptorIndexingFeatures;
+    }
+    [[nodiscard]] const vk::PhysicalDeviceDescriptorIndexingProperties& GetDescriptorIndexingProperties() const
+    {
+        return m_descriptorIndexingProperties;
+    }
 
 private:
     bool PickPhysicalDevice();
@@ -91,11 +101,18 @@ private:
     std::vector<std::unique_ptr<VkCommandList>> m_commandLists{};
     rhi::SwapchainInfo m_swapchainInfo{};
     rhi::Extent2D m_requestedExtent{};
+    vk::PhysicalDeviceDescriptorIndexingFeatures m_descriptorIndexingFeatures{};
+    vk::PhysicalDeviceDescriptorIndexingProperties m_descriptorIndexingProperties{};
+#ifdef MRE_ENABLE_TRACY
+    tracy::VkCtx* m_tracyContext = nullptr;
+#endif
     std::uint32_t m_graphicsQueueFamily = 0;
     std::uint32_t m_apiVersion = VK_API_VERSION_1_3;
     std::uint32_t m_framesInFlight = 2;
     std::uint32_t m_frameIndex = 0;
     std::uint32_t m_currentImageIndex = 0;
+    std::uint32_t m_nextBindlessIndex = 0;
+    bool m_descriptorIndexingSupported = false;
     bool m_swapchainDirty = false;
     bool m_initialized = false;
 };

@@ -26,13 +26,27 @@ struct GltfPrimitive
     int materialIndex = -1;
 };
 
+enum class GltfWrapMode : std::uint8_t
+{
+    Repeat = 0,
+    ClampToEdge,
+    MirroredRepeat,
+};
+
+struct GltfTexture
+{
+    int imageIndex = -1;
+    GltfWrapMode wrapS = GltfWrapMode::Repeat;
+    GltfWrapMode wrapT = GltfWrapMode::Repeat;
+};
+
 struct GltfMaterial
 {
     glm::vec4 baseColorFactor{1.0f};
     float metallicFactor = 1.0f;
     float roughnessFactor = 1.0f;
-    int baseColorImage = -1;
-    int metallicRoughnessImage = -1;
+    int baseColorTexture = -1;
+    int metallicRoughnessTexture = -1;
     bool doubleSided = false;
 };
 
@@ -55,6 +69,7 @@ struct GltfModel
     std::vector<std::vector<std::uint32_t>> meshPrimitives{};
     std::vector<GltfMaterial> materials{};
     std::vector<GltfImage> images{};
+    std::vector<GltfTexture> textures{};
     std::vector<GltfNode> nodes{};
     glm::vec3 minBounds{0.0f};
     glm::vec3 maxBounds{0.0f};

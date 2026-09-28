@@ -1,10 +1,12 @@
 struct SceneUniform
 {
     float4x4 viewProjection;
+    float4x4 view;
     float4 cameraPosition;
-    float4 lightDirection;
-    float4 lightColor;
     float4 ambientColor;
+    float4 clusterParams;
+    uint4 clusterGrid;
+    float4 screenSize;
 };
 
 [[vk::binding(0, 0)]] ConstantBuffer<SceneUniform> gScene;
@@ -14,6 +16,8 @@ struct ObjectPushConstants
     float4x4 model;
     float4 baseColorFactor;
     float4 params;
+    uint2 textureIndices;
+    uint2 samplerIndices;
 };
 
 [[vk::push_constant]] ConstantBuffer<ObjectPushConstants> gObject;

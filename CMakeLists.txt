@@ -18,13 +18,19 @@ endif()
 
 option(MRE_BUILD_SANDBOX "Build the sandbox application" ON)
 option(MRE_BUILD_TESTS "Build the unit tests" ON)
+option(MRE_ENABLE_TRACY "Enable Tracy profiler instrumentation" OFF)
 
 find_package(Vulkan REQUIRED)
 find_package(glfw3 CONFIG REQUIRED)
 find_package(glm CONFIG REQUIRED)
 find_package(VulkanMemoryAllocator CONFIG REQUIRED)
 find_package(imgui CONFIG REQUIRED)
+find_package(nlohmann_json CONFIG REQUIRED)
 find_package(Threads REQUIRED)
+
+if(MRE_ENABLE_TRACY)
+    find_package(Tracy CONFIG REQUIRED)
+endif()
 
 find_path(MRE_TINYGLTF_INCLUDE_DIR NAMES tiny_gltf.h REQUIRED)
 find_path(MRE_STB_INCLUDE_DIR NAMES stb_image.h REQUIRED)
@@ -92,7 +98,13 @@ add_library(mukki_engine STATIC
     Renderer/BufferManager.cpp
     Renderer/Deferred/DeferredRenderer.cpp
     Renderer/Deferred/GBuffer.cpp
+    Renderer/Lighting/ClusterGrid.cpp
+    Renderer/Lighting/Light.cpp
+    Renderer/Lighting/ShadowCascade.cpp
     Renderer/RHI/Resources.cpp
+    Scene/SceneBinary.cpp
+    Scene/SceneDescription.cpp
+    Scene/SceneJson.cpp
     Renderer/Vulkan/Core/FrameSync.cpp
     Renderer/Vulkan/Core/VkCommandList.cpp
     Renderer/Vulkan/Core/VkConversions.cpp
@@ -129,6 +141,7 @@ target_compile_definitions(mukki_engine PRIVATE
     VMA_STATIC_VULKAN_FUNCTIONS=1
     VMA_DYNAMIC_VULKAN_FUNCTIONS=0
 )
+target_link_libraries(mukki_engine PRIVATE nlohmann_json::nlohmann_json)
 target_link_libraries(mukki_engine
     PUBLIC
         Vulkan::Vulkan
@@ -139,17 +152,24 @@ target_link_libraries(mukki_engine
         Threads::Threads
 )
 
+if(MRE_ENABLE_TRACY)
+    target_compile_definitions(mukki_engine PUBLIC MRE_ENABLE_TRACY)
+    target_link_libraries(mukki_engine PUBLIC Tracy::TracyClient)
+endif()
+
 if(MRE_BUILD_SANDBOX)
     add_executable(mukki_sandbox
         Sandbox/main.cpp
     )
     target_link_libraries(mukki_sandbox PRIVATE mukki::engine)
 
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/glTF-Sample-Models/2.0")
+    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/glTF-Sample-Models/2.0")
+        message(STATUS "glTF sample models submodule not found; the demo scene models will not load")
+    endif()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/Sandbox/Scenes")
         target_compile_definitions(mukki_sandbox PRIVATE
-            MRE_SAMPLE_MODELS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/glTF-Sample-Models/2.0")
-    else()
-        message(STATUS "glTF sample models submodule not found, sandbox model browser disabled")
+            MRE_SCENES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/Sandbox/Scenes")
     endif()
 
     mre_add_slang_shaders(mukki_sandbox
@@ -157,8 +177,16 @@ if(MRE_BUILD_SANDBOX)
         Renderer/Shaders/gbuffer.frag.slang
         Renderer/Shaders/lighting.vert.slang
         Renderer/Shaders/lighting.frag.slang
+        Renderer/Shaders/cluster_culling.comp.slang
+        Renderer/Shaders/shadow.vert.slang
+        Renderer/Shaders/shadow.frag.slang
     )
 endif()
+
+add_executable(mukki_scene_compiler
+    Tools/SceneCompiler/main.cpp
+)
+target_link_libraries(mukki_scene_compiler PRIVATE mukki::engine)
 
 if(MRE_BUILD_TESTS)
     enable_testing()

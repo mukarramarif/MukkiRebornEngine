@@ -16,10 +16,12 @@ public:
 
     [[nodiscard]] vk::Pipeline GetHandle() const { return *m_pipeline; }
     [[nodiscard]] vk::PipelineLayout GetLayout() const { return *m_layout; }
+    [[nodiscard]] bool IsCompute() const override { return m_isCompute; }
 
 private:
     vk::raii::PipelineLayout m_layout{nullptr};
     vk::raii::Pipeline m_pipeline{nullptr};
+    bool m_isCompute = false;
 };
 
 } // namespace mukki::vulkan

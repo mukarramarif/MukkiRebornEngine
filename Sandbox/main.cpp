@@ -5,15 +5,20 @@
 #include "Application/Window.h"
 #include "Core/JobSystem.h"
 #include "Renderer/Deferred/DeferredRenderer.h"
+#include "Renderer/Lighting/Light.h"
 #include "Renderer/RHI/Device.h"
 #include "Renderer/RHI/Resources.h"
 #include "Renderer/Vulkan/Core/VkDevice.h"
 #include "Renderer/Vulkan/UiLayer.h"
+#include "Scene/SceneBinary.h"
+#include "Scene/SceneDescription.h"
+#include "Scene/SceneJson.h"
 #include "Utilities/Log.h"
 #include "Utilities/PathUtils.h"
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -24,11 +29,27 @@
 #include <vector>
 
 #include <GLFW/glfw3.h>
+#include <glm/geometric.hpp>
+#include <glm/trigonometric.hpp>
 #include <glm/vec3.hpp>
 #include <imgui.h>
 
 namespace
 {
+
+const char* LightTypeLabel(mukki::LightType type)
+{
+    switch (type)
+    {
+    case mukki::LightType::Directional:
+        return "directional";
+    case mukki::LightType::Point:
+        return "point";
+    case mukki::LightType::Spot:
+        return "spot";
+    }
+    return "point";
+}
 
 void DrawTexturePreview(const char* label, ImTextureID textureId, float width, float aspect)
 {
@@ -44,10 +65,15 @@ void DrawTexturePreview(const char* label, ImTextureID textureId, float width, f
 class SandboxApp final : public mukki::Application
 {
 public:
-    SandboxApp(int maxFrames, std::filesystem::path shaderDirectory, std::filesystem::path requestedModel)
+    SandboxApp(
+        int maxFrames,
+        std::filesystem::path shaderDirectory,
+        std::filesystem::path requestedModel,
+        std::filesystem::path requestedScene)
         : m_maxFrames(maxFrames)
         , m_shaderDirectory(std::move(shaderDirectory))
         , m_requestedModel(std::move(requestedModel))
+        , m_requestedScene(std::move(requestedScene))
     {
     }
 
@@ -104,14 +130,20 @@ protected:
             return;
         }
 
-        ScanSampleModels();
+        ScanSceneFiles();
+
         if (!m_requestedModel.empty())
         {
             m_pendingModelPath = m_requestedModel;
         }
         else
         {
-            LoadModelByIndex(m_selectedModel);
+            const std::filesystem::path scenePath =
+                m_requestedScene.empty() ? DefaultSceneJsonPath() : m_requestedScene;
+            if (!scenePath.empty())
+            {
+                LoadSceneFromJson(scenePath);
+            }
         }
     }
 
@@ -200,7 +232,8 @@ protected:
 
         m_ui.BeginFrame();
         DrawStatsWindow();
-        DrawModelBrowser();
+        DrawSceneBrowser();
+        DrawSceneWindow();
         DrawGBufferWindow();
         if (m_showDemoWindow)
         {
@@ -216,11 +249,23 @@ protected:
 
         m_renderer->PollModelLoad();
 
-        m_renderer->Render(commandList, m_camera.GetViewProjectionMatrix(), m_camera.GetPosition());
+        mukki::FrameView view{};
+        view.view = m_camera.GetViewMatrix();
+        view.projection = m_camera.GetProjectionMatrix();
+        view.viewProjection = m_camera.GetViewProjectionMatrix();
+        view.position = m_camera.GetPosition();
+        view.fovYRadians = m_camera.GetFovY();
+        view.aspectRatio = m_camera.GetAspectRatio();
+        view.nearPlane = m_camera.GetNearPlane();
+        view.farPlane = m_camera.GetFarPlane();
 
+        m_renderer->Render(commandList, view);
+
+        commandList.BeginGpuZone("ImGui");
         commandList.BeginSwapchainRendering(mukki::rhi::ClearColor{0.0f, 0.0f, 0.0f, 1.0f}, false);
         m_ui.EndFrame(commandList);
         commandList.EndSwapchainRendering();
+        commandList.EndGpuZone();
 
         commandList.End();
         m_device->EndFrame();
@@ -236,65 +281,45 @@ protected:
     }
 
 private:
-    void ScanSampleModels()
+    void ScanSceneFiles()
     {
-#ifdef MRE_SAMPLE_MODELS_DIR
-        m_modelsRoot = std::filesystem::path{MRE_SAMPLE_MODELS_DIR};
-        if (!std::filesystem::exists(m_modelsRoot))
+#ifdef MRE_SCENES_DIR
+        m_scenesRoot = std::filesystem::path{MRE_SCENES_DIR};
+        if (!std::filesystem::exists(m_scenesRoot))
         {
-            MRE_WARN("Sample models directory '{}' does not exist", mukki::PathToUtf8(m_modelsRoot));
+            MRE_WARN("Scenes directory '{}' does not exist", mukki::PathToUtf8(m_scenesRoot));
             return;
         }
 
-        for (const std::filesystem::directory_entry& entry :
-             std::filesystem::recursive_directory_iterator(m_modelsRoot))
+        for (const std::filesystem::directory_entry& entry : std::filesystem::directory_iterator(m_scenesRoot))
         {
             if (!entry.is_regular_file())
             {
                 continue;
             }
-
-            const std::filesystem::path& path = entry.path();
-            const std::string extension = mukki::PathToUtf8(path.extension());
-            if (extension != ".gltf" && extension != ".glb")
+            if (mukki::PathToUtf8(entry.path().extension()) != ".json")
             {
                 continue;
             }
 
-            const std::string variant = mukki::PathToUtf8(path.parent_path().filename());
-            if (variant == "glTF-Embedded")
-            {
-                continue;
-            }
-
-            m_sampleModels.push_back(path);
+            m_sceneFiles.push_back(entry.path());
         }
 
-        std::sort(m_sampleModels.begin(), m_sampleModels.end());
+        std::sort(m_sceneFiles.begin(), m_sceneFiles.end());
 
-        for (std::size_t index = 0; index < m_sampleModels.size(); ++index)
+        for (std::size_t index = 0; index < m_sceneFiles.size(); ++index)
         {
-            if (mukki::PathToUtf8(m_sampleModels[index].filename()).find("DamagedHelmet") != std::string::npos)
+            if (mukki::PathToUtf8(m_sceneFiles[index].filename()).find("demo") != std::string::npos)
             {
-                m_selectedModel = static_cast<int>(index);
+                m_sceneFileIndex = static_cast<int>(index);
                 break;
             }
         }
 
-        MRE_INFO("Found {} sample models in '{}'", m_sampleModels.size(), mukki::PathToUtf8(m_modelsRoot));
+        MRE_INFO("Found {} scene files in '{}'", m_sceneFiles.size(), mukki::PathToUtf8(m_scenesRoot));
 #else
-        MRE_WARN("Sample models directory was not configured at build time");
+        MRE_WARN("Scenes directory was not configured at build time");
 #endif
-    }
-
-    void LoadModelByIndex(int index)
-    {
-        if (index < 0 || index >= static_cast<int>(m_sampleModels.size()))
-        {
-            return;
-        }
-
-        m_pendingModelPath = m_sampleModels[static_cast<std::size_t>(index)];
     }
 
     void DrawStatsWindow()
@@ -316,67 +341,476 @@ private:
         ImGui::End();
     }
 
-    void DrawModelBrowser()
+    void DrawSceneBrowser()
     {
-        ImGui::Begin("Model browser");
+        ImGui::SetNextWindowPos(ImVec2(560.0f, 20.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(340.0f, 0.0f), ImGuiCond_FirstUseEver);
+        ImGui::Begin("Scenes");
 
-        if (m_sampleModels.empty())
-        {
-            ImGui::TextUnformatted("No sample models available.");
-            ImGui::TextUnformatted("Initialize the ThirdParty/glTF-Sample-Models submodule and reconfigure.");
-            ImGui::End();
-            return;
-        }
-
-        const std::string current = m_renderer->HasModel() ? m_renderer->GetModelName() : "none";
-        ImGui::Text("Loaded: %s", current.c_str());
+        ImGui::Text("Loaded: %s", m_scene.name.empty() ? "none" : m_scene.name.c_str());
         if (m_renderer->IsModelLoading())
         {
             ImGui::SameLine();
-            ImGui::TextColored(ImVec4{1.0f, 0.8f, 0.2f, 1.0f}, "(loading...)");
+            ImGui::TextColored(ImVec4{1.0f, 0.8f, 0.2f, 1.0f}, "(loading model...)");
         }
 
-        const std::string selectedName = mukki::PathToUtf8(
-            m_sampleModels[static_cast<std::size_t>(m_selectedModel)].filename());
-        if (ImGui::BeginCombo("Model", selectedName.c_str()))
+        if (m_sceneFiles.empty())
         {
-            for (std::size_t index = 0; index < m_sampleModels.size(); ++index)
+            ImGui::TextUnformatted("No scene files found.");
+            ImGui::TextUnformatted("Add .json scenes to Sandbox/Scenes and reconfigure.");
+        }
+        else
+        {
+            const std::size_t selectedIndex = static_cast<std::size_t>(
+                std::clamp(m_sceneFileIndex, 0, static_cast<int>(m_sceneFiles.size()) - 1));
+            const std::string selectedName = mukki::PathToUtf8(m_sceneFiles[selectedIndex].filename());
+            if (ImGui::BeginCombo("Scene", selectedName.c_str()))
             {
-                std::error_code relativeError{};
-                const std::filesystem::path relativePath =
-                    std::filesystem::relative(m_sampleModels[index], m_modelsRoot, relativeError);
-                const std::string relative =
-                    relativeError ? mukki::PathToUtf8(m_sampleModels[index]) : mukki::PathToUtf8(relativePath);
-                const bool selected = static_cast<int>(index) == m_selectedModel;
-                if (ImGui::Selectable(relative.c_str(), selected))
+                for (std::size_t index = 0; index < m_sceneFiles.size(); ++index)
                 {
-                    m_selectedModel = static_cast<int>(index);
-                    LoadModelByIndex(m_selectedModel);
+                    const bool selected = index == selectedIndex;
+                    const std::string name = mukki::PathToUtf8(m_sceneFiles[index].filename());
+                    if (ImGui::Selectable(name.c_str(), selected))
+                    {
+                        m_sceneFileIndex = static_cast<int>(index);
+                        LoadSceneFromJson(m_sceneFiles[index]);
+                    }
+                    if (selected)
+                    {
+                        ImGui::SetItemDefaultFocus();
+                    }
                 }
-                if (selected)
-                {
-                    ImGui::SetItemDefaultFocus();
-                }
+                ImGui::EndCombo();
             }
-            ImGui::EndCombo();
+
+            if (ImGui::Button("Load"))
+            {
+                LoadSceneFromJson(m_sceneFiles[selectedIndex]);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Reload"))
+            {
+                LoadSceneFromJson(
+                    m_sceneSourcePath.empty() ? m_sceneFiles[selectedIndex] : m_sceneSourcePath);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Unload scene"))
+            {
+                m_renderer->ClearScene();
+                m_scene = mukki::SceneDescription{};
+                m_sceneSourcePath.clear();
+                m_sceneStatus = "scene unloaded";
+            }
         }
 
-        if (ImGui::Button("Reload"))
+        ImGui::SeparatorText("Transform");
+        float modelScale = m_renderer->GetModelScale();
+        if (ImGui::SliderFloat("Uniform scale", &modelScale, 0.1f, 10.0f, "%.2f"))
         {
-            LoadModelByIndex(m_selectedModel);
+            m_renderer->SetModelScale(modelScale);
         }
         ImGui::SameLine();
-        if (ImGui::Button("Unload"))
+        if (ImGui::SmallButton("Reset"))
         {
-            m_renderer->UnloadModel();
+            m_renderer->SetModelScale(1.0f);
         }
 
         ImGui::Separator();
+        ImGui::Text("Objects: %zu   Lights: %zu", m_scene.objects.size(), m_scene.lights.size());
         ImGui::Text("Vertices: %llu", static_cast<unsigned long long>(m_renderer->GetModelVertexCount()));
         ImGui::Text("Triangles: %llu", static_cast<unsigned long long>(m_renderer->GetModelTriangleCount()));
-        ImGui::Text("Models found: %zu", m_sampleModels.size());
 
         ImGui::End();
+    }
+
+    std::filesystem::path DefaultSceneJsonPath() const
+    {
+#ifdef MRE_SCENES_DIR
+        return std::filesystem::path{MRE_SCENES_DIR} / "demo.scene.json";
+#else
+        return {};
+#endif
+    }
+
+    // Compiles the JSON source to bytecode next to the executable, then loads the bytecode.
+    bool LoadSceneFromJson(const std::filesystem::path& jsonPath)
+    {
+        if (!std::filesystem::exists(jsonPath))
+        {
+            m_sceneStatus = "scene JSON not found: " + mukki::PathToUtf8(jsonPath);
+            MRE_WARN("{}", m_sceneStatus);
+            return false;
+        }
+
+        m_sceneSourcePath = jsonPath;
+        m_sceneBinaryDirectory = m_shaderDirectory.parent_path() / "scenes";
+        std::error_code directoryError{};
+        std::filesystem::create_directories(m_sceneBinaryDirectory, directoryError);
+        const std::filesystem::path binaryPath =
+            m_sceneBinaryDirectory / (mukki::PathToUtf8(jsonPath.stem()) + ".mres");
+
+        std::string error{};
+        mukki::SceneDescription authored{};
+        if (!mukki::SceneJson::Load(jsonPath, authored, error))
+        {
+            m_sceneStatus = "JSON: " + error;
+            MRE_ERROR("{}", m_sceneStatus);
+            return false;
+        }
+
+        // The JSON is the authoring format; the engine only ever loads the compiled bytecode.
+        if (!mukki::SceneBinary::Write(binaryPath, authored, error))
+        {
+            m_sceneStatus = "compile: " + error;
+            MRE_ERROR("{}", m_sceneStatus);
+            return false;
+        }
+
+        mukki::SceneDescription loaded{};
+        if (!mukki::SceneBinary::Read(binaryPath, loaded, error))
+        {
+            m_sceneStatus = "bytecode: " + error;
+            MRE_ERROR("{}", m_sceneStatus);
+            return false;
+        }
+
+        m_scene = std::move(loaded);
+        m_selectedLight = 0;
+        m_selectedObject = 0;
+        if (!m_renderer->LoadScene(m_scene))
+        {
+            m_sceneStatus = "the renderer failed to load the scene";
+            return false;
+        }
+
+        m_sceneLightsDirty = false;
+        m_sceneStatus = "loaded '" + m_scene.name + "' (" + std::to_string(m_scene.objects.size()) +
+                        " objects, " + std::to_string(m_scene.lights.size()) + " lights)";
+        MRE_INFO("{}", m_sceneStatus);
+        return true;
+    }
+
+    std::string SceneOutputStem() const
+    {
+        return m_sceneSourcePath.empty() ? std::string{"demo.scene"}
+                                         : mukki::PathToUtf8(m_sceneSourcePath.stem());
+    }
+
+    void SaveSceneJson()
+    {
+        if (m_sceneBinaryDirectory.empty())
+        {
+            m_sceneBinaryDirectory = m_shaderDirectory.parent_path() / "scenes";
+        }
+        std::error_code directoryError{};
+        std::filesystem::create_directories(m_sceneBinaryDirectory, directoryError);
+        const std::filesystem::path path = m_sceneBinaryDirectory / (SceneOutputStem() + ".json");
+
+        std::string error{};
+        if (mukki::SceneJson::Save(path, m_scene, error))
+        {
+            m_sceneStatus = "saved " + mukki::PathToUtf8(path);
+        }
+        else
+        {
+            m_sceneStatus = error;
+            MRE_ERROR("{}", error);
+        }
+    }
+
+    void CompileSceneBinary()
+    {
+        if (m_sceneBinaryDirectory.empty())
+        {
+            m_sceneBinaryDirectory = m_shaderDirectory.parent_path() / "scenes";
+        }
+        std::error_code directoryError{};
+        std::filesystem::create_directories(m_sceneBinaryDirectory, directoryError);
+        const std::filesystem::path path = m_sceneBinaryDirectory / (SceneOutputStem() + ".mres");
+
+        std::string error{};
+        if (mukki::SceneBinary::Write(path, m_scene, error))
+        {
+            m_sceneStatus = "compiled " + mukki::PathToUtf8(path);
+        }
+        else
+        {
+            m_sceneStatus = error;
+            MRE_ERROR("{}", error);
+        }
+    }
+
+    void ApplySceneLights()
+    {
+        std::vector<mukki::Light> lights{};
+        lights.reserve(m_scene.lights.size());
+        for (const mukki::SceneLight& sceneLight : m_scene.lights)
+        {
+            lights.push_back(sceneLight.light);
+        }
+        m_renderer->SetLights(lights);
+    }
+
+    void DrawSceneWindow()
+    {
+        ImGui::Begin("Scene");
+
+        ImGui::Text("Scene: %s", m_scene.name.empty() ? "(none)" : m_scene.name.c_str());
+        ImGui::Text(
+            "Objects: %zu   Lights: %zu   In renderer: %u",
+            m_scene.objects.size(),
+            m_scene.lights.size(),
+            m_renderer->GetLightCount());
+        if (!m_sceneStatus.empty())
+        {
+            ImGui::TextWrapped("%s", m_sceneStatus.c_str());
+        }
+
+        if (ImGui::Button("Reload JSON -> bytecode"))
+        {
+            LoadSceneFromJson(
+                m_sceneSourcePath.empty() ? DefaultSceneJsonPath() : m_sceneSourcePath);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Save JSON"))
+        {
+            SaveSceneJson();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Compile bytecode"))
+        {
+            CompileSceneBinary();
+        }
+
+        bool debugClusters = m_renderer->IsClusterDebugViewEnabled();
+        if (ImGui::Checkbox("Visualize cluster light counts", &debugClusters))
+        {
+            m_renderer->SetClusterDebugView(debugClusters);
+        }
+
+        ImGui::SeparatorText("Objects");
+        if (ImGui::BeginChild("##object_list", ImVec2(0.0f, 90.0f), ImGuiChildFlags_Borders))
+        {
+            for (std::size_t index = 0; index < m_scene.objects.size(); ++index)
+            {
+                const mukki::SceneObject& object = m_scene.objects[index];
+                char label[256];
+                std::snprintf(
+                    label,
+                    sizeof(label),
+                    "%s (%s)",
+                    object.name.c_str(),
+                    object.modelPath.c_str());
+                if (ImGui::Selectable(label, m_selectedObject == static_cast<int>(index)))
+                {
+                    m_selectedObject = static_cast<int>(index);
+                }
+            }
+        }
+        ImGui::EndChild();
+
+        if (m_selectedObject >= 0 && m_selectedObject < static_cast<int>(m_scene.objects.size()))
+        {
+            DrawObjectEditor(m_scene.objects[static_cast<std::size_t>(m_selectedObject)]);
+        }
+
+        ImGui::SeparatorText("Lights");
+        if (ImGui::BeginChild("##light_list", ImVec2(0.0f, 110.0f), ImGuiChildFlags_Borders))
+        {
+            for (std::size_t index = 0; index < m_scene.lights.size(); ++index)
+            {
+                const mukki::SceneLight& sceneLight = m_scene.lights[index];
+                char label[192];
+                std::snprintf(
+                    label,
+                    sizeof(label),
+                    "%s (%s)",
+                    sceneLight.name.c_str(),
+                    LightTypeLabel(sceneLight.light.type));
+                if (ImGui::Selectable(label, m_selectedLight == static_cast<int>(index)))
+                {
+                    m_selectedLight = static_cast<int>(index);
+                }
+            }
+        }
+        ImGui::EndChild();
+
+        if (ImGui::Button("Add light"))
+        {
+            mukki::SceneLight sceneLight{};
+            sceneLight.name = "Light " + std::to_string(m_scene.lights.size());
+            sceneLight.light.type = mukki::LightType::Point;
+            sceneLight.light.position = glm::vec3{0.0f, 2.0f, 0.0f};
+            sceneLight.light.range = 5.0f;
+            sceneLight.light.intensity = 1.0f;
+            m_scene.lights.push_back(sceneLight);
+            m_selectedLight = static_cast<int>(m_scene.lights.size()) - 1;
+            m_sceneLightsDirty = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Remove light") && !m_scene.lights.empty())
+        {
+            const std::size_t index = static_cast<std::size_t>(
+                std::clamp(m_selectedLight, 0, static_cast<int>(m_scene.lights.size()) - 1));
+            m_scene.lights.erase(m_scene.lights.begin() + static_cast<std::ptrdiff_t>(index));
+            m_selectedLight = std::min(m_selectedLight, static_cast<int>(m_scene.lights.size()) - 1);
+            m_sceneLightsDirty = true;
+        }
+
+        if (m_selectedLight >= 0 && m_selectedLight < static_cast<int>(m_scene.lights.size()))
+        {
+            DrawLightEditor(m_scene.lights[static_cast<std::size_t>(m_selectedLight)]);
+        }
+
+        if (m_sceneLightsDirty)
+        {
+            ApplySceneLights();
+            m_sceneLightsDirty = false;
+        }
+
+        DrawShadowSettings();
+
+        ImGui::End();
+    }
+
+    void DrawShadowSettings()
+    {
+        ImGui::SeparatorText("Shadows");
+
+        mukki::ShadowSettings settings = m_renderer->GetShadowSettings();
+        bool changed = ImGui::Checkbox("Enabled", &settings.enabled);
+
+        changed |= ImGui::SliderFloat("Distance", &settings.distance, 5.0f, 500.0f, "%.1f");
+        changed |= ImGui::SliderFloat("Depth bias", &settings.depthBias, 0.0f, 5.0f, "%.2f");
+        changed |= ImGui::SliderFloat("Normal bias", &settings.normalBias, 0.0f, 1.0f, "%.3f");
+
+        ImGui::Text(
+            "%u cascades at %u, %u spot maps, %u point atlases",
+            static_cast<unsigned>(settings.cascadeCount),
+            static_cast<unsigned>(settings.resolution),
+            static_cast<unsigned>(mukki::kMaxSpotShadowLights),
+            static_cast<unsigned>(mukki::kMaxPointShadowLights));
+
+        if (changed)
+        {
+            m_renderer->SetShadowSettings(settings);
+        }
+    }
+
+    void DrawObjectEditor(mukki::SceneObject& object)
+    {
+        const std::size_t index = static_cast<std::size_t>(std::max(m_selectedObject, 0));
+        ImGui::Text("Model: %s", object.modelPath.c_str());
+
+        bool changed = false;
+        changed |= ImGui::DragFloat3("Object position", &object.position.x, 0.05f, -100.0f, 100.0f);
+        changed |= ImGui::DragFloat3("Object rotation (deg)", &object.rotation.x, 0.5f, -360.0f, 360.0f);
+        changed |= ImGui::DragFloat3("Object scale", &object.scale.x, 0.02f, 0.01f, 100.0f);
+
+        if (changed)
+        {
+            if (index < m_renderer->GetSceneObjectCount())
+            {
+                m_renderer->UpdateSceneObjectTransform(index, mukki::BuildObjectTransform(object));
+                m_sceneStatus = "object '" + object.name + "' updated";
+            }
+            else
+            {
+                m_sceneStatus = "object is not instantiated in the renderer";
+            }
+        }
+    }
+
+    void DrawLightEditor(mukki::SceneLight& sceneLight)
+    {
+        mukki::Light& light = sceneLight.light;
+
+        char nameBuffer[128];
+        std::snprintf(nameBuffer, sizeof(nameBuffer), "%s", sceneLight.name.c_str());
+        if (ImGui::InputText("Name", nameBuffer, sizeof(nameBuffer)))
+        {
+            sceneLight.name = nameBuffer;
+            m_sceneLightsDirty = true;
+        }
+
+        const char* typeNames[] = {"Directional", "Point", "Spot"};
+        int type = static_cast<int>(light.type);
+        if (ImGui::Combo("Type", &type, typeNames, 3))
+        {
+            light.type = static_cast<mukki::LightType>(type);
+            m_sceneLightsDirty = true;
+        }
+
+        if (light.type != mukki::LightType::Directional)
+        {
+            if (ImGui::DragFloat3("Position", &light.position.x, 0.05f, -100.0f, 100.0f))
+            {
+                m_sceneLightsDirty = true;
+            }
+        }
+
+        if (light.type != mukki::LightType::Point)
+        {
+            glm::vec3 direction = light.direction;
+            if (ImGui::DragFloat3("Direction", &direction.x, 0.01f, -1.0f, 1.0f))
+            {
+                const float length = glm::length(direction);
+                light.direction = length > 1e-4f ? direction / length : glm::vec3{0.0f, -1.0f, 0.0f};
+                m_sceneLightsDirty = true;
+            }
+        }
+
+        if (ImGui::Checkbox("Casts shadows", &light.castShadows))
+        {
+            m_sceneLightsDirty = true;
+        }
+        switch (light.type)
+        {
+        case mukki::LightType::Directional:
+            ImGui::TextUnformatted("(only the first shadow-casting directional light is used)");
+            break;
+        case mukki::LightType::Spot:
+            ImGui::Text("(up to %u spot shadow maps)", static_cast<unsigned>(mukki::kMaxSpotShadowLights));
+            break;
+        case mukki::LightType::Point:
+            ImGui::Text(
+                "(up to %u point shadow slots, six faces each)",
+                static_cast<unsigned>(mukki::kMaxPointShadowLights));
+            break;
+        }
+
+        if (ImGui::ColorEdit3("Color", &light.color.x))
+        {
+            m_sceneLightsDirty = true;
+        }
+
+        if (ImGui::DragFloat("Strength", &light.intensity, 0.05f, 0.0f, 100.0f))
+        {
+            m_sceneLightsDirty = true;
+        }
+
+        if (light.type != mukki::LightType::Directional)
+        {
+            if (ImGui::DragFloat("Range", &light.range, 0.1f, 0.1f, 200.0f))
+            {
+                m_sceneLightsDirty = true;
+            }
+        }
+
+        if (light.type == mukki::LightType::Spot)
+        {
+            float innerDegrees = glm::degrees(light.innerConeAngle);
+            float outerDegrees = glm::degrees(light.outerConeAngle);
+            bool changed = false;
+            changed |= ImGui::DragFloat("Inner cone (deg)", &innerDegrees, 0.5f, 0.0f, 89.0f);
+            changed |= ImGui::DragFloat("Outer cone (deg)", &outerDegrees, 0.5f, 1.0f, 89.0f);
+            if (changed)
+            {
+                light.innerConeAngle = glm::radians(std::min(innerDegrees, outerDegrees));
+                light.outerConeAngle = glm::radians(std::max(innerDegrees, outerDegrees));
+                m_sceneLightsDirty = true;
+            }
+        }
     }
 
     void DrawGBufferWindow()
@@ -421,18 +855,26 @@ private:
     std::unique_ptr<mukki::rhi::Device> m_device{};
     std::unique_ptr<mukki::DeferredRenderer> m_renderer{};
     mukki::vulkan::UiLayer m_ui{};
-    std::vector<std::filesystem::path> m_sampleModels{};
-    std::filesystem::path m_modelsRoot{};
+    mukki::SceneDescription m_scene{};
+    std::vector<std::filesystem::path> m_sceneFiles{};
+    std::filesystem::path m_scenesRoot{};
     std::filesystem::path m_pendingModelPath{};
     ImTextureID m_albedoTextureId = 0;
     ImTextureID m_normalTextureId = 0;
     ImTextureID m_positionTextureId = 0;
     std::filesystem::path m_shaderDirectory{};
+    std::filesystem::path m_sceneBinaryDirectory{};
+    std::filesystem::path m_sceneSourcePath{};
     std::filesystem::path m_requestedModel{};
+    std::filesystem::path m_requestedScene{};
+    std::string m_sceneStatus{};
     float m_frameTimeMs = 0.0f;
-    int m_selectedModel = 0;
+    int m_selectedLight = 0;
+    int m_selectedObject = 0;
+    int m_sceneFileIndex = 0;
     int m_maxFrames = 0;
     int m_frameCount = 0;
+    bool m_sceneLightsDirty = false;
     bool m_debugTexturesRegistered = false;
     bool m_renderedFrame = false;
     bool m_cursorReleased = false;
@@ -446,6 +888,7 @@ int main(int argc, char** argv)
 {
     int maxFrames = 0;
     std::filesystem::path requestedModel{};
+    std::filesystem::path requestedScene{};
     for (int i = 1; i < argc; ++i)
     {
         if (std::strcmp(argv[i], "--frames") == 0 && i + 1 < argc)
@@ -455,6 +898,10 @@ int main(int argc, char** argv)
         else if (std::strcmp(argv[i], "--model") == 0 && i + 1 < argc)
         {
             requestedModel = argv[i + 1];
+        }
+        else if (std::strcmp(argv[i], "--scene") == 0 && i + 1 < argc)
+        {
+            requestedScene = argv[i + 1];
         }
     }
 
@@ -466,7 +913,7 @@ int main(int argc, char** argv)
         const std::filesystem::path shaderDirectory =
             std::filesystem::absolute(argv[0]).parent_path() / "shaders";
 
-        SandboxApp app{maxFrames, shaderDirectory, requestedModel};
+        SandboxApp app{maxFrames, shaderDirectory, requestedModel, requestedScene};
         if (!app.Init(mukki::WindowDesc{}))
         {
             MRE_CRITICAL("Failed to initialize the application");
