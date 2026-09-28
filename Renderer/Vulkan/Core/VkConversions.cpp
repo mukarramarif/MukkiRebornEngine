@@ -125,6 +125,25 @@ vk::ShaderStageFlags ToVkShaderStageMask(rhi::ShaderStageMask mask)
     return flags;
 }
 
+vk::PipelineStageFlags2 ToVkPipelineStageFlags2(rhi::ShaderStageMask mask)
+{
+    vk::PipelineStageFlags2 flags{};
+    const auto value = static_cast<std::uint8_t>(mask);
+    if ((value & static_cast<std::uint8_t>(rhi::ShaderStageMask::Vertex)) != 0)
+    {
+        flags |= vk::PipelineStageFlagBits2::eVertexShader;
+    }
+    if ((value & static_cast<std::uint8_t>(rhi::ShaderStageMask::Fragment)) != 0)
+    {
+        flags |= vk::PipelineStageFlagBits2::eFragmentShader;
+    }
+    if ((value & static_cast<std::uint8_t>(rhi::ShaderStageMask::Compute)) != 0)
+    {
+        flags |= vk::PipelineStageFlagBits2::eComputeShader;
+    }
+    return flags;
+}
+
 vk::CullModeFlags ToVkCullMode(rhi::CullMode mode)
 {
     switch (mode)
@@ -146,6 +165,8 @@ vk::DescriptorType ToVkDescriptorType(rhi::DescriptorType type)
     {
     case rhi::DescriptorType::UniformBuffer:
         return vk::DescriptorType::eUniformBuffer;
+    case rhi::DescriptorType::StorageBuffer:
+        return vk::DescriptorType::eStorageBuffer;
     case rhi::DescriptorType::CombinedImageSampler:
         return vk::DescriptorType::eCombinedImageSampler;
     case rhi::DescriptorType::SampledImage:

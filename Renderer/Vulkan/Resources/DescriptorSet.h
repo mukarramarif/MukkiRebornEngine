@@ -17,9 +17,11 @@ public:
     VkDescriptorSetLayout(const vk::raii::Device& device, const std::vector<rhi::DescriptorBinding>& bindings);
 
     [[nodiscard]] vk::DescriptorSetLayout GetHandle() const { return *m_layout; }
+    [[nodiscard]] const std::vector<rhi::DescriptorBinding>& GetBindings() const { return m_bindings; }
 
 private:
     vk::raii::DescriptorSetLayout m_layout{nullptr};
+    std::vector<rhi::DescriptorBinding> m_bindings{};
 };
 
 class VkDescriptorSet final : public rhi::DescriptorSet
@@ -43,8 +45,11 @@ public:
     [[nodiscard]] vk::DescriptorSet GetHandle() const { return *m_set; }
 
 private:
+    [[nodiscard]] rhi::DescriptorType GetBindingType(std::uint32_t binding) const;
+
     const vk::raii::Device* m_device = nullptr;
     vk::raii::DescriptorSet m_set{nullptr};
+    std::vector<rhi::DescriptorBinding> m_bindings{};
 };
 
 } // namespace mukki::vulkan

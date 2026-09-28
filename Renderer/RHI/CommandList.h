@@ -52,6 +52,11 @@ public:
     virtual void SetPushConstants(const void* data, std::uint32_t size, ShaderStageMask stages) = 0;
     virtual void Draw(std::uint32_t vertexCount, std::uint32_t firstVertex = 0) = 0;
     virtual void DrawIndexed(std::uint32_t indexCount, std::uint32_t firstIndex = 0) = 0;
+    virtual void Dispatch(std::uint32_t groupCountX, std::uint32_t groupCountY, std::uint32_t groupCountZ) = 0;
+
+    // Memory dependency between shader stages, used when compute-produced storage data is read by
+    // a later stage within the same command buffer.
+    virtual void ShaderMemoryBarrier(ShaderStageMask before, ShaderStageMask after) = 0;
 
     // GPU timestamp zone markers, used by profilers such as Tracy. Zone names must remain
     // valid for the duration of the recording scope and zones must be balanced pairs.

@@ -97,6 +97,8 @@ add_library(mukki_engine STATIC
     Renderer/BufferManager.cpp
     Renderer/Deferred/DeferredRenderer.cpp
     Renderer/Deferred/GBuffer.cpp
+    Renderer/Lighting/ClusterGrid.cpp
+    Renderer/Lighting/Light.cpp
     Renderer/RHI/Resources.cpp
     Renderer/Vulkan/Core/FrameSync.cpp
     Renderer/Vulkan/Core/VkCommandList.cpp
@@ -167,6 +169,7 @@ if(MRE_BUILD_SANDBOX)
         Renderer/Shaders/gbuffer.frag.slang
         Renderer/Shaders/lighting.vert.slang
         Renderer/Shaders/lighting.frag.slang
+        Renderer/Shaders/cluster_culling.comp.slang
     )
 endif()
 

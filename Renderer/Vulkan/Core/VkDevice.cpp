@@ -552,8 +552,9 @@ bool VkDevice::CreateAllocator()
 
 bool VkDevice::CreateDescriptorPool()
 {
-    const std::array<vk::DescriptorPoolSize, 4> poolSizes{
+    const std::array<vk::DescriptorPoolSize, 5> poolSizes{
         vk::DescriptorPoolSize{vk::DescriptorType::eUniformBuffer, 256},
+        vk::DescriptorPoolSize{vk::DescriptorType::eStorageBuffer, 256},
         vk::DescriptorPoolSize{vk::DescriptorType::eCombinedImageSampler, 256},
         vk::DescriptorPoolSize{vk::DescriptorType::eSampledImage, rhi::kMaxBindlessTextures},
         vk::DescriptorPoolSize{vk::DescriptorType::eSampler, 64},

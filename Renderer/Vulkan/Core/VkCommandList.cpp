@@ -81,6 +81,7 @@ void VkCommandList::Shutdown()
     m_swapchainExtent = vk::Extent2D{0, 0};
     m_swapchainImageLayout = vk::ImageLayout::eUndefined;
     m_boundPipelineLayout = vk::PipelineLayout{nullptr};
+    m_boundPipelineBindPoint = vk::PipelineBindPoint::eGraphics;
     m_renderingColorTextures.clear();
     m_renderingDepthTexture = nullptr;
     m_swapchainImageIndex = 0;
@@ -106,6 +107,7 @@ void VkCommandList::SetSwapchainTarget(
     m_renderedThisFrame = false;
     m_hasBoundPipeline = false;
     m_boundPipelineLayout = vk::PipelineLayout{nullptr};
+    m_boundPipelineBindPoint = vk::PipelineBindPoint::eGraphics;
 }
 
 void VkCommandList::Begin()
@@ -119,6 +121,7 @@ void VkCommandList::Begin()
     m_renderedThisFrame = false;
     m_hasBoundPipeline = false;
     m_boundPipelineLayout = vk::PipelineLayout{nullptr};
+    m_boundPipelineBindPoint = vk::PipelineBindPoint::eGraphics;
 }
 
 void VkCommandList::End()
@@ -416,6 +419,7 @@ void VkCommandList::BeginSecondary(const rhi::RenderingDesc& desc)
     m_renderingSwapchain = false;
     m_hasBoundPipeline = false;
     m_boundPipelineLayout = vk::PipelineLayout{nullptr};
+    m_boundPipelineBindPoint = vk::PipelineBindPoint::eGraphics;
     SetViewportAndScissor(extent);
 }
 
@@ -483,7 +487,9 @@ void VkCommandList::BindPipeline(const rhi::Pipeline& pipeline)
     MRE_ASSERT(m_recording, "VkCommandList::BindPipeline called outside of a recording scope");
 
     const auto& vkPipeline = static_cast<const VkPipeline&>(pipeline);
-    m_commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, vkPipeline.GetHandle());
+    m_boundPipelineBindPoint = vkPipeline.IsCompute() ? vk::PipelineBindPoint::eCompute
+                                                      : vk::PipelineBindPoint::eGraphics;
+    m_commandBuffer.bindPipeline(m_boundPipelineBindPoint, vkPipeline.GetHandle());
     m_boundPipelineLayout = vkPipeline.GetLayout();
     m_hasBoundPipeline = true;
 }
@@ -495,7 +501,7 @@ void VkCommandList::BindDescriptorSet(std::uint32_t setIndex, const rhi::Descrip
 
     const auto& vkDescriptorSet = static_cast<const VkDescriptorSet&>(descriptorSet);
     const vk::DescriptorSet handle = vkDescriptorSet.GetHandle();
-    m_commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, m_boundPipelineLayout, setIndex, handle, {});
+    m_commandBuffer.bindDescriptorSets(m_boundPipelineBindPoint, m_boundPipelineLayout, setIndex, handle, {});
 }
 
 void VkCommandList::BindVertexBuffer(const rhi::Buffer& buffer)
@@ -540,6 +546,30 @@ void VkCommandList::DrawIndexed(std::uint32_t indexCount, std::uint32_t firstInd
     MRE_ASSERT(m_rendering, "VkCommandList::DrawIndexed called outside of a rendering scope");
 
     m_commandBuffer.drawIndexed(indexCount, 1, firstIndex, 0, 0);
+}
+
+void VkCommandList::Dispatch(std::uint32_t groupCountX, std::uint32_t groupCountY, std::uint32_t groupCountZ)
+{
+    MRE_ASSERT(m_recording, "VkCommandList::Dispatch called outside of a recording scope");
+    MRE_ASSERT(!m_rendering, "VkCommandList::Dispatch cannot be called inside a rendering scope");
+    MRE_ASSERT(m_hasBoundPipeline, "VkCommandList::Dispatch requires a bound pipeline");
+    MRE_ASSERT(
+        m_boundPipelineBindPoint == vk::PipelineBindPoint::eCompute,
+        "VkCommandList::Dispatch requires a bound compute pipeline");
+
+    m_commandBuffer.dispatch(groupCountX, groupCountY, groupCountZ);
+}
+
+void VkCommandList::ShaderMemoryBarrier(rhi::ShaderStageMask before, rhi::ShaderStageMask after)
+{
+    MRE_ASSERT(m_recording, "VkCommandList::ShaderMemoryBarrier called outside of a recording scope");
+
+    const vk::MemoryBarrier2 barrier = vk::MemoryBarrier2{}
+                                           .setSrcStageMask(ToVkPipelineStageFlags2(before))
+                                           .setSrcAccessMask(vk::AccessFlagBits2::eShaderWrite)
+                                           .setDstStageMask(ToVkPipelineStageFlags2(after))
+                                           .setDstAccessMask(vk::AccessFlagBits2::eShaderRead);
+    m_commandBuffer.pipelineBarrier2(vk::DependencyInfo{}.setMemoryBarriers(barrier));
 }
 
 void VkCommandList::SetViewportAndScissor(const vk::Extent2D& extent)

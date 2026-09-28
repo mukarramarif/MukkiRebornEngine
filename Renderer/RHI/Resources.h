@@ -82,6 +82,7 @@ enum class AddressMode : std::uint8_t
 enum class DescriptorType : std::uint8_t
 {
     UniformBuffer = 0,
+    StorageBuffer,
     CombinedImageSampler,
     SampledImage,
     Sampler,
@@ -256,8 +257,10 @@ struct PipelineDesc
 {
     const Shader* vertexShader = nullptr;
     const Shader* fragmentShader = nullptr;
+    const Shader* computeShader = nullptr;
     std::string_view vertexEntryPoint = "vertexMain";
     std::string_view fragmentEntryPoint = "fragmentMain";
+    std::string_view computeEntryPoint = "computeMain";
     VertexLayout vertexLayout{};
     bool depthTest = false;
     bool depthWrite = false;
@@ -277,6 +280,8 @@ public:
 
     Pipeline(const Pipeline&) = delete;
     Pipeline& operator=(const Pipeline&) = delete;
+
+    [[nodiscard]] virtual bool IsCompute() const = 0;
 
 protected:
     Pipeline() = default;

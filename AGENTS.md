@@ -27,6 +27,14 @@ must not expose backend types, and Vulkan types may only appear under `Renderer/
 - Bindless: descriptor indexing is a hard device requirement. Textures get a bindless index from the
   device and are bound into a global update-after-bind `SampledImage` array set; shaders sample them
   through `Texture2D textures[]` with `NonUniformResourceIndex`.
+- Lighting: clustered deferred. `Renderer/Lighting/` holds the light types (`LightType`/`Light`) and
+  the cluster grid (`kClusterTileSize`, `kClusterZSliceCount`, `kMaxLightsPerCluster`, `kMaxLights`).
+  `Renderer/Shaders/cluster_culling.comp.slang` bins the lights submitted through
+  `DeferredRenderer::SetLights` into an exponential-slice cluster grid, and the lighting pass iterates
+  the per-cluster light lists with a Cook-Torrance BRDF. Directional, point and spot lights are
+  supported; lights are uploaded as an SSBO (`GpuLight`, packed float4s). `SetClusterDebugView`
+  renders a light-count heatmap for debugging. Shadows (CSM and spot shadow maps) are not implemented
+  yet.
 - Profiling: Tracy (on-demand). Use the `MRE_PROFILE_*` macros from `Utilities/Profiling.h` for CPU
   zones and `rhi::CommandList::BeginGpuZone/EndGpuZone` for GPU pass zones. Enabled via the
   `*-tracy` CMake presets (`MRE_ENABLE_TRACY=ON`, `VCPKG_MANIFEST_FEATURES=tracy`); connect with the

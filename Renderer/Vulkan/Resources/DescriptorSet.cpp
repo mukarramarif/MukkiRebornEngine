@@ -14,6 +14,7 @@ namespace mukki::vulkan
 VkDescriptorSetLayout::VkDescriptorSetLayout(
     const vk::raii::Device& device,
     const std::vector<rhi::DescriptorBinding>& bindings)
+    : m_bindings(bindings)
 {
     MRE_ASSERT(!bindings.empty(), "Descriptor set layout requires at least one binding");
 
@@ -60,6 +61,7 @@ VkDescriptorSet::VkDescriptorSet(
     const vk::raii::DescriptorPool& pool,
     const VkDescriptorSetLayout& layout)
     : m_device(&device)
+    , m_bindings(layout.GetBindings())
 {
     const vk::DescriptorSetLayout layoutHandle = layout.GetHandle();
     const vk::DescriptorSetAllocateInfo allocateInfo = vk::DescriptorSetAllocateInfo{}
@@ -80,6 +82,11 @@ void VkDescriptorSet::BindBuffer(
     MRE_ASSERT(m_device != nullptr, "VkDescriptorSet requires a valid device");
     MRE_ASSERT(m_set != nullptr, "VkDescriptorSet requires a valid descriptor set");
 
+    const rhi::DescriptorType bindingType = GetBindingType(binding);
+    MRE_ASSERT(
+        bindingType == rhi::DescriptorType::UniformBuffer || bindingType == rhi::DescriptorType::StorageBuffer,
+        "BindBuffer requires a uniform or storage buffer binding");
+
     const auto& vkBuffer = static_cast<const VkBuffer&>(buffer);
     const vk::DescriptorBufferInfo bufferInfo = vk::DescriptorBufferInfo{}
                                                     .setBuffer(vkBuffer.GetHandle())
@@ -89,10 +96,24 @@ void VkDescriptorSet::BindBuffer(
     const vk::WriteDescriptorSet write = vk::WriteDescriptorSet{}
                                              .setDstSet(*m_set)
                                              .setDstBinding(binding)
-                                             .setDescriptorType(vk::DescriptorType::eUniformBuffer)
+                                             .setDescriptorType(ToVkDescriptorType(bindingType))
                                              .setBufferInfo(bufferInfo);
 
     m_device->updateDescriptorSets(write, {});
+}
+
+rhi::DescriptorType VkDescriptorSet::GetBindingType(std::uint32_t binding) const
+{
+    for (const rhi::DescriptorBinding& candidate : m_bindings)
+    {
+        if (candidate.binding == binding)
+        {
+            return candidate.type;
+        }
+    }
+
+    MRE_ASSERT(false, "Descriptor set layout has no binding {}", binding);
+    return rhi::DescriptorType::UniformBuffer;
 }
 
 void VkDescriptorSet::BindTexture(

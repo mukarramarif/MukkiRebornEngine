@@ -5,6 +5,7 @@
 #include "Application/Window.h"
 #include "Core/JobSystem.h"
 #include "Renderer/Deferred/DeferredRenderer.h"
+#include "Renderer/Lighting/Light.h"
 #include "Renderer/RHI/Device.h"
 #include "Renderer/RHI/Resources.h"
 #include "Renderer/Vulkan/Core/VkDevice.h"
@@ -13,6 +14,7 @@
 #include "Utilities/PathUtils.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -24,11 +26,21 @@
 #include <vector>
 
 #include <GLFW/glfw3.h>
+#include <glm/geometric.hpp>
 #include <glm/vec3.hpp>
 #include <imgui.h>
 
 namespace
 {
+
+glm::vec3 HueColor(float hue)
+{
+    const auto channel = [hue](float offset) {
+        const float value = std::fmod(hue * 6.0f + offset, 6.0f);
+        return std::clamp(std::min(value, 4.0f - value), 0.0f, 1.0f);
+    };
+    return glm::vec3{channel(5.0f), channel(3.0f), channel(1.0f)};
+}
 
 void DrawTexturePreview(const char* label, ImTextureID textureId, float width, float aspect)
 {
@@ -113,6 +125,9 @@ protected:
         {
             LoadModelByIndex(m_selectedModel);
         }
+
+        RebuildLights(0.0f);
+        m_renderer->SetLights(m_lights);
     }
 
     void OnUpdate(float deltaTime) override
@@ -176,6 +191,14 @@ protected:
             m_debugTexturesRegistered = true;
         }
 
+        m_elapsed += deltaTime;
+        if (m_animateLights || m_lightsDirty)
+        {
+            RebuildLights(m_animateLights ? m_elapsed * 0.25f : 0.0f);
+            m_renderer->SetLights(m_lights);
+            m_lightsDirty = false;
+        }
+
         ++m_frameCount;
         if (m_maxFrames > 0 && m_frameCount >= m_maxFrames)
         {
@@ -201,6 +224,7 @@ protected:
         m_ui.BeginFrame();
         DrawStatsWindow();
         DrawModelBrowser();
+        DrawLightWindow();
         DrawGBufferWindow();
         if (m_showDemoWindow)
         {
@@ -216,7 +240,17 @@ protected:
 
         m_renderer->PollModelLoad();
 
-        m_renderer->Render(commandList, m_camera.GetViewProjectionMatrix(), m_camera.GetPosition());
+        mukki::FrameView view{};
+        view.view = m_camera.GetViewMatrix();
+        view.projection = m_camera.GetProjectionMatrix();
+        view.viewProjection = m_camera.GetViewProjectionMatrix();
+        view.position = m_camera.GetPosition();
+        view.fovYRadians = m_camera.GetFovY();
+        view.aspectRatio = m_camera.GetAspectRatio();
+        view.nearPlane = m_camera.GetNearPlane();
+        view.farPlane = m_camera.GetFarPlane();
+
+        m_renderer->Render(commandList, view);
 
         commandList.BeginGpuZone("ImGui");
         commandList.BeginSwapchainRendering(mukki::rhi::ClearColor{0.0f, 0.0f, 0.0f, 1.0f}, false);
@@ -381,6 +415,69 @@ private:
         ImGui::End();
     }
 
+    void DrawLightWindow()
+    {
+        ImGui::Begin("Lights");
+        ImGui::Text("Registered: %u", m_renderer->GetLightCount());
+
+        int count = m_demoLightCount;
+        if (ImGui::SliderInt("Count", &count, 1, static_cast<int>(mukki::kMaxLights)))
+        {
+            m_demoLightCount = count;
+            m_lightsDirty = true;
+        }
+
+        ImGui::Checkbox("Animate", &m_animateLights);
+
+        bool debugClusters = m_renderer->IsClusterDebugViewEnabled();
+        if (ImGui::Checkbox("Visualize cluster light counts", &debugClusters))
+        {
+            m_renderer->SetClusterDebugView(debugClusters);
+        }
+
+        ImGui::TextUnformatted("1 directional + clustered point/spot ring");
+        ImGui::End();
+    }
+
+    void RebuildLights(float rotation)
+    {
+        m_lights.clear();
+        m_lights.reserve(static_cast<std::size_t>(m_demoLightCount) + 1);
+
+        mukki::Light sun{};
+        sun.type = mukki::LightType::Directional;
+        sun.direction = glm::normalize(glm::vec3{-0.4f, -1.0f, -0.3f});
+        sun.color = glm::vec3{1.0f, 0.97f, 0.92f};
+        sun.intensity = 0.6f;
+        m_lights.push_back(sun);
+
+        const int dynamicCount = std::max(0, m_demoLightCount - 1);
+        for (int index = 0; index < dynamicCount; ++index)
+        {
+            const float t = dynamicCount > 1
+                ? static_cast<float>(index) / static_cast<float>(dynamicCount - 1)
+                : 0.0f;
+            const float angle = rotation + t * 6.2831853f * 4.0f;
+            const float radius = 2.5f + 5.0f * t;
+            const float height = 1.2f + 0.8f * static_cast<float>(index % 3);
+            const glm::vec3 position{std::cos(angle) * radius, height, std::sin(angle) * radius};
+
+            mukki::Light light{};
+            light.color = HueColor(t);
+            light.position = position;
+            light.range = 6.0f;
+            light.intensity = 0.5f;
+            light.type = index % 3 == 0 ? mukki::LightType::Spot : mukki::LightType::Point;
+            if (light.type == mukki::LightType::Spot)
+            {
+                light.direction = glm::normalize(glm::vec3{0.0f, 0.4f, 0.0f} - position);
+                light.innerConeAngle = 0.35f;
+                light.outerConeAngle = 0.6f;
+            }
+            m_lights.push_back(light);
+        }
+    }
+
     void DrawGBufferWindow()
     {
         if (!m_showGBuffer)
@@ -423,6 +520,7 @@ private:
     std::unique_ptr<mukki::rhi::Device> m_device{};
     std::unique_ptr<mukki::DeferredRenderer> m_renderer{};
     mukki::vulkan::UiLayer m_ui{};
+    std::vector<mukki::Light> m_lights{};
     std::vector<std::filesystem::path> m_sampleModels{};
     std::filesystem::path m_modelsRoot{};
     std::filesystem::path m_pendingModelPath{};
@@ -432,6 +530,8 @@ private:
     std::filesystem::path m_shaderDirectory{};
     std::filesystem::path m_requestedModel{};
     float m_frameTimeMs = 0.0f;
+    float m_elapsed = 0.0f;
+    int m_demoLightCount = 100;
     int m_selectedModel = 0;
     int m_maxFrames = 0;
     int m_frameCount = 0;
@@ -440,6 +540,8 @@ private:
     bool m_cursorReleased = false;
     bool m_showGBuffer = false;
     bool m_showDemoWindow = false;
+    bool m_animateLights = true;
+    bool m_lightsDirty = false;
 };
 
 } // namespace

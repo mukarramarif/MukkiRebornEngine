@@ -24,6 +24,10 @@ public:
     [[nodiscard]] glm::vec3 GetUp() const;
     [[nodiscard]] float GetYaw() const { return m_yaw; }
     [[nodiscard]] float GetPitch() const { return m_pitch; }
+    [[nodiscard]] float GetFovY() const { return m_fovY; }
+    [[nodiscard]] float GetAspectRatio() const { return m_aspectRatio; }
+    [[nodiscard]] float GetNearPlane() const { return m_nearPlane; }
+    [[nodiscard]] float GetFarPlane() const { return m_farPlane; }
 
 private:
     void RecalculateView();

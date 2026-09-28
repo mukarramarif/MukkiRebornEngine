@@ -9,6 +9,7 @@
 #include "Utilities/Profiling.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <future>
 #include <iterator>
@@ -16,6 +17,7 @@
 
 #include <glm/ext/matrix_transform.hpp>
 #include <glm/geometric.hpp>
+#include <glm/gtc/matrix_inverse.hpp>
 
 namespace mukki
 {
@@ -74,6 +76,7 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
     {
         return false;
     }
+    m_clusterGrid = ComputeClusterGrid(m_gbuffer.GetWidth(), m_gbuffer.GetHeight());
 
     m_bufferManager = std::make_unique<BufferManager>(device);
     m_gbufferSampler = device.CreateSampler(rhi::SamplerDesc{});
@@ -114,10 +117,20 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
         rhi::DescriptorBinding{1, rhi::DescriptorType::CombinedImageSampler, rhi::ShaderStageMask::Fragment},
         rhi::DescriptorBinding{2, rhi::DescriptorType::CombinedImageSampler, rhi::ShaderStageMask::Fragment},
         rhi::DescriptorBinding{3, rhi::DescriptorType::CombinedImageSampler, rhi::ShaderStageMask::Fragment},
+        rhi::DescriptorBinding{4, rhi::DescriptorType::StorageBuffer, rhi::ShaderStageMask::Fragment},
+        rhi::DescriptorBinding{5, rhi::DescriptorType::StorageBuffer, rhi::ShaderStageMask::Fragment},
+        rhi::DescriptorBinding{6, rhi::DescriptorType::StorageBuffer, rhi::ShaderStageMask::Fragment},
+    };
+    const std::vector<rhi::DescriptorBinding> clusterBindings{
+        rhi::DescriptorBinding{0, rhi::DescriptorType::UniformBuffer, rhi::ShaderStageMask::Compute},
+        rhi::DescriptorBinding{1, rhi::DescriptorType::StorageBuffer, rhi::ShaderStageMask::Compute},
+        rhi::DescriptorBinding{2, rhi::DescriptorType::StorageBuffer, rhi::ShaderStageMask::Compute},
+        rhi::DescriptorBinding{3, rhi::DescriptorType::StorageBuffer, rhi::ShaderStageMask::Compute},
     };
     m_sceneSetLayout = device.CreateDescriptorSetLayout(sceneBindings);
     m_bindlessSetLayout = device.CreateDescriptorSetLayout(bindlessBindings);
     m_lightingSetLayout = device.CreateDescriptorSetLayout(lightingBindings);
+    m_clusterSetLayout = device.CreateDescriptorSetLayout(clusterBindings);
 
     m_bindlessSet = device.CreateDescriptorSet(*m_bindlessSetLayout);
     m_bindlessSet->BindTexture(0, *m_whiteTexture, m_whiteTexture->GetBindlessIndex());
@@ -138,6 +151,12 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
         m_sceneSets.push_back(std::move(sceneSet));
     }
 
+    if (!CreateClusterResources(device))
+    {
+        Shutdown();
+        return false;
+    }
+
     m_gbufferSecondaries.clear();
     m_gbufferSecondaries.resize(framesInFlight);
     for (std::uint32_t frame = 0; frame < framesInFlight; ++frame)
@@ -155,8 +174,6 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
         return false;
     }
 
-    m_sceneUniform.lightDirection = glm::vec4(glm::normalize(glm::vec3(-0.4f, -1.0f, -0.3f)), 0.0f);
-    m_sceneUniform.lightColor = glm::vec4(1.0f, 0.97f, 0.92f, 3.0f);
     m_sceneUniform.ambientColor = glm::vec4(0.05f, 0.06f, 0.09f, 1.0f);
 
     m_initialized = true;
@@ -169,16 +186,27 @@ void DeferredRenderer::Shutdown()
     UnloadModel();
 
     m_lightingSets.clear();
+    m_clusterSets.clear();
     m_sceneSets.clear();
     m_materials.clear();
+    m_clusterCullingPipeline.reset();
     m_lightingPipeline.reset();
     m_gbufferPipeline.reset();
+    m_clusterCullingShader.reset();
     m_lightingFragmentShader.reset();
     m_lightingVertexShader.reset();
     m_gbufferFragmentShader.reset();
     m_gbufferVertexShader.reset();
     m_sceneDrawItems.clear();
     m_gbufferSecondaries.clear();
+    m_lightBuffers.clear();
+    m_clusterUniformBuffers.clear();
+    m_clusterCountBuffers.clear();
+    m_clusterIndexBuffers.clear();
+    m_lights.clear();
+    m_gpuLights.clear();
+    m_zeroClusterCounts.clear();
+    m_clusterSetLayout.reset();
     m_lightingSetLayout.reset();
     m_bindlessSetLayout.reset();
     m_sceneSetLayout.reset();
@@ -215,11 +243,19 @@ void DeferredRenderer::Resize(std::uint32_t width, std::uint32_t height)
     m_device->WaitIdle();
 
     m_lightingSets.clear();
+    m_clusterSets.clear();
     m_lightingSetsDirty = true;
 
     if (!m_gbuffer.Resize(*m_device, width, height))
     {
         MRE_CRITICAL("Failed to resize the G-buffer");
+        return;
+    }
+
+    m_clusterGrid = ComputeClusterGrid(m_gbuffer.GetWidth(), m_gbuffer.GetHeight());
+    if (!CreateClusterResources(*m_device))
+    {
+        MRE_CRITICAL("Failed to recreate the clustered light resources");
     }
 }
 
@@ -457,10 +493,7 @@ void DeferredRenderer::UnloadModel()
     m_modelTriangleCount = 0;
 }
 
-void DeferredRenderer::Render(
-    rhi::CommandList& commandList,
-    const glm::mat4& viewProjection,
-    const glm::vec3& cameraPosition)
+void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& view)
 {
     MRE_PROFILE_ZONE_N("DeferredRenderer::Render");
     MRE_ASSERT(m_initialized, "DeferredRenderer::Render called before DeferredRenderer::Init");
@@ -469,7 +502,7 @@ void DeferredRenderer::Render(
     const std::uint32_t frameIndex = m_device->GetFrameIndex();
     MRE_ASSERT(frameIndex < m_sceneSets.size(), "Frame index out of range");
 
-    UpdateUniforms(frameIndex, viewProjection, cameraPosition);
+    UpdateUniforms(frameIndex, view);
 
     rhi::RenderingDesc gbufferDesc{};
     gbufferDesc.colorAttachments = {
@@ -541,6 +574,19 @@ void DeferredRenderer::Render(
     {
         CreateLightingSets(*m_device);
         m_lightingSetsDirty = false;
+    }
+
+    if (m_clusterGrid.count > 0 && !m_gpuLights.empty())
+    {
+        commandList.BeginGpuZone("LightCulling");
+        commandList.BindPipeline(*m_clusterCullingPipeline);
+        commandList.BindDescriptorSet(0, *m_clusterSets[frameIndex]);
+        commandList.Dispatch(
+            (m_clusterGrid.x + 3) / 4,
+            (m_clusterGrid.y + 3) / 4,
+            m_clusterGrid.z);
+        commandList.EndGpuZone();
+        commandList.ShaderMemoryBarrier(rhi::ShaderStageMask::Compute, rhi::ShaderStageMask::Fragment);
     }
 
     commandList.BeginGpuZone("Lighting");
@@ -646,9 +692,13 @@ bool DeferredRenderer::CreatePipelines(rhi::Device& device, const std::filesyste
     m_lightingFragmentShader = device.CreateShader(
         rhi::ShaderStage::Fragment,
         shaderDirectory / "lighting.frag.spv");
+    m_clusterCullingShader = device.CreateShader(
+        rhi::ShaderStage::Compute,
+        shaderDirectory / "cluster_culling.comp.spv");
 
     if (m_gbufferVertexShader == nullptr || m_gbufferFragmentShader == nullptr ||
-        m_lightingVertexShader == nullptr || m_lightingFragmentShader == nullptr)
+        m_lightingVertexShader == nullptr || m_lightingFragmentShader == nullptr ||
+        m_clusterCullingShader == nullptr)
     {
         MRE_CRITICAL("Failed to load the deferred shaders from '{}'", PathToUtf8(shaderDirectory));
         return false;
@@ -688,7 +738,12 @@ bool DeferredRenderer::CreatePipelines(rhi::Device& device, const std::filesyste
     lightingPipelineDesc.colorFormats = {device.GetSwapchainInfo().format};
     m_lightingPipeline = device.CreatePipeline(lightingPipelineDesc);
 
-    return m_gbufferPipeline != nullptr && m_lightingPipeline != nullptr;
+    rhi::PipelineDesc clusterPipelineDesc{};
+    clusterPipelineDesc.computeShader = m_clusterCullingShader.get();
+    clusterPipelineDesc.descriptorSetLayouts = {m_clusterSetLayout.get()};
+    m_clusterCullingPipeline = device.CreatePipeline(clusterPipelineDesc);
+
+    return m_gbufferPipeline != nullptr && m_lightingPipeline != nullptr && m_clusterCullingPipeline != nullptr;
 }
 
 bool DeferredRenderer::CreateScene()
@@ -730,18 +785,152 @@ void DeferredRenderer::CreateLightingSets(rhi::Device& device)
         lightingSet->BindTexture(1, m_gbuffer.GetAlbedo(), *m_gbufferSampler);
         lightingSet->BindTexture(2, m_gbuffer.GetNormal(), *m_gbufferSampler);
         lightingSet->BindTexture(3, m_gbuffer.GetPosition(), *m_gbufferSampler);
+        lightingSet->BindBuffer(4, *m_lightBuffers[frame]);
+        lightingSet->BindBuffer(5, *m_clusterCountBuffers[frame]);
+        lightingSet->BindBuffer(6, *m_clusterIndexBuffers[frame]);
         m_lightingSets.push_back(std::move(lightingSet));
     }
 }
 
-void DeferredRenderer::UpdateUniforms(
-    std::uint32_t frameIndex,
-    const glm::mat4& viewProjection,
-    const glm::vec3& cameraPosition)
+bool DeferredRenderer::CreateClusterResources(rhi::Device& device)
 {
-    m_sceneUniform.viewProjection = viewProjection;
-    m_sceneUniform.cameraPosition = glm::vec4{cameraPosition, 1.0f};
+    MRE_PROFILE_ZONE_N("CreateClusterResources");
+    MRE_ASSERT(device.GetFramesInFlight() > 0, "Device requires frames in flight");
+    MRE_ASSERT(m_clusterGrid.count > 0, "Cluster grid must be computed before creating cluster resources");
+
+    m_clusterSets.clear();
+    m_lightBuffers.clear();
+    m_clusterUniformBuffers.clear();
+    m_clusterCountBuffers.clear();
+    m_clusterIndexBuffers.clear();
+
+    const std::uint32_t framesInFlight = device.GetFramesInFlight();
+    const std::uint64_t lightBufferSize = sizeof(GpuLight) * kMaxLights;
+    const std::uint64_t countBufferSize = sizeof(std::uint32_t) * m_clusterGrid.count;
+    const std::uint64_t indexBufferSize =
+        sizeof(std::uint32_t) * m_clusterGrid.count * kMaxLightsPerCluster;
+
+    m_zeroClusterCounts.assign(m_clusterGrid.count, 0u);
+
+    m_lightBuffers.reserve(framesInFlight);
+    m_clusterUniformBuffers.reserve(framesInFlight);
+    m_clusterCountBuffers.reserve(framesInFlight);
+    m_clusterIndexBuffers.reserve(framesInFlight);
+    m_clusterSets.reserve(framesInFlight);
+
+    for (std::uint32_t frame = 0; frame < framesInFlight; ++frame)
+    {
+        m_lightBuffers.push_back(device.CreateBuffer(rhi::BufferDesc{lightBufferSize, rhi::BufferUsage::Storage, true}));
+        m_clusterUniformBuffers.push_back(
+            device.CreateBuffer(rhi::BufferDesc{sizeof(ClusterUniform), rhi::BufferUsage::Uniform, true}));
+        m_clusterCountBuffers.push_back(
+            device.CreateBuffer(rhi::BufferDesc{countBufferSize, rhi::BufferUsage::Storage, true}));
+        m_clusterIndexBuffers.push_back(
+            device.CreateBuffer(rhi::BufferDesc{indexBufferSize, rhi::BufferUsage::Storage, false}));
+
+        if (m_lightBuffers.back() == nullptr || m_clusterUniformBuffers.back() == nullptr ||
+            m_clusterCountBuffers.back() == nullptr || m_clusterIndexBuffers.back() == nullptr)
+        {
+            MRE_CRITICAL("Failed to create the clustered light buffers");
+            return false;
+        }
+
+        std::unique_ptr<rhi::DescriptorSet> clusterSet = device.CreateDescriptorSet(*m_clusterSetLayout);
+        clusterSet->BindBuffer(0, *m_clusterUniformBuffers.back());
+        clusterSet->BindBuffer(1, *m_lightBuffers.back());
+        clusterSet->BindBuffer(2, *m_clusterCountBuffers.back());
+        clusterSet->BindBuffer(3, *m_clusterIndexBuffers.back());
+        m_clusterSets.push_back(std::move(clusterSet));
+    }
+
+    MRE_INFO(
+        "Cluster grid {}x{}x{} ({} clusters, up to {} lights per cluster)",
+        m_clusterGrid.x,
+        m_clusterGrid.y,
+        m_clusterGrid.z,
+        m_clusterGrid.count,
+        kMaxLightsPerCluster);
+    return true;
+}
+
+void DeferredRenderer::SetLights(std::span<const Light> lights)
+{
+    m_lights.assign(lights.begin(), lights.end());
+    if (m_lights.size() > kMaxLights)
+    {
+        MRE_WARN(
+            "Scene registered {} lights, but only the first {} are rendered",
+            m_lights.size(),
+            kMaxLights);
+    }
+}
+
+std::uint32_t DeferredRenderer::GetLightCount() const
+{
+    return static_cast<std::uint32_t>(std::min(m_lights.size(), static_cast<std::size_t>(kMaxLights)));
+}
+
+void DeferredRenderer::UpdateUniforms(std::uint32_t frameIndex, const FrameView& view)
+{
+    MRE_ASSERT(frameIndex < m_uniformBuffers.size(), "Frame index out of range");
+    MRE_ASSERT(frameIndex < m_lightBuffers.size(), "Frame index out of range");
+
+    const float tanHalfFovY = std::abs(view.projection[1][1]) > 0.0f
+        ? 1.0f / std::abs(view.projection[1][1])
+        : std::tan(view.fovYRadians * 0.5f);
+
+    m_gpuLights.clear();
+    m_gpuLights.reserve(m_lights.size());
+    for (const Light& light : m_lights)
+    {
+        if (m_gpuLights.size() >= kMaxLights)
+        {
+            break;
+        }
+        m_gpuLights.push_back(ToGpuLight(light));
+    }
+
+    m_sceneUniform.viewProjection = view.viewProjection;
+    m_sceneUniform.view = view.view;
+    m_sceneUniform.cameraPosition = glm::vec4{view.position, 1.0f};
+    m_sceneUniform.clusterParams = glm::vec4{
+        view.nearPlane,
+        view.farPlane,
+        static_cast<float>(kClusterTileSize),
+        static_cast<float>(kClusterZSliceCount)};
+    m_sceneUniform.clusterGrid = glm::uvec4{
+        m_clusterGrid.x,
+        m_clusterGrid.y,
+        m_clusterGrid.z,
+        static_cast<std::uint32_t>(m_gpuLights.size())};
+    m_sceneUniform.screenSize = glm::vec4{
+        static_cast<float>(m_gbuffer.GetWidth()),
+        static_cast<float>(m_gbuffer.GetHeight()),
+        m_clusterDebugView ? 1.0f : 0.0f,
+        0.0f};
     m_uniformBuffers[frameIndex]->Write(&m_sceneUniform, sizeof(SceneUniform));
+
+    m_clusterUniform.inverseView = glm::inverse(view.view);
+    m_clusterUniform.cameraParams = glm::vec4{view.nearPlane, view.farPlane, tanHalfFovY, view.aspectRatio};
+    m_clusterUniform.clusterParams = glm::vec4{
+        static_cast<float>(kClusterTileSize),
+        static_cast<float>(kClusterZSliceCount),
+        0.0f,
+        0.0f};
+    m_clusterUniform.grid = m_sceneUniform.clusterGrid;
+    m_clusterUniform.screen = glm::uvec4{m_gbuffer.GetWidth(), m_gbuffer.GetHeight(), 0u, 0u};
+    m_clusterUniformBuffers[frameIndex]->Write(&m_clusterUniform, sizeof(ClusterUniform));
+
+    if (!m_gpuLights.empty())
+    {
+        m_lightBuffers[frameIndex]->Write(
+            m_gpuLights.data(),
+            m_gpuLights.size() * sizeof(GpuLight));
+    }
+
+    m_clusterCountBuffers[frameIndex]->Write(
+        m_zeroClusterCounts.data(),
+        m_zeroClusterCounts.size() * sizeof(std::uint32_t));
 }
 
 std::uint32_t DeferredRenderer::GetSamplerIndex(rhi::AddressMode addressModeU, rhi::AddressMode addressModeV)

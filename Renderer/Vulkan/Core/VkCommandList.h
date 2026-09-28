@@ -49,6 +49,8 @@ public:
     void SetPushConstants(const void* data, std::uint32_t size, rhi::ShaderStageMask stages) override;
     void Draw(std::uint32_t vertexCount, std::uint32_t firstVertex) override;
     void DrawIndexed(std::uint32_t indexCount, std::uint32_t firstIndex) override;
+    void Dispatch(std::uint32_t groupCountX, std::uint32_t groupCountY, std::uint32_t groupCountZ) override;
+    void ShaderMemoryBarrier(rhi::ShaderStageMask before, rhi::ShaderStageMask after) override;
     void BeginGpuZone(const char* name) override;
     void EndGpuZone() override;
 
@@ -77,6 +79,7 @@ private:
     vk::Extent2D m_swapchainExtent{0, 0};
     vk::ImageLayout m_swapchainImageLayout = vk::ImageLayout::eUndefined;
     vk::PipelineLayout m_boundPipelineLayout{nullptr};
+    vk::PipelineBindPoint m_boundPipelineBindPoint = vk::PipelineBindPoint::eGraphics;
     std::vector<const VkTexture*> m_renderingColorTextures{};
     const VkTexture* m_renderingDepthTexture = nullptr;
     std::uint32_t m_swapchainImageIndex = 0;
