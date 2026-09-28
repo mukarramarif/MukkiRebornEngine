@@ -476,6 +476,7 @@ private:
 
         m_scene = std::move(loaded);
         m_selectedLight = 0;
+        m_selectedObject = 0;
         if (!m_renderer->LoadScene(m_scene))
         {
             m_sceneStatus = "the renderer failed to load the scene";
@@ -587,12 +588,30 @@ private:
             m_renderer->SetClusterDebugView(debugClusters);
         }
 
-        if (ImGui::CollapsingHeader("Objects"))
+        ImGui::SeparatorText("Objects");
+        if (ImGui::BeginChild("##object_list", ImVec2(0.0f, 90.0f), ImGuiChildFlags_Borders))
         {
-            for (const mukki::SceneObject& object : m_scene.objects)
+            for (std::size_t index = 0; index < m_scene.objects.size(); ++index)
             {
-                ImGui::BulletText("%s  (%s)", object.name.c_str(), object.modelPath.c_str());
+                const mukki::SceneObject& object = m_scene.objects[index];
+                char label[256];
+                std::snprintf(
+                    label,
+                    sizeof(label),
+                    "%s (%s)",
+                    object.name.c_str(),
+                    object.modelPath.c_str());
+                if (ImGui::Selectable(label, m_selectedObject == static_cast<int>(index)))
+                {
+                    m_selectedObject = static_cast<int>(index);
+                }
             }
+        }
+        ImGui::EndChild();
+
+        if (m_selectedObject >= 0 && m_selectedObject < static_cast<int>(m_scene.objects.size()))
+        {
+            DrawObjectEditor(m_scene.objects[static_cast<std::size_t>(m_selectedObject)]);
         }
 
         ImGui::SeparatorText("Lights");
@@ -649,7 +668,56 @@ private:
             m_sceneLightsDirty = false;
         }
 
+        DrawShadowSettings();
+
         ImGui::End();
+    }
+
+    void DrawShadowSettings()
+    {
+        ImGui::SeparatorText("Shadows");
+
+        mukki::ShadowSettings settings = m_renderer->GetShadowSettings();
+        bool changed = ImGui::Checkbox("Enabled", &settings.enabled);
+
+        changed |= ImGui::SliderFloat("Distance", &settings.distance, 5.0f, 500.0f, "%.1f");
+        changed |= ImGui::SliderFloat("Depth bias", &settings.depthBias, 0.0f, 5.0f, "%.2f");
+        changed |= ImGui::SliderFloat("Normal bias", &settings.normalBias, 0.0f, 1.0f, "%.3f");
+
+        ImGui::Text(
+            "%u cascades, %ux%u shadow map",
+            static_cast<unsigned>(settings.cascadeCount),
+            static_cast<unsigned>(settings.resolution),
+            static_cast<unsigned>(settings.resolution));
+
+        if (changed)
+        {
+            m_renderer->SetShadowSettings(settings);
+        }
+    }
+
+    void DrawObjectEditor(mukki::SceneObject& object)
+    {
+        const std::size_t index = static_cast<std::size_t>(std::max(m_selectedObject, 0));
+        ImGui::Text("Model: %s", object.modelPath.c_str());
+
+        bool changed = false;
+        changed |= ImGui::DragFloat3("Object position", &object.position.x, 0.05f, -100.0f, 100.0f);
+        changed |= ImGui::DragFloat3("Object rotation (deg)", &object.rotation.x, 0.5f, -360.0f, 360.0f);
+        changed |= ImGui::DragFloat3("Object scale", &object.scale.x, 0.02f, 0.01f, 100.0f);
+
+        if (changed)
+        {
+            if (index < m_renderer->GetSceneObjectCount())
+            {
+                m_renderer->UpdateSceneObjectTransform(index, mukki::BuildObjectTransform(object));
+                m_sceneStatus = "object '" + object.name + "' updated";
+            }
+            else
+            {
+                m_sceneStatus = "object is not instantiated in the renderer";
+            }
+        }
     }
 
     void DrawLightEditor(mukki::SceneLight& sceneLight)
@@ -689,6 +757,15 @@ private:
                 light.direction = length > 1e-4f ? direction / length : glm::vec3{0.0f, -1.0f, 0.0f};
                 m_sceneLightsDirty = true;
             }
+        }
+
+        if (light.type == mukki::LightType::Directional)
+        {
+            if (ImGui::Checkbox("Casts shadows", &light.castShadows))
+            {
+                m_sceneLightsDirty = true;
+            }
+            ImGui::TextUnformatted("(the first shadow-casting directional light is used)");
         }
 
         if (ImGui::ColorEdit3("Color", &light.color.x))
@@ -782,6 +859,7 @@ private:
     std::string m_sceneStatus{};
     float m_frameTimeMs = 0.0f;
     int m_selectedLight = 0;
+    int m_selectedObject = 0;
     int m_sceneFileIndex = 0;
     int m_maxFrames = 0;
     int m_frameCount = 0;

@@ -24,7 +24,8 @@ vk::ImageMemoryBarrier2 MakeImageBarrier(
     vk::PipelineStageFlags2 srcStage,
     vk::AccessFlags2 srcAccess,
     vk::PipelineStageFlags2 dstStage,
-    vk::AccessFlags2 dstAccess)
+    vk::AccessFlags2 dstAccess,
+    std::uint32_t layerCount = 1)
 {
     vk::ImageMemoryBarrier2 barrier{};
     barrier.srcStageMask = srcStage;
@@ -41,7 +42,7 @@ vk::ImageMemoryBarrier2 MakeImageBarrier(
                                    .setBaseMipLevel(0)
                                    .setLevelCount(1)
                                    .setBaseArrayLayer(0)
-                                   .setLayerCount(1);
+                                   .setLayerCount(layerCount);
     return barrier;
 }
 
@@ -218,7 +219,9 @@ void VkCommandList::BeginRendering(const rhi::RenderingDesc& desc)
 {
     MRE_ASSERT(m_recording, "VkCommandList::BeginRendering called outside of a recording scope");
     MRE_ASSERT(!m_rendering, "VkCommandList::BeginRendering called while a rendering scope is open");
-    MRE_ASSERT(!desc.colorAttachments.empty(), "BeginRendering requires at least one color attachment");
+    MRE_ASSERT(
+        !desc.colorAttachments.empty() || desc.depthAttachment.texture != nullptr,
+        "BeginRendering requires at least one color or depth attachment");
 
     std::vector<vk::RenderingAttachmentInfo> colorAttachments{};
     colorAttachments.reserve(desc.colorAttachments.size());
@@ -243,13 +246,14 @@ void VkCommandList::BeginRendering(const rhi::RenderingDesc& desc)
                                : vk::PipelineStageFlagBits2::eNone,
                 wasInitialized ? vk::AccessFlagBits2::eColorAttachmentWrite : vk::AccessFlagBits2::eNone,
                 vk::PipelineStageFlagBits2::eColorAttachmentOutput,
-                vk::AccessFlagBits2::eColorAttachmentWrite);
+                vk::AccessFlagBits2::eColorAttachmentWrite,
+                texture->GetArrayLayers());
             m_commandBuffer.pipelineBarrier2(vk::DependencyInfo{}.setImageMemoryBarriers(barrier));
             texture->SetLayout(vk::ImageLayout::eColorAttachmentOptimal);
         }
 
         colorAttachments.push_back(vk::RenderingAttachmentInfo{}
-                                       .setImageView(texture->GetImageView())
+                                       .setImageView(texture->GetLayerView(0))
                                        .setImageLayout(vk::ImageLayout::eColorAttachmentOptimal)
                                        .setLoadOp(attachment.clear ? vk::AttachmentLoadOp::eClear
                                                                    : vk::AttachmentLoadOp::eLoad)
@@ -285,13 +289,14 @@ void VkCommandList::BeginRendering(const rhi::RenderingDesc& desc)
                 wasInitialized ? vk::AccessFlagBits2::eDepthStencilAttachmentWrite
                                : vk::AccessFlagBits2::eNone,
                 vk::PipelineStageFlagBits2::eEarlyFragmentTests | vk::PipelineStageFlagBits2::eLateFragmentTests,
-                vk::AccessFlagBits2::eDepthStencilAttachmentWrite);
+                vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+                depthTexture->GetArrayLayers());
             m_commandBuffer.pipelineBarrier2(vk::DependencyInfo{}.setImageMemoryBarriers(barrier));
             depthTexture->SetLayout(vk::ImageLayout::eDepthAttachmentOptimal);
         }
 
         depthAttachmentInfo = vk::RenderingAttachmentInfo{}
-                                  .setImageView(depthTexture->GetImageView())
+                                  .setImageView(depthTexture->GetLayerView(desc.depthAttachment.layer))
                                   .setImageLayout(vk::ImageLayout::eDepthAttachmentOptimal)
                                   .setLoadOp(desc.depthAttachment.clear ? vk::AttachmentLoadOp::eClear
                                                                         : vk::AttachmentLoadOp::eLoad)
@@ -343,7 +348,8 @@ void VkCommandList::EndRendering()
             vk::PipelineStageFlagBits2::eColorAttachmentOutput,
             vk::AccessFlagBits2::eColorAttachmentWrite,
             vk::PipelineStageFlagBits2::eFragmentShader,
-            vk::AccessFlagBits2::eShaderSampledRead);
+            vk::AccessFlagBits2::eShaderSampledRead,
+            texture->GetArrayLayers());
         m_commandBuffer.pipelineBarrier2(vk::DependencyInfo{}.setImageMemoryBarriers(barrier));
         texture->SetLayout(vk::ImageLayout::eShaderReadOnlyOptimal);
     }
@@ -358,7 +364,8 @@ void VkCommandList::EndRendering()
             vk::PipelineStageFlagBits2::eEarlyFragmentTests | vk::PipelineStageFlagBits2::eLateFragmentTests,
             vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
             vk::PipelineStageFlagBits2::eFragmentShader,
-            vk::AccessFlagBits2::eShaderSampledRead);
+            vk::AccessFlagBits2::eShaderSampledRead,
+            m_renderingDepthTexture->GetArrayLayers());
         m_commandBuffer.pipelineBarrier2(vk::DependencyInfo{}.setImageMemoryBarriers(barrier));
         m_renderingDepthTexture->SetLayout(vk::ImageLayout::eShaderReadOnlyOptimal);
     }
@@ -372,7 +379,9 @@ void VkCommandList::BeginSecondary(const rhi::RenderingDesc& desc)
 {
     MRE_ASSERT(m_secondary, "VkCommandList::BeginSecondary requires a secondary command list");
     MRE_ASSERT(!m_recording, "VkCommandList::BeginSecondary called while already recording");
-    MRE_ASSERT(!desc.colorAttachments.empty(), "BeginSecondary requires at least one color attachment");
+    MRE_ASSERT(
+        !desc.colorAttachments.empty() || desc.depthAttachment.texture != nullptr,
+        "BeginSecondary requires at least one color or depth attachment");
 
     std::vector<vk::Format> colorFormats{};
     colorFormats.reserve(desc.colorAttachments.size());
@@ -400,7 +409,7 @@ void VkCommandList::BeginSecondary(const rhi::RenderingDesc& desc)
 
     vk::CommandBufferInheritanceRenderingInfo inheritanceRenderingInfo{};
     inheritanceRenderingInfo.colorAttachmentCount = static_cast<std::uint32_t>(colorFormats.size());
-    inheritanceRenderingInfo.pColorAttachmentFormats = colorFormats.data();
+    inheritanceRenderingInfo.pColorAttachmentFormats = colorFormats.empty() ? nullptr : colorFormats.data();
     inheritanceRenderingInfo.depthAttachmentFormat = depthFormat;
     inheritanceRenderingInfo.stencilAttachmentFormat = vk::Format::eUndefined;
     inheritanceRenderingInfo.rasterizationSamples = vk::SampleCountFlagBits::e1;
@@ -570,6 +579,14 @@ void VkCommandList::ShaderMemoryBarrier(rhi::ShaderStageMask before, rhi::Shader
                                            .setDstStageMask(ToVkPipelineStageFlags2(after))
                                            .setDstAccessMask(vk::AccessFlagBits2::eShaderRead);
     m_commandBuffer.pipelineBarrier2(vk::DependencyInfo{}.setMemoryBarriers(barrier));
+}
+
+void VkCommandList::SetDepthBias(float constantFactor, float slopeFactor, float clamp)
+{
+    MRE_ASSERT(m_recording, "VkCommandList::SetDepthBias called outside of a recording scope");
+    MRE_ASSERT(m_hasBoundPipeline, "VkCommandList::SetDepthBias requires a bound pipeline");
+
+    m_commandBuffer.setDepthBias(constantFactor, clamp, slopeFactor);
 }
 
 void VkCommandList::SetViewportAndScissor(const vk::Extent2D& extent)

@@ -121,6 +121,9 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
         rhi::DescriptorBinding{4, rhi::DescriptorType::StorageBuffer, rhi::ShaderStageMask::Fragment},
         rhi::DescriptorBinding{5, rhi::DescriptorType::StorageBuffer, rhi::ShaderStageMask::Fragment},
         rhi::DescriptorBinding{6, rhi::DescriptorType::StorageBuffer, rhi::ShaderStageMask::Fragment},
+        rhi::DescriptorBinding{7, rhi::DescriptorType::UniformBuffer, rhi::ShaderStageMask::Fragment},
+        rhi::DescriptorBinding{8, rhi::DescriptorType::SampledImage, rhi::ShaderStageMask::Fragment},
+        rhi::DescriptorBinding{9, rhi::DescriptorType::Sampler, rhi::ShaderStageMask::Fragment},
     };
     const std::vector<rhi::DescriptorBinding> clusterBindings{
         rhi::DescriptorBinding{0, rhi::DescriptorType::UniformBuffer, rhi::ShaderStageMask::Compute},
@@ -128,10 +131,14 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
         rhi::DescriptorBinding{2, rhi::DescriptorType::StorageBuffer, rhi::ShaderStageMask::Compute},
         rhi::DescriptorBinding{3, rhi::DescriptorType::StorageBuffer, rhi::ShaderStageMask::Compute},
     };
+    const std::vector<rhi::DescriptorBinding> shadowBindings{
+        rhi::DescriptorBinding{0, rhi::DescriptorType::UniformBuffer, rhi::ShaderStageMask::Vertex},
+    };
     m_sceneSetLayout = device.CreateDescriptorSetLayout(sceneBindings);
     m_bindlessSetLayout = device.CreateDescriptorSetLayout(bindlessBindings);
     m_lightingSetLayout = device.CreateDescriptorSetLayout(lightingBindings);
     m_clusterSetLayout = device.CreateDescriptorSetLayout(clusterBindings);
+    m_shadowSetLayout = device.CreateDescriptorSetLayout(shadowBindings);
 
     m_bindlessSet = device.CreateDescriptorSet(*m_bindlessSetLayout);
     m_bindlessSet->BindTexture(0, *m_whiteTexture, m_whiteTexture->GetBindlessIndex());
@@ -152,7 +159,7 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
         m_sceneSets.push_back(std::move(sceneSet));
     }
 
-    if (!CreateClusterResources(device))
+    if (!CreateClusterResources(device) || !CreateShadowResources(device))
     {
         Shutdown();
         return false;
@@ -160,12 +167,21 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
 
     m_gbufferSecondaries.clear();
     m_gbufferSecondaries.resize(framesInFlight);
+    m_shadowSecondaries.clear();
+    m_shadowSecondaries.resize(framesInFlight);
     for (std::uint32_t frame = 0; frame < framesInFlight; ++frame)
     {
         m_gbufferSecondaries[frame].reserve(m_secondaryBatchCount);
         for (std::uint32_t batch = 0; batch < m_secondaryBatchCount; ++batch)
         {
             m_gbufferSecondaries[frame].push_back(device.CreateSecondaryCommandList());
+        }
+
+        const std::uint32_t shadowBatchCount = m_secondaryBatchCount * kShadowCascadeCount;
+        m_shadowSecondaries[frame].reserve(shadowBatchCount);
+        for (std::uint32_t batch = 0; batch < shadowBatchCount; ++batch)
+        {
+            m_shadowSecondaries[frame].push_back(device.CreateSecondaryCommandList());
         }
     }
 
@@ -189,9 +205,13 @@ void DeferredRenderer::Shutdown()
     m_lightingSets.clear();
     m_clusterSets.clear();
     m_sceneSets.clear();
+    m_shadowSets.clear();
+    m_shadowPipeline.reset();
     m_clusterCullingPipeline.reset();
     m_lightingPipeline.reset();
     m_gbufferPipeline.reset();
+    m_shadowFragmentShader.reset();
+    m_shadowVertexShader.reset();
     m_clusterCullingShader.reset();
     m_lightingFragmentShader.reset();
     m_lightingVertexShader.reset();
@@ -199,6 +219,10 @@ void DeferredRenderer::Shutdown()
     m_gbufferVertexShader.reset();
     m_sceneDrawItems.clear();
     m_gbufferSecondaries.clear();
+    m_shadowSecondaries.clear();
+    m_shadowMap.reset();
+    m_shadowSampler.reset();
+    m_shadowUniformBuffers.clear();
     m_lightBuffers.clear();
     m_clusterUniformBuffers.clear();
     m_clusterCountBuffers.clear();
@@ -206,6 +230,7 @@ void DeferredRenderer::Shutdown()
     m_lights.clear();
     m_gpuLights.clear();
     m_zeroClusterCounts.clear();
+    m_shadowSetLayout.reset();
     m_clusterSetLayout.reset();
     m_lightingSetLayout.reset();
     m_bindlessSetLayout.reset();
@@ -605,6 +630,12 @@ void DeferredRenderer::AddModelInstance(std::size_t modelIndex, const glm::mat4&
 
     const ModelResources& model = *m_models[modelIndex];
     const glm::mat4 scaleMatrix = glm::scale(glm::mat4{1.0f}, glm::vec3{m_modelScale});
+
+    SceneObjectInstance sceneObject{};
+    sceneObject.modelIndex = modelIndex;
+    sceneObject.firstDrawItem = m_modelDrawItems.size();
+    sceneObject.transform = transform;
+
     for (const DrawItem& source : model.drawItems)
     {
         DrawItem instance = source;
@@ -613,12 +644,39 @@ void DeferredRenderer::AddModelInstance(std::size_t modelIndex, const glm::mat4&
         m_modelDrawItems.push_back(instance);
         m_modelBaseTransforms.push_back(baseTransform);
     }
+
+    sceneObject.drawItemCount = m_modelDrawItems.size() - sceneObject.firstDrawItem;
+    m_objectInstances.push_back(sceneObject);
+}
+
+void DeferredRenderer::UpdateSceneObjectTransform(std::size_t objectIndex, const glm::mat4& transform)
+{
+    MRE_ASSERT(objectIndex < m_objectInstances.size(), "Scene object index out of range");
+
+    SceneObjectInstance& sceneObject = m_objectInstances[objectIndex];
+    sceneObject.transform = transform;
+
+    const ModelResources& model = *m_models[sceneObject.modelIndex];
+    MRE_ASSERT(
+        sceneObject.firstDrawItem + sceneObject.drawItemCount <= m_modelDrawItems.size(),
+        "Scene object draw items are out of range");
+
+    const glm::mat4 scaleMatrix = glm::scale(glm::mat4{1.0f}, glm::vec3{m_modelScale});
+    for (std::size_t index = 0; index < sceneObject.drawItemCount; ++index)
+    {
+        const DrawItem& source = model.drawItems[index];
+        const std::size_t drawIndex = sceneObject.firstDrawItem + index;
+        const glm::mat4 baseTransform = transform * source.pushConstants.model;
+        m_modelDrawItems[drawIndex].pushConstants.model = scaleMatrix * baseTransform;
+        m_modelBaseTransforms[drawIndex] = baseTransform;
+    }
 }
 
 void DeferredRenderer::ClearModelInstances()
 {
     m_modelDrawItems.clear();
     m_modelBaseTransforms.clear();
+    m_objectInstances.clear();
 }
 
 void DeferredRenderer::ClearModels()
@@ -689,6 +747,72 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
     for (const DrawItem& item : m_modelDrawItems)
     {
         gbufferItems.push_back(&item);
+    }
+
+    const bool shadowsActive = m_shadowSettings.enabled && FindShadowLight() != nullptr &&
+                               !gbufferItems.empty() && m_shadowMap != nullptr;
+    if (shadowsActive)
+    {
+        commandList.BeginGpuZone("ShadowPass");
+
+        rhi::RenderingDesc shadowDesc{};
+        shadowDesc.depthAttachment.texture = m_shadowMap.get();
+        shadowDesc.depthAttachment.clearDepth = 1.0f;
+        shadowDesc.depthAttachment.clear = true;
+
+        const bool useShadowSecondaries =
+            m_jobSystem != nullptr && m_secondaryBatchCount > 1 && gbufferItems.size() > 1 &&
+            frameIndex < m_shadowSecondaries.size();
+
+        if (useShadowSecondaries)
+        {
+            const std::uint32_t batchCount = RecordShadowSecondaries(frameIndex, gbufferItems);
+            shadowDesc.secondaryCommandBuffers = true;
+
+            for (std::uint32_t cascade = 0; cascade < kShadowCascadeCount; ++cascade)
+            {
+                std::vector<const rhi::CommandList*> secondaries{};
+                secondaries.reserve(batchCount);
+                for (std::uint32_t batch = 0; batch < batchCount; ++batch)
+                {
+                    secondaries.push_back(
+                        m_shadowSecondaries[frameIndex][cascade * m_secondaryBatchCount + batch].get());
+                }
+
+                shadowDesc.depthAttachment.layer = cascade;
+                commandList.BeginRendering(shadowDesc);
+                commandList.ExecuteCommands(secondaries);
+                commandList.EndRendering();
+            }
+        }
+        else
+        {
+            for (std::uint32_t cascade = 0; cascade < kShadowCascadeCount; ++cascade)
+            {
+                shadowDesc.depthAttachment.layer = cascade;
+                commandList.BeginRendering(shadowDesc);
+                commandList.BindPipeline(*m_shadowPipeline);
+                commandList.BindDescriptorSet(0, *m_shadowSets[frameIndex]);
+                commandList.SetDepthBias(m_shadowSettings.depthBias, m_shadowSettings.depthBias * 1.5f, 0.0f);
+
+                ShadowPushConstants pushConstants{};
+                pushConstants.cascadeIndex = cascade;
+                for (const DrawItem* item : gbufferItems)
+                {
+                    pushConstants.object = item->pushConstants;
+                    commandList.BindVertexBuffer(*item->vertexBuffer);
+                    commandList.BindIndexBuffer(*item->indexBuffer);
+                    commandList.SetPushConstants(
+                        &pushConstants,
+                        sizeof(ShadowPushConstants),
+                        rhi::ShaderStageMask::Vertex);
+                    commandList.DrawIndexed(item->indexCount, item->firstIndex);
+                }
+                commandList.EndRendering();
+            }
+        }
+
+        commandList.EndGpuZone();
     }
 
     const auto drawItems = [&commandList, frameIndex](const std::vector<const DrawItem*>& items) {
@@ -846,6 +970,99 @@ void DeferredRenderer::RecordGBufferBatch(
     secondary.End();
 }
 
+std::uint32_t DeferredRenderer::RecordShadowSecondaries(
+    std::uint32_t frameIndex,
+    const std::vector<const DrawItem*>& items)
+{
+    MRE_PROFILE_ZONE_N("RecordShadowSecondaries");
+    MRE_ASSERT(m_jobSystem != nullptr, "RecordShadowSecondaries requires a job system");
+    MRE_ASSERT(frameIndex < m_shadowSecondaries.size(), "Frame index out of range");
+    MRE_ASSERT(!items.empty(), "RecordShadowSecondaries requires draw items");
+
+    const std::uint32_t batchCount = std::min(
+        m_secondaryBatchCount,
+        static_cast<std::uint32_t>(items.size()));
+    MRE_ASSERT(batchCount > 0, "RecordShadowSecondaries requires at least one batch");
+    MRE_ASSERT(
+        static_cast<std::size_t>(batchCount) * kShadowCascadeCount <= m_shadowSecondaries[frameIndex].size(),
+        "Not enough shadow secondary command lists were allocated");
+
+    rhi::RenderingDesc desc{};
+    desc.depthAttachment.texture = m_shadowMap.get();
+    desc.depthAttachment.clearDepth = 1.0f;
+    desc.depthAttachment.clear = true;
+
+    const std::size_t itemsPerBatch = (items.size() + batchCount - 1) / batchCount;
+
+    std::vector<std::future<void>> futures{};
+    futures.reserve(static_cast<std::size_t>(batchCount) * kShadowCascadeCount);
+
+    for (std::uint32_t cascade = 0; cascade < kShadowCascadeCount; ++cascade)
+    {
+        for (std::uint32_t batch = 0; batch < batchCount; ++batch)
+        {
+            const std::size_t begin = static_cast<std::size_t>(batch) * itemsPerBatch;
+            const std::size_t end = std::min(begin + itemsPerBatch, items.size());
+            if (begin >= end)
+            {
+                break;
+            }
+
+            rhi::CommandList* secondary =
+                m_shadowSecondaries[frameIndex][cascade * m_secondaryBatchCount + batch].get();
+            futures.push_back(m_jobSystem->Submit(
+                [this, frameIndex, secondary, &items, begin, end, cascade, &desc]() {
+                    RecordShadowBatch(frameIndex, items, begin, end, cascade, *secondary, desc);
+                }));
+        }
+    }
+
+    for (std::future<void>& future : futures)
+    {
+        future.get();
+    }
+
+    return batchCount;
+}
+
+void DeferredRenderer::RecordShadowBatch(
+    std::uint32_t frameIndex,
+    const std::vector<const DrawItem*>& items,
+    std::size_t begin,
+    std::size_t end,
+    std::uint32_t cascadeIndex,
+    rhi::CommandList& secondary,
+    const rhi::RenderingDesc& desc)
+{
+    MRE_ASSERT(m_shadowPipeline != nullptr, "RecordShadowBatch requires the shadow pipeline");
+    MRE_ASSERT(frameIndex < m_shadowSets.size(), "Frame index out of range");
+
+    secondary.BeginSecondary(desc);
+    secondary.BindPipeline(*m_shadowPipeline);
+    secondary.BindDescriptorSet(0, *m_shadowSets[frameIndex]);
+    secondary.SetDepthBias(m_shadowSettings.depthBias, m_shadowSettings.depthBias * 1.5f, 0.0f);
+    secondary.BeginGpuZone("ShadowBatch");
+
+    ShadowPushConstants pushConstants{};
+    pushConstants.cascadeIndex = cascadeIndex;
+
+    for (std::size_t index = begin; index < end; ++index)
+    {
+        const DrawItem& item = *items[index];
+        pushConstants.object = item.pushConstants;
+        secondary.BindVertexBuffer(*item.vertexBuffer);
+        secondary.BindIndexBuffer(*item.indexBuffer);
+        secondary.SetPushConstants(
+            &pushConstants,
+            sizeof(ShadowPushConstants),
+            rhi::ShaderStageMask::Vertex);
+        secondary.DrawIndexed(item.indexCount, item.firstIndex);
+    }
+
+    secondary.EndGpuZone();
+    secondary.End();
+}
+
 bool DeferredRenderer::CreatePipelines(rhi::Device& device, const std::filesystem::path& shaderDirectory)
 {
     m_gbufferVertexShader = device.CreateShader(
@@ -863,10 +1080,17 @@ bool DeferredRenderer::CreatePipelines(rhi::Device& device, const std::filesyste
     m_clusterCullingShader = device.CreateShader(
         rhi::ShaderStage::Compute,
         shaderDirectory / "cluster_culling.comp.spv");
+    m_shadowVertexShader = device.CreateShader(
+        rhi::ShaderStage::Vertex,
+        shaderDirectory / "shadow.vert.spv");
+    m_shadowFragmentShader = device.CreateShader(
+        rhi::ShaderStage::Fragment,
+        shaderDirectory / "shadow.frag.spv");
 
     if (m_gbufferVertexShader == nullptr || m_gbufferFragmentShader == nullptr ||
         m_lightingVertexShader == nullptr || m_lightingFragmentShader == nullptr ||
-        m_clusterCullingShader == nullptr)
+        m_clusterCullingShader == nullptr || m_shadowVertexShader == nullptr ||
+        m_shadowFragmentShader == nullptr)
     {
         MRE_CRITICAL("Failed to load the deferred shaders from '{}'", PathToUtf8(shaderDirectory));
         return false;
@@ -911,7 +1135,27 @@ bool DeferredRenderer::CreatePipelines(rhi::Device& device, const std::filesyste
     clusterPipelineDesc.descriptorSetLayouts = {m_clusterSetLayout.get()};
     m_clusterCullingPipeline = device.CreatePipeline(clusterPipelineDesc);
 
-    return m_gbufferPipeline != nullptr && m_lightingPipeline != nullptr && m_clusterCullingPipeline != nullptr;
+    // The shadow pass only consumes positions but binds the same interleaved vertex buffers.
+    rhi::VertexLayout shadowVertexLayout{};
+    shadowVertexLayout.AddAttribute(0, rhi::Format::R32G32B32Sfloat);
+    shadowVertexLayout.SetBindingStride(vertexLayout.GetStride());
+
+    rhi::PipelineDesc shadowPipelineDesc{};
+    shadowPipelineDesc.vertexShader = m_shadowVertexShader.get();
+    shadowPipelineDesc.fragmentShader = m_shadowFragmentShader.get();
+    shadowPipelineDesc.vertexLayout = shadowVertexLayout;
+    shadowPipelineDesc.depthTest = true;
+    shadowPipelineDesc.depthWrite = true;
+    shadowPipelineDesc.depthBiasEnable = true;
+    shadowPipelineDesc.cullMode = rhi::CullMode::None;
+    shadowPipelineDesc.pushConstantSize = sizeof(ShadowPushConstants);
+    shadowPipelineDesc.pushConstantStages = rhi::ShaderStageMask::Vertex;
+    shadowPipelineDesc.descriptorSetLayouts = {m_shadowSetLayout.get()};
+    shadowPipelineDesc.depthFormat = rhi::Format::D32Sfloat;
+    m_shadowPipeline = device.CreatePipeline(shadowPipelineDesc);
+
+    return m_gbufferPipeline != nullptr && m_lightingPipeline != nullptr &&
+           m_clusterCullingPipeline != nullptr && m_shadowPipeline != nullptr;
 }
 
 bool DeferredRenderer::CreateScene()
@@ -956,8 +1200,69 @@ void DeferredRenderer::CreateLightingSets(rhi::Device& device)
         lightingSet->BindBuffer(4, *m_lightBuffers[frame]);
         lightingSet->BindBuffer(5, *m_clusterCountBuffers[frame]);
         lightingSet->BindBuffer(6, *m_clusterIndexBuffers[frame]);
+        lightingSet->BindBuffer(7, *m_shadowUniformBuffers[frame]);
+        lightingSet->BindTexture(8, *m_shadowMap, 0u);
+        lightingSet->BindSampler(9, *m_shadowSampler);
         m_lightingSets.push_back(std::move(lightingSet));
     }
+}
+
+bool DeferredRenderer::CreateShadowResources(rhi::Device& device)
+{
+    MRE_PROFILE_ZONE_N("CreateShadowResources");
+    MRE_ASSERT(m_shadowSetLayout != nullptr, "DeferredRenderer requires a shadow set layout");
+
+    const rhi::TextureDesc shadowMapDesc{
+        kShadowResolution,
+        kShadowResolution,
+        rhi::Format::D32Sfloat,
+        rhi::TextureUsage::DepthAttachment,
+        nullptr,
+        0,
+        kShadowCascadeCount};
+    m_shadowMap = device.CreateTexture(shadowMapDesc);
+    if (m_shadowMap == nullptr)
+    {
+        MRE_CRITICAL("Failed to create the shadow map array");
+        return false;
+    }
+
+    rhi::SamplerDesc samplerDesc{};
+    samplerDesc.minFilter = rhi::Filter::Linear;
+    samplerDesc.magFilter = rhi::Filter::Linear;
+    samplerDesc.addressModeU = rhi::AddressMode::ClampToEdge;
+    samplerDesc.addressModeV = rhi::AddressMode::ClampToEdge;
+    samplerDesc.compareEnable = true;
+    samplerDesc.compareOp = rhi::CompareOp::LessEqual;
+    m_shadowSampler = device.CreateSampler(samplerDesc);
+    if (m_shadowSampler == nullptr)
+    {
+        MRE_CRITICAL("Failed to create the shadow comparison sampler");
+        return false;
+    }
+
+    const std::uint32_t framesInFlight = device.GetFramesInFlight();
+    m_shadowUniformBuffers.clear();
+    m_shadowSets.clear();
+    m_shadowUniformBuffers.reserve(framesInFlight);
+    m_shadowSets.reserve(framesInFlight);
+
+    for (std::uint32_t frame = 0; frame < framesInFlight; ++frame)
+    {
+        m_shadowUniformBuffers.push_back(
+            device.CreateBuffer(rhi::BufferDesc{sizeof(ShadowUniform), rhi::BufferUsage::Uniform, true}));
+
+        std::unique_ptr<rhi::DescriptorSet> shadowSet = device.CreateDescriptorSet(*m_shadowSetLayout);
+        shadowSet->BindBuffer(0, *m_shadowUniformBuffers.back());
+        m_shadowSets.push_back(std::move(shadowSet));
+    }
+
+    MRE_INFO(
+        "Shadow map array created ({}x{}, {} cascades)",
+        kShadowResolution,
+        kShadowResolution,
+        kShadowCascadeCount);
+    return true;
 }
 
 bool DeferredRenderer::CreateClusterResources(rhi::Device& device)
@@ -1099,6 +1404,51 @@ void DeferredRenderer::UpdateUniforms(std::uint32_t frameIndex, const FrameView&
     m_clusterCountBuffers[frameIndex]->Write(
         m_zeroClusterCounts.data(),
         m_zeroClusterCounts.size() * sizeof(std::uint32_t));
+
+    UpdateShadowUniforms(frameIndex, view);
+}
+
+const Light* DeferredRenderer::FindShadowLight() const
+{
+    for (const Light& light : m_lights)
+    {
+        if (light.type == LightType::Directional && light.castShadows)
+        {
+            return &light;
+        }
+    }
+    return nullptr;
+}
+
+void DeferredRenderer::UpdateShadowUniforms(std::uint32_t frameIndex, const FrameView& view)
+{
+    MRE_ASSERT(frameIndex < m_shadowUniformBuffers.size(), "Frame index out of range");
+
+    m_shadowUniform = ShadowUniform{};
+
+    const Light* shadowLight = FindShadowLight();
+    if (m_shadowSettings.enabled && shadowLight != nullptr)
+    {
+        const std::vector<ShadowCascade> cascades =
+            ComputeShadowCascades(view, shadowLight->direction, m_shadowSettings);
+
+        for (std::size_t index = 0; index < cascades.size() && index < kShadowCascadeCount; ++index)
+        {
+            m_shadowUniform.lightViewProjection[index] = cascades[index].lightViewProjection;
+            if (index + 1 < cascades.size())
+            {
+                m_shadowUniform.cascadeSplits[static_cast<glm::length_t>(index)] = cascades[index].splitFar;
+            }
+        }
+
+        m_shadowUniform.params = glm::vec4{
+            m_shadowSettings.depthBias,
+            m_shadowSettings.normalBias,
+            cascades.empty() ? m_shadowSettings.distance : cascades.back().splitFar,
+            1.0f};
+    }
+
+    m_shadowUniformBuffers[frameIndex]->Write(&m_shadowUniform, sizeof(ShadowUniform));
 }
 
 std::uint32_t DeferredRenderer::GetSamplerIndex(rhi::AddressMode addressModeU, rhi::AddressMode addressModeV)

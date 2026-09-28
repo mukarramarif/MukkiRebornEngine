@@ -17,6 +17,13 @@ struct GpuLight
     float4 params; // x: type, y: inner cone cosine, z: outer cone cosine
 };
 
+struct ShadowUniform
+{
+    float4x4 lightViewProjection[4];
+    float4 cascadeSplits;
+    float4 params; // x: depthBias, y: normalBias, z: distance, w: enabled
+};
+
 [[vk::binding(0, 0)]] ConstantBuffer<SceneUniform> gScene;
 [[vk::binding(1, 0)]] Sampler2D gAlbedo;
 [[vk::binding(2, 0)]] Sampler2D gNormal;
@@ -24,11 +31,16 @@ struct GpuLight
 [[vk::binding(4, 0)]] StructuredBuffer<GpuLight> gLights;
 [[vk::binding(5, 0)]] StructuredBuffer<uint> gClusterCounts;
 [[vk::binding(6, 0)]] StructuredBuffer<uint> gClusterIndices;
+[[vk::binding(7, 0)]] ConstantBuffer<ShadowUniform> gShadow;
+[[vk::binding(8, 0)]] Texture2DArray gShadowMap;
+[[vk::binding(9, 0)]] SamplerComparisonState gShadowSampler;
 
 static const uint kMaxLightsPerCluster = 64;
 static const uint kLightTypeDirectional = 0;
 static const uint kLightTypePoint = 1;
 static const float kPi = 3.14159265359;
+static const float kShadowMapSize = 1024.0;
+static const float kShadowCompareBiasScale = 0.0002;
 
 float3 acesTonemap(float3 color)
 {
@@ -95,6 +107,63 @@ float distanceAttenuation(float distance, float range)
     return cutoff * cutoff / distanceSquared;
 }
 
+float sampleShadowFactor(float3 worldPosition, float3 normal)
+{
+    if (gShadow.params.w < 0.5)
+    {
+        return 1.0;
+    }
+
+    const float viewDepth = -mul(gScene.view, float4(worldPosition, 1.0)).z;
+    uint cascade = 0;
+    if (viewDepth > gShadow.cascadeSplits.x)
+    {
+        cascade = 1;
+    }
+    if (viewDepth > gShadow.cascadeSplits.y)
+    {
+        cascade = 2;
+    }
+    if (viewDepth > gShadow.cascadeSplits.z)
+    {
+        cascade = 3;
+    }
+
+    if (viewDepth > gShadow.params.z)
+    {
+        return 1.0;
+    }
+
+    const float3 offsetPosition = worldPosition + normal * gShadow.params.y;
+    const float4 lightClip = mul(gShadow.lightViewProjection[cascade], float4(offsetPosition, 1.0));
+    const float3 ndc = lightClip.xyz / max(abs(lightClip.w), 1e-6);
+    const float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+
+    if (any(uv < 0.0) || any(uv > 1.0) || ndc.z < 0.0 || ndc.z > 1.0)
+    {
+        return 1.0;
+    }
+
+    const float compareDepth = ndc.z - gShadow.params.x * kShadowCompareBiasScale;
+    const float2 texel = float2(1.0 / kShadowMapSize, 1.0 / kShadowMapSize);
+
+    float shadow = 0.0;
+    [unroll]
+    for (int y = -1; y <= 1; ++y)
+    {
+        [unroll]
+        for (int x = -1; x <= 1; ++x)
+        {
+            shadow += gShadowMap.SampleCmpLevelZero(
+                gShadowSampler,
+                float3(uv + float2(float(x), float(y)) * texel, float(cascade)),
+                compareDepth);
+        }
+    }
+
+    return shadow / 9.0;
+}
+
 uint clusterIndexOf(float3 worldPosition, float2 pixelCoord)
 {
     const float3 viewPosition = mul(gScene.view, float4(worldPosition, 1.0)).xyz;
@@ -134,6 +203,8 @@ float4 fragmentMain(VertexOutput input) : SV_Target
 
     float3 color = gScene.ambientColor.rgb * albedo;
 
+    const float shadowFactor = sampleShadowFactor(worldPosition.xyz, normal);
+
     const uint clusterIndex = clusterIndexOf(worldPosition.xyz, input.position.xy);
     const uint clusterBase = clusterIndex * kMaxLightsPerCluster;
     const uint clusterLightCount = min(gClusterCounts[clusterIndex], kMaxLightsPerCluster);
@@ -166,6 +237,7 @@ float4 fragmentMain(VertexOutput input) : SV_Target
         if (type == kLightTypeDirectional)
         {
             lightDirection = -light.directionIntensity.xyz;
+            radiance *= shadowFactor;
         }
         else
         {

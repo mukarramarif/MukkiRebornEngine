@@ -100,6 +100,7 @@ add_library(mukki_engine STATIC
     Renderer/Deferred/GBuffer.cpp
     Renderer/Lighting/ClusterGrid.cpp
     Renderer/Lighting/Light.cpp
+    Renderer/Lighting/ShadowCascade.cpp
     Renderer/RHI/Resources.cpp
     Scene/SceneBinary.cpp
     Scene/SceneDescription.cpp
@@ -177,6 +178,8 @@ if(MRE_BUILD_SANDBOX)
         Renderer/Shaders/lighting.vert.slang
         Renderer/Shaders/lighting.frag.slang
         Renderer/Shaders/cluster_culling.comp.slang
+        Renderer/Shaders/shadow.vert.slang
+        Renderer/Shaders/shadow.frag.slang
     )
 endif()
 

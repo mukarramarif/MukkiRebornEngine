@@ -5,7 +5,7 @@
     {
       "name": "Helmet",
       "model": "DamagedHelmet/glTF/DamagedHelmet.gltf",
-      "position": [0.0, 0.0, 0.0],
+      "position": [0.0, 2.0, 0.0],
       "rotation": [0.0, 0.0, 0.0],
       "scale": [1.2, 1.2, 1.2]
     },
@@ -19,35 +19,35 @@
     {
       "name": "Avocado",
       "model": "Avocado/glTF/Avocado.gltf",
-      "position": [3.0, 0.0, -1.5],
+      "position": [3.0, 2.0, -1.5],
       "rotation": [0.0, -30.0, 0.0],
       "scale": [0.7, 0.7, 0.7]
     },
     {
       "name": "BoomBox",
       "model": "BoomBox/glTF/BoomBox.gltf",
-      "position": [-2.5, 0.0, 2.5],
+      "position": [-2.5,2.0, 2.5],
       "rotation": [0.0, 135.0, 0.0],
       "scale": [0.8, 0.8, 0.8]
     },
     {
       "name": "Corset",
       "model": "Corset/glTF/Corset.gltf",
-      "position": [2.5, 0.0, 2.5],
+      "position": [2.5, 2.0, 2.5],
       "rotation": [0.0, -135.0, 0.0],
       "scale": [0.8, 0.8, 0.8]
     },
     {
       "name": "Lantern",
       "model": "Lantern/glTF/Lantern.gltf",
-      "position": [0.0, 0.0, 3.5],
+      "position": [0.0, 2.0, 3.5],
       "rotation": [0.0, 180.0, 0.0],
       "scale": [0.7, 0.7, 0.7]
     },
     {
       "name": "Fox",
       "model": "Fox/glTF/Fox.gltf",
-      "position": [0.0, 0.0, -3.5],
+      "position": [3.0, 2.0, -3.5],
       "rotation": [0.0, 180.0, 0.0],
       "scale": [0.8, 0.8, 0.8]
     }

@@ -10,12 +10,14 @@ VkTexture::VkTexture(
     vk::Image image,
     VmaAllocation allocation,
     vk::raii::ImageView view,
+    std::vector<vk::raii::ImageView> layerViews,
     const rhi::TextureDesc& desc,
     vk::ImageLayout layout)
     : m_allocator(allocator)
     , m_image(image)
     , m_allocation(allocation)
     , m_view(std::move(view))
+    , m_layerViews(std::move(layerViews))
     , m_layout(layout)
     , m_desc(desc)
 {
@@ -27,6 +29,7 @@ VkTexture::VkTexture(
 
 VkTexture::~VkTexture()
 {
+    m_layerViews.clear();
     m_view = vk::raii::ImageView{nullptr};
 
     if (m_image != nullptr && m_allocator != VK_NULL_HANDLE)

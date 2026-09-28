@@ -196,11 +196,32 @@ then loads only that bytecode:
 .\build\windows-debug\Debug\mukki_sandbox.exe --scene Sandbox\Scenes\demo.scene.json --frames 240
 ```
 
+### Shadows
+
+The renderer implements cascaded shadow maps for directional lights:
+
+- 4 cascades at 1024x1024 (`D32Sfloat`) with exponential/uniform blended splits, sphere-fitted
+  ortho projections and texel snapping to avoid shimmering.
+- The cascades are rendered in the shadow pass, recorded into secondary command buffers on worker
+  threads like the G-buffer pass.
+- The lighting pass selects the cascade by view depth and filters with hardware comparison
+  samplers (3x3 PCF), plus a whole-shadow-map normal bias.
+- The first directional light with `"castShadows": true` (JSON, default `true`) casts shadows.
+- Spot and point light shadows are not implemented yet.
+
+The `Scene` window exposes `Enabled`, `Distance`, `Depth bias` and `Normal bias` sliders for
+tuning, and the directional light editor has a `Casts shadows` checkbox.
+
 In the sandbox, the `Scenes` window browses and loads the JSON scenes found in `Sandbox/Scenes`
-(with a global transform scale). The `Scene` window lists the loaded objects and lights; selecting a
-light opens a `Type` dropdown (directional/point/spot) plus position, direction, color, `Strength`,
-range and cone controls. `Reload JSON -> bytecode` recompiles the source file, `Compile bytecode`
-writes the current in-memory edits to `<exe>\scenes\<name>.mres`, and `Save JSON` dumps them back to
+(with a global transform scale). The `Scene` window lists the loaded objects and lights:
+
+- Selecting an object lets you edit its position, rotation (degrees, YXZ) and scale; the change is
+  applied to the renderer immediately.
+- Selecting a light opens a `Type` dropdown (directional/point/spot) plus position, direction,
+  color, `Strength`, range and cone controls.
+
+`Reload JSON -> bytecode` recompiles the source file, `Compile bytecode` writes the current
+in-memory edits to `<exe>\scenes\<name>.mres`, and `Save JSON` dumps them back to
 `<exe>\scenes\<name>.json`.
 
 ## Layout

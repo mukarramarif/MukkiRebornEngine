@@ -30,7 +30,8 @@ constexpr const char* kSceneText = R"({
       "type": "directional",
       "direction": [0.0, -1.0, 0.0],
       "color": [1.0, 0.9, 0.8],
-      "intensity": 3.0
+      "intensity": 3.0,
+      "castShadows": false
     },
     {
       "name": "Bulb",
@@ -85,9 +86,11 @@ TEST(SceneJson, ParsesObjectsAndLights)
     EXPECT_EQ(scene.lights[0].light.type, mukki::LightType::Directional);
     EXPECT_FLOAT_EQ(scene.lights[0].light.direction.y, -1.0f);
     EXPECT_FLOAT_EQ(scene.lights[0].light.intensity, 3.0f);
+    EXPECT_FALSE(scene.lights[0].light.castShadows);
 
     EXPECT_EQ(scene.lights[1].light.type, mukki::LightType::Point);
     EXPECT_FLOAT_EQ(scene.lights[1].light.range, 8.0f);
+    EXPECT_TRUE(scene.lights[1].light.castShadows);
 
     EXPECT_EQ(scene.lights[2].light.type, mukki::LightType::Spot);
     EXPECT_NEAR(scene.lights[2].light.innerConeAngle, 20.0f * kRadiansPerDegree, 1e-6f);
@@ -123,6 +126,7 @@ TEST(SceneJson, RoundTripsThroughSerialization)
     {
         EXPECT_EQ(reloaded.lights[index].name, scene.lights[index].name);
         EXPECT_EQ(reloaded.lights[index].light.type, scene.lights[index].light.type);
+        EXPECT_EQ(reloaded.lights[index].light.castShadows, scene.lights[index].light.castShadows);
         EXPECT_FLOAT_EQ(reloaded.lights[index].light.intensity, scene.lights[index].light.intensity);
         EXPECT_NEAR(
             reloaded.lights[index].light.outerConeAngle,

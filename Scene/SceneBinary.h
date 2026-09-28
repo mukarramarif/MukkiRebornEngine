@@ -18,7 +18,7 @@ class SceneBinary
 {
 public:
     static constexpr std::uint32_t kMagic = 0x5345524Du; // "MRES"
-    static constexpr std::uint32_t kVersion = 1;
+    static constexpr std::uint32_t kVersion = 2;         // v2 adds Light::castShadows
 
     [[nodiscard]] static std::vector<std::byte> Encode(const SceneDescription& scene);
 

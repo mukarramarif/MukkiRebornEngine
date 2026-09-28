@@ -22,7 +22,8 @@ vk::ImageMemoryBarrier2 MakeImageBarrier(
     vk::PipelineStageFlags2 srcStage,
     vk::AccessFlags2 srcAccess,
     vk::PipelineStageFlags2 dstStage,
-    vk::AccessFlags2 dstAccess)
+    vk::AccessFlags2 dstAccess,
+    std::uint32_t layerCount = 1)
 {
     vk::ImageMemoryBarrier2 barrier{};
     barrier.srcStageMask = srcStage;
@@ -39,7 +40,7 @@ vk::ImageMemoryBarrier2 MakeImageBarrier(
                                    .setBaseMipLevel(0)
                                    .setLevelCount(1)
                                    .setBaseArrayLayer(0)
-                                   .setLayerCount(1);
+                                   .setLayerCount(layerCount);
     return barrier;
 }
 
@@ -186,8 +187,10 @@ std::unique_ptr<rhi::Texture> VkResourceAllocator::CreateTexture(const rhi::Text
     MRE_ASSERT(m_allocator != VK_NULL_HANDLE, "VkResourceAllocator::CreateTexture called before Init");
     MRE_ASSERT(desc.width > 0 && desc.height > 0, "Texture dimensions must be greater than zero");
     MRE_ASSERT(desc.format != rhi::Format::Undefined, "Texture format must be defined");
+    MRE_ASSERT(desc.arrayLayers > 0, "Texture layer count must be greater than zero");
 
     const bool hasData = desc.initialData != nullptr && desc.initialDataSize > 0;
+    MRE_ASSERT(!hasData || desc.arrayLayers == 1, "Initial data is only supported for single-layer textures");
     const bool isDepth = desc.usage == rhi::TextureUsage::DepthAttachment;
     const vk::ImageAspectFlags aspect = isDepth ? vk::ImageAspectFlagBits::eDepth : vk::ImageAspectFlagBits::eColor;
 
@@ -213,7 +216,7 @@ std::unique_ptr<rhi::Texture> VkResourceAllocator::CreateTexture(const rhi::Text
     imageInfo.format = ToVkFormat(desc.format);
     imageInfo.extent = vk::Extent3D{desc.width, desc.height, 1};
     imageInfo.mipLevels = 1;
-    imageInfo.arrayLayers = 1;
+    imageInfo.arrayLayers = desc.arrayLayers;
     imageInfo.samples = vk::SampleCountFlagBits::e1;
     imageInfo.tiling = vk::ImageTiling::eOptimal;
     imageInfo.usage = usage;
@@ -316,20 +319,69 @@ std::unique_ptr<rhi::Texture> VkResourceAllocator::CreateTexture(const rhi::Text
         vmaDestroyBuffer(m_allocator, stagingBuffer, stagingAllocation);
         layout = vk::ImageLayout::eShaderReadOnlyOptimal;
     }
+    else if (isDepth)
+    {
+        // Depth targets are sampled by later passes (shadow maps, depth debug views); start them in
+        // a shader readable layout so they can be bound before their first render pass.
+        ImmediateSubmit([&](vk::CommandBuffer commandBuffer) {
+            const vk::ImageMemoryBarrier2 toShaderRead = MakeImageBarrier(
+                image,
+                vk::ImageLayout::eUndefined,
+                vk::ImageLayout::eShaderReadOnlyOptimal,
+                aspect,
+                vk::PipelineStageFlagBits2::eNone,
+                vk::AccessFlagBits2::eNone,
+                vk::PipelineStageFlagBits2::eFragmentShader,
+                vk::AccessFlagBits2::eShaderSampledRead,
+                desc.arrayLayers);
+            commandBuffer.pipelineBarrier2(vk::DependencyInfo{}.setImageMemoryBarriers(toShaderRead));
+        });
+        layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+    }
 
     const vk::ImageViewCreateInfo viewInfo = vk::ImageViewCreateInfo{}
                                                  .setImage(image)
-                                                 .setViewType(vk::ImageViewType::e2D)
+                                                 .setViewType(
+                                                     desc.arrayLayers > 1 ? vk::ImageViewType::e2DArray
+                                                                          : vk::ImageViewType::e2D)
                                                  .setFormat(ToVkFormat(desc.format))
                                                  .setSubresourceRange(vk::ImageSubresourceRange{}
                                                                           .setAspectMask(aspect)
                                                                           .setBaseMipLevel(0)
                                                                           .setLevelCount(1)
                                                                           .setBaseArrayLayer(0)
-                                                                          .setLayerCount(1));
+                                                                          .setLayerCount(desc.arrayLayers));
     vk::raii::ImageView view{*m_device, viewInfo};
 
-    return std::make_unique<VkTexture>(m_allocator, image, allocation, std::move(view), desc, layout);
+    // Depth arrays are rendered one layer at a time, which needs per-layer views.
+    std::vector<vk::raii::ImageView> layerViews{};
+    if (isDepth && desc.arrayLayers > 1)
+    {
+        layerViews.reserve(desc.arrayLayers);
+        for (std::uint32_t layer = 0; layer < desc.arrayLayers; ++layer)
+        {
+            const vk::ImageViewCreateInfo layerViewInfo = vk::ImageViewCreateInfo{}
+                                                              .setImage(image)
+                                                              .setViewType(vk::ImageViewType::e2D)
+                                                              .setFormat(ToVkFormat(desc.format))
+                                                              .setSubresourceRange(vk::ImageSubresourceRange{}
+                                                                                       .setAspectMask(aspect)
+                                                                                       .setBaseMipLevel(0)
+                                                                                       .setLevelCount(1)
+                                                                                       .setBaseArrayLayer(layer)
+                                                                                       .setLayerCount(1));
+            layerViews.emplace_back(*m_device, layerViewInfo);
+        }
+    }
+
+    return std::make_unique<VkTexture>(
+        m_allocator,
+        image,
+        allocation,
+        std::move(view),
+        std::move(layerViews),
+        desc,
+        layout);
 }
 
 void VkResourceAllocator::ImmediateSubmit(const std::function<void(vk::CommandBuffer)>& record)

@@ -51,6 +51,7 @@ public:
     void DrawIndexed(std::uint32_t indexCount, std::uint32_t firstIndex) override;
     void Dispatch(std::uint32_t groupCountX, std::uint32_t groupCountY, std::uint32_t groupCountZ) override;
     void ShaderMemoryBarrier(rhi::ShaderStageMask before, rhi::ShaderStageMask after) override;
+    void SetDepthBias(float constantFactor, float slopeFactor, float clamp) override;
     void BeginGpuZone(const char* name) override;
     void EndGpuZone() override;
 

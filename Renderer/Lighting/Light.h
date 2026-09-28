@@ -25,6 +25,7 @@ struct Light
     float range = 10.0f;
     float innerConeAngle = 0.0f;
     float outerConeAngle = 0.7853981634f;
+    bool castShadows = true; // only used by the first directional light with shadows enabled
 };
 
 // GPU layout shared with the shaders. Every member is a float4 so the std430 offsets match the

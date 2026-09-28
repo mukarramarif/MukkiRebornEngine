@@ -60,7 +60,9 @@ VkPipeline::VkPipeline(const vk::raii::Device& device, const rhi::PipelineDesc& 
 
     MRE_ASSERT(desc.vertexShader != nullptr, "PipelineDesc requires a vertex shader");
     MRE_ASSERT(desc.fragmentShader != nullptr, "PipelineDesc requires a fragment shader");
-    MRE_ASSERT(!desc.colorFormats.empty(), "PipelineDesc requires at least one color format");
+    MRE_ASSERT(
+        !desc.colorFormats.empty() || desc.depthFormat != rhi::Format::Undefined,
+        "PipelineDesc requires at least one color format or a depth format");
 
     const auto* vertexShader = static_cast<const VkShader*>(desc.vertexShader);
     const auto* fragmentShader = static_cast<const VkShader*>(desc.fragmentShader);
@@ -110,7 +112,10 @@ VkPipeline::VkPipeline(const vk::raii::Device& device, const rhi::PipelineDesc& 
                                                                             .setTopology(vk::PrimitiveTopology::eTriangleList)
                                                                             .setPrimitiveRestartEnable(false);
 
-    const std::array<vk::DynamicState, 2> dynamicStates{vk::DynamicState::eViewport, vk::DynamicState::eScissor};
+    const std::array<vk::DynamicState, 3> dynamicStates{
+        vk::DynamicState::eViewport,
+        vk::DynamicState::eScissor,
+        vk::DynamicState::eDepthBias};
     const vk::PipelineDynamicStateCreateInfo dynamicState = vk::PipelineDynamicStateCreateInfo{}.setDynamicStates(
         dynamicStates);
 
@@ -125,7 +130,10 @@ VkPipeline::VkPipeline(const vk::raii::Device& device, const rhi::PipelineDesc& 
             .setPolygonMode(vk::PolygonMode::eFill)
             .setCullMode(ToVkCullMode(desc.cullMode))
             .setFrontFace(vk::FrontFace::eCounterClockwise)
-            .setDepthBiasEnable(false)
+            .setDepthBiasEnable(desc.depthBiasEnable)
+            .setDepthBiasConstantFactor(desc.depthBiasConstant)
+            .setDepthBiasSlopeFactor(desc.depthBiasSlope)
+            .setDepthBiasClamp(desc.depthBiasClamp)
             .setLineWidth(1.0f);
 
     const vk::PipelineMultisampleStateCreateInfo multisampleState = vk::PipelineMultisampleStateCreateInfo{}

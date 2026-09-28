@@ -73,6 +73,22 @@ bool ReadString(const Json& node, const char* key, std::string& out, bool requir
     return true;
 }
 
+bool ReadBool(const Json& node, const char* key, bool& out, std::string& error)
+{
+    const auto it = node.find(key);
+    if (it == node.end())
+    {
+        return true;
+    }
+    if (!it->is_boolean())
+    {
+        error = std::string{"'"} + key + "' must be a boolean";
+        return false;
+    }
+    out = it->get<bool>();
+    return true;
+}
+
 bool ReadFloat(const Json& node, const char* key, float& out, std::string& error)
 {
     const auto it = node.find(key);
@@ -246,7 +262,8 @@ bool SceneJson::Parse(
                 !ReadFloat(node, "intensity", sceneLight.light.intensity, entryError) ||
                 !ReadFloat(node, "range", sceneLight.light.range, entryError) ||
                 !ReadFloat(node, "innerConeAngle", sceneLight.light.innerConeAngle, entryError) ||
-                !ReadFloat(node, "outerConeAngle", sceneLight.light.outerConeAngle, entryError))
+                !ReadFloat(node, "outerConeAngle", sceneLight.light.outerConeAngle, entryError) ||
+                !ReadBool(node, "castShadows", sceneLight.light.castShadows, entryError))
             {
                 error = Indexed("lights", index, std::move(entryError));
                 return false;
@@ -315,6 +332,7 @@ std::string SceneJson::Serialize(const SceneDescription& scene)
         {
         case LightType::Directional:
             node["direction"] = Vec3ToJson(light.direction);
+            node["castShadows"] = light.castShadows;
             break;
         case LightType::Point:
             node["position"] = Vec3ToJson(light.position);

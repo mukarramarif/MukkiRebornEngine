@@ -39,8 +39,13 @@ must not expose backend types, and Vulkan types may only appear under `Renderer/
   `DeferredRenderer::SetLights` into an exponential-slice cluster grid, and the lighting pass iterates
   the per-cluster light lists with a Cook-Torrance BRDF. Directional, point and spot lights are
   supported; lights are uploaded as an SSBO (`GpuLight`, packed float4s). `SetClusterDebugView`
-  renders a light-count heatmap for debugging. Shadows (CSM and spot shadow maps) are not implemented
-  yet.
+  renders a light-count heatmap for debugging.
+- Shadows: cascaded shadow maps (`Renderer/Lighting/ShadowCascade.h`, 4x1024 `D32Sfloat` array) for
+  the first directional `Light` with `castShadows`. The shadow pass renders each cascade into its
+  own array layer using per-layer depth views and secondary command buffers; depth-only dynamic
+  rendering, comparison samplers, depth bias and dynamic depth bias are supported by the RHI. The
+  lighting pass does 3x3 hardware PCF with a normal bias from `ShadowSettings` (UI-adjustable).
+  Spot/point shadows are not implemented yet.
 - Profiling: Tracy (on-demand). Use the `MRE_PROFILE_*` macros from `Utilities/Profiling.h` for CPU
   zones and `rhi::CommandList::BeginGpuZone/EndGpuZone` for GPU pass zones. Enabled via the
   `*-tracy` CMake presets (`MRE_ENABLE_TRACY=ON`, `VCPKG_MANIFEST_FEATURES=tracy`); connect with the

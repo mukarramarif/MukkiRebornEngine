@@ -151,6 +151,7 @@ std::vector<std::byte> SceneBinary::Encode(const SceneDescription& scene)
         writer.F32(light.range);
         writer.F32(light.innerConeAngle);
         writer.F32(light.outerConeAngle);
+        writer.U32(light.castShadows ? 1u : 0u);
     }
 
     return writer.Take();
@@ -223,10 +224,12 @@ bool SceneBinary::Decode(std::span<const std::byte> data, SceneDescription& scen
     {
         SceneLight sceneLight{};
         std::uint32_t type = 0;
+        std::uint32_t castShadows = 1;
         if (!reader.String(sceneLight.name) || !reader.U32(type) || !reader.Vec3(sceneLight.light.position) ||
             !reader.Vec3(sceneLight.light.direction) || !reader.Vec3(sceneLight.light.color) ||
             !reader.F32(sceneLight.light.intensity) || !reader.F32(sceneLight.light.range) ||
-            !reader.F32(sceneLight.light.innerConeAngle) || !reader.F32(sceneLight.light.outerConeAngle))
+            !reader.F32(sceneLight.light.innerConeAngle) || !reader.F32(sceneLight.light.outerConeAngle) ||
+            !reader.U32(castShadows))
         {
             error = "scene binary is truncated while reading lights";
             return false;
@@ -237,6 +240,7 @@ bool SceneBinary::Decode(std::span<const std::byte> data, SceneDescription& scen
             return false;
         }
         sceneLight.light.type = static_cast<LightType>(type);
+        sceneLight.light.castShadows = castShadows != 0;
         result.lights.push_back(std::move(sceneLight));
     }
 

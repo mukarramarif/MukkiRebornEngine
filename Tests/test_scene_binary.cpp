@@ -35,6 +35,7 @@ mukki::SceneDescription MakeScene()
     sun.light.direction = glm::vec3{0.0f, -1.0f, 0.0f};
     sun.light.color = glm::vec3{1.0f, 0.9f, 0.8f};
     sun.light.intensity = 2.5f;
+    sun.light.castShadows = false;
     scene.lights.push_back(sun);
 
     mukki::SceneLight spot{};
@@ -74,6 +75,8 @@ TEST(SceneBinary, RoundTrips)
     ASSERT_EQ(decoded.lights.size(), scene.lights.size());
     EXPECT_EQ(decoded.lights[0].light.type, mukki::LightType::Directional);
     EXPECT_FLOAT_EQ(decoded.lights[0].light.intensity, scene.lights[0].light.intensity);
+    EXPECT_FALSE(decoded.lights[0].light.castShadows);
+    EXPECT_TRUE(decoded.lights[1].light.castShadows);
     EXPECT_EQ(decoded.lights[1].light.type, mukki::LightType::Spot);
     EXPECT_FLOAT_EQ(decoded.lights[1].light.range, scene.lights[1].light.range);
     EXPECT_FLOAT_EQ(decoded.lights[1].light.outerConeAngle, scene.lights[1].light.outerConeAngle);

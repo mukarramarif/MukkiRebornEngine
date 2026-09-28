@@ -20,6 +20,7 @@ struct DepthAttachment
     const Texture* texture = nullptr;
     float clearDepth = 1.0f;
     bool clear = true;
+    std::uint32_t layer = 0;
 };
 
 struct RenderingDesc
@@ -57,6 +58,10 @@ public:
     // Memory dependency between shader stages, used when compute-produced storage data is read by
     // a later stage within the same command buffer.
     virtual void ShaderMemoryBarrier(ShaderStageMask before, ShaderStageMask after) = 0;
+
+    // Dynamic depth bias for the currently bound graphics pipeline. Pipelines must be created with
+    // depthBiasEnable for the values to take effect.
+    virtual void SetDepthBias(float constantFactor, float slopeFactor, float clamp = 0.0f) = 0;
 
     // GPU timestamp zone markers, used by profilers such as Tracy. Zone names must remain
     // valid for the duration of the recording scope and zones must be balanced pairs.

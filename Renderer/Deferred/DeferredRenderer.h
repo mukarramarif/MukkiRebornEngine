@@ -17,8 +17,10 @@
 #include "Assets/AsyncGltfLoader.h"
 #include "Renderer/BufferManager.h"
 #include "Renderer/Deferred/GBuffer.h"
+#include "Renderer/FrameView.h"
 #include "Renderer/Lighting/ClusterGrid.h"
 #include "Renderer/Lighting/Light.h"
+#include "Renderer/Lighting/ShadowCascade.h"
 #include "Renderer/RHI/Resources.h"
 
 namespace mukki
@@ -45,18 +47,6 @@ struct ClusterUniform
     glm::vec4 clusterParams{0.0f}; // x: tile size, y: z slice count
     glm::uvec4 grid{0u};           // x, y, z grid dimensions, w: light count
     glm::uvec4 screen{0u};         // x: width, y: height
-};
-
-struct FrameView
-{
-    glm::mat4 view{1.0f};
-    glm::mat4 projection{1.0f};
-    glm::mat4 viewProjection{1.0f};
-    glm::vec3 position{0.0f};
-    float fovYRadians = 1.0471975512f;
-    float aspectRatio = 16.0f / 9.0f;
-    float nearPlane = 0.1f;
-    float farPlane = 1000.0f;
 };
 
 struct ObjectPushConstants
@@ -98,9 +88,19 @@ public:
     void SetModelScale(float scale);
     [[nodiscard]] float GetModelScale() const { return m_modelScale; }
 
+    // Updates the transform of a scene object instantiated by LoadScene. Object indices follow the
+    // order of SceneDescription::objects.
+    void UpdateSceneObjectTransform(std::size_t objectIndex, const glm::mat4& transform);
+    [[nodiscard]] std::size_t GetSceneObjectCount() const { return m_objectInstances.size(); }
+
     // Replaces the lit image with a heatmap of the clustered light counts for debugging.
     void SetClusterDebugView(bool enabled) { m_clusterDebugView = enabled; }
     [[nodiscard]] bool IsClusterDebugViewEnabled() const { return m_clusterDebugView; }
+
+    // Directional cascaded shadow map settings. Shadows come from the first directional light that
+    // has Light::castShadows set.
+    void SetShadowSettings(const ShadowSettings& settings) { m_shadowSettings = settings; }
+    [[nodiscard]] const ShadowSettings& GetShadowSettings() const { return m_shadowSettings; }
 
     bool LoadModel(const std::filesystem::path& path);
     void RequestModelLoad(const std::filesystem::path& path);
@@ -151,11 +151,46 @@ private:
         std::uint64_t triangleCount = 0;
     };
 
+    struct SceneObjectInstance
+    {
+        std::size_t modelIndex = 0;
+        std::size_t firstDrawItem = 0;
+        std::size_t drawItemCount = 0;
+        glm::mat4 transform{1.0f};
+    };
+
+    struct ShadowPushConstants
+    {
+        ObjectPushConstants object{};
+        std::uint32_t cascadeIndex = 0;
+    };
+
+    struct ShadowUniform
+    {
+        glm::mat4 lightViewProjection[kShadowCascadeCount]{};
+        glm::vec4 cascadeSplits{0.0f}; // x, y, z: split distances between cascades
+        glm::vec4 params{0.0f};        // x: depthBias, y: normalBias, z: distance, w: enabled
+    };
+
     bool CreatePipelines(rhi::Device& device, const std::filesystem::path& shaderDirectory);
     bool CreateScene();
     bool CreateClusterResources(rhi::Device& device);
+    bool CreateShadowResources(rhi::Device& device);
     void CreateLightingSets(rhi::Device& device);
     void UpdateUniforms(std::uint32_t frameIndex, const FrameView& view);
+    void UpdateShadowUniforms(std::uint32_t frameIndex, const FrameView& view);
+    [[nodiscard]] const Light* FindShadowLight() const;
+    [[nodiscard]] std::uint32_t RecordShadowSecondaries(
+        std::uint32_t frameIndex,
+        const std::vector<const DrawItem*>& items);
+    void RecordShadowBatch(
+        std::uint32_t frameIndex,
+        const std::vector<const DrawItem*>& items,
+        std::size_t begin,
+        std::size_t end,
+        std::uint32_t cascadeIndex,
+        rhi::CommandList& secondary,
+        const rhi::RenderingDesc& desc);
     void ApplyModelScale();
     [[nodiscard]] std::optional<std::size_t> UploadModel(const std::filesystem::path& path, GltfModel& model);
     [[nodiscard]] std::optional<std::size_t> LoadModelResources(const std::filesystem::path& path);
@@ -191,6 +226,12 @@ private:
     std::unique_ptr<rhi::DescriptorSetLayout> m_bindlessSetLayout{};
     std::unique_ptr<rhi::DescriptorSetLayout> m_lightingSetLayout{};
     std::unique_ptr<rhi::DescriptorSetLayout> m_clusterSetLayout{};
+    std::unique_ptr<rhi::DescriptorSetLayout> m_shadowSetLayout{};
+    std::unique_ptr<rhi::Texture> m_shadowMap{};
+    std::unique_ptr<rhi::Sampler> m_shadowSampler{};
+    std::vector<std::unique_ptr<rhi::DescriptorSet>> m_shadowSets{};
+    std::vector<std::unique_ptr<rhi::Buffer>> m_shadowUniformBuffers{};
+    std::vector<std::vector<std::unique_ptr<rhi::CommandList>>> m_shadowSecondaries{};
     std::unique_ptr<rhi::DescriptorSet> m_bindlessSet{};
     std::vector<std::unique_ptr<rhi::DescriptorSet>> m_sceneSets{};
     std::vector<std::unique_ptr<rhi::DescriptorSet>> m_lightingSets{};
@@ -200,14 +241,18 @@ private:
     std::unique_ptr<rhi::Shader> m_lightingVertexShader{};
     std::unique_ptr<rhi::Shader> m_lightingFragmentShader{};
     std::unique_ptr<rhi::Shader> m_clusterCullingShader{};
+    std::unique_ptr<rhi::Shader> m_shadowVertexShader{};
+    std::unique_ptr<rhi::Shader> m_shadowFragmentShader{};
     std::unique_ptr<rhi::Pipeline> m_gbufferPipeline{};
     std::unique_ptr<rhi::Pipeline> m_lightingPipeline{};
     std::unique_ptr<rhi::Pipeline> m_clusterCullingPipeline{};
+    std::unique_ptr<rhi::Pipeline> m_shadowPipeline{};
     std::vector<DrawItem> m_sceneDrawItems{};
     std::vector<DrawItem> m_modelDrawItems{};
     std::vector<glm::mat4> m_modelBaseTransforms{};
     std::vector<std::unique_ptr<ModelResources>> m_models{};
     std::unordered_map<std::string, std::size_t> m_modelCache{};
+    std::vector<SceneObjectInstance> m_objectInstances{};
     std::vector<std::vector<std::unique_ptr<rhi::CommandList>>> m_gbufferSecondaries{};
     std::vector<std::unique_ptr<rhi::Buffer>> m_lightBuffers{};
     std::vector<std::unique_ptr<rhi::Buffer>> m_clusterUniformBuffers{};
@@ -218,6 +263,8 @@ private:
     std::vector<std::uint32_t> m_zeroClusterCounts{};
     SceneUniform m_sceneUniform{};
     ClusterUniform m_clusterUniform{};
+    ShadowUniform m_shadowUniform{};
+    ShadowSettings m_shadowSettings{};
     ClusterGrid m_clusterGrid{};
     std::string m_modelName{};
     std::uint64_t m_modelVertexCount = 0;
