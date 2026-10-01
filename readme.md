@@ -255,7 +255,7 @@ clustered lights:
   lighting pass blends the surrounding probes by inverse distance, and the per-pixel trace/denoiser
   is skipped while probes are active (`Use probes for GI`) so the indirect lighting is not counted
   twice. Place several probes around the scene for smooth indirect; they update every frame and
-  follow the objects when moved.
+  reset their accumulation when moved.
 - A hand-rolled SVGF denoiser accumulates edge-aware temporally (depth, normal, luminance and
   hit-distance rejection, variance from the first two moments), then runs 4 iterations of a
   depth/normal/roughness-aware a-trous filter and a joint bilateral upsample back to full
