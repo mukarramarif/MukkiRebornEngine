@@ -10,6 +10,8 @@ namespace mukki::rhi
 
 Buffer::~Buffer() = default;
 
+AccelerationStructure::~AccelerationStructure() = default;
+
 Texture::~Texture() = default;
 
 Sampler::~Sampler() = default;

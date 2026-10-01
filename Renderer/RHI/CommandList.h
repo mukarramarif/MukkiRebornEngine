@@ -74,6 +74,13 @@ public:
     // depthBiasEnable for the values to take effect.
     virtual void SetDepthBias(float constantFactor, float slopeFactor, float clamp = 0.0f) = 0;
 
+    // Records an acceleration structure build (ray tracing). Must be followed by
+    // AccelerationStructureBarrier before the structure is traced.
+    virtual void BuildAccelerationStructure(const AccelerationStructure& accelerationStructure) = 0;
+
+    // Memory dependency between acceleration structure builds and ray tracing reads.
+    virtual void AccelerationStructureBarrier() = 0;
+
     // GPU timestamp zone markers, used by profilers such as Tracy. Zone names must remain
     // valid for the duration of the recording scope and zones must be balanced pairs.
     virtual void BeginGpuZone(const char* name) = 0;

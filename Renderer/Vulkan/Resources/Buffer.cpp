@@ -12,11 +12,13 @@ VkBuffer::VkBuffer(
     vk::Buffer buffer,
     VmaAllocation allocation,
     std::uint64_t size,
-    bool hostVisible)
+    bool hostVisible,
+    std::uint64_t deviceAddress)
     : m_allocator(allocator)
     , m_buffer(buffer)
     , m_allocation(allocation)
     , m_size(size)
+    , m_deviceAddress(deviceAddress)
     , m_hostVisible(hostVisible)
 {
     MRE_ASSERT(m_buffer != nullptr, "VkBuffer requires a valid buffer handle");

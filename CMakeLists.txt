@@ -112,8 +112,10 @@ add_library(mukki_engine STATIC
     Renderer/Vulkan/Core/VkDevice.cpp
     Renderer/Vulkan/Core/VkInstance.cpp
     Renderer/Vulkan/Core/VkPipeline.cpp
+    Renderer/Vulkan/Core/VkRayTracingDispatch.cpp
     Renderer/Vulkan/Core/VkShader.cpp
     Renderer/Vulkan/Core/VkSwapchain.cpp
+    Renderer/Vulkan/Resources/AccelerationStructure.cpp
     Renderer/Vulkan/Resources/Buffer.cpp
     Renderer/Vulkan/Resources/DescriptorSet.cpp
     Renderer/Vulkan/Resources/ResourceAllocator.cpp

@@ -152,6 +152,8 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
     static_cast<void>(GetSamplerIndex(rhi::AddressMode::ClampToEdge, rhi::AddressMode::ClampToEdge));
 
     const std::uint32_t framesInFlight = device.GetFramesInFlight();
+    m_tlas.resize(framesInFlight);
+    m_geometryDataBuffers.resize(framesInFlight);
     m_uniformBuffers.reserve(framesInFlight);
     m_sceneSets.reserve(framesInFlight);
     for (std::uint32_t frame = 0; frame < framesInFlight; ++frame)
@@ -226,6 +228,12 @@ void DeferredRenderer::Shutdown()
     m_sceneDrawItems.clear();
     m_gbufferSecondaries.clear();
     m_shadowSecondaries.clear();
+    m_tlas.clear();
+    m_geometryDataBuffers.clear();
+    m_geometryData.clear();
+    m_planeBlas.reset();
+    m_tlasInstanceCount = 0;
+    m_blasDirty = false;
     m_shadowMap.reset();
     m_spotShadowMap.reset();
     m_pointShadowMap.reset();
@@ -502,22 +510,38 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
         resources->materials.push_back(std::move(material));
     }
 
+    const bool rayTracingSupported = m_device->IsRayTracingSupported();
     resources->vertexBuffers.reserve(model.primitives.size());
     resources->indexBuffers.reserve(model.primitives.size());
+    resources->accelerationStructures.reserve(model.primitives.size());
     for (const GltfPrimitive& primitive : model.primitives)
     {
         const std::uint64_t vertexBytes = sizeof(GltfVertex) * primitive.vertices.size();
         const std::uint64_t indexBytes = sizeof(std::uint32_t) * primitive.indices.size();
 
         resources->vertexBuffers.push_back(m_device->CreateBuffer(
-            rhi::BufferDesc{vertexBytes, rhi::BufferUsage::Vertex, false},
+            rhi::BufferDesc{vertexBytes, rhi::BufferUsage::Vertex, false, rayTracingSupported},
             primitive.vertices.data(),
             vertexBytes));
         resources->indexBuffers.push_back(m_device->CreateBuffer(
-            rhi::BufferDesc{indexBytes, rhi::BufferUsage::Index, false},
+            rhi::BufferDesc{indexBytes, rhi::BufferUsage::Index, false, rayTracingSupported},
             primitive.indices.data(),
             indexBytes));
+
+        if (rayTracingSupported)
+        {
+            const rhi::BottomLevelAccelerationStructureDesc blasDesc{
+                resources->vertexBuffers.back().get(),
+                static_cast<std::uint32_t>(sizeof(GltfVertex)),
+                static_cast<std::uint32_t>(primitive.vertices.size()),
+                resources->indexBuffers.back().get(),
+                static_cast<std::uint32_t>(primitive.indices.size()),
+                true};
+            resources->accelerationStructures.push_back(
+                m_device->CreateBottomLevelAccelerationStructure(blasDesc));
+        }
     }
+    m_blasDirty = true;
 
     for (const GltfNode& node : model.nodes)
     {
@@ -536,6 +560,10 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
             item.indexCount = static_cast<std::uint32_t>(primitive.indices.size());
             item.firstIndex = 0;
             item.pushConstants.model = fit * node.worldTransform;
+            if (primitiveIndex < resources->accelerationStructures.size())
+            {
+                item.blas = resources->accelerationStructures[primitiveIndex].get();
+            }
 
             const std::uint32_t whiteIndex = m_whiteTexture->GetBindlessIndex();
             item.pushConstants.textureIndices = glm::uvec2{whiteIndex, whiteIndex};
@@ -704,6 +732,7 @@ void DeferredRenderer::ClearModels()
 {
     m_modelCache.clear();
     m_models.clear();
+    m_blasDirty = true;
 }
 
 void DeferredRenderer::UnloadModel()
@@ -725,6 +754,118 @@ void DeferredRenderer::SetModelScale(float scale)
     MRE_ASSERT(scale > 0.0f, "Model scale must be greater than zero");
     m_modelScale = std::clamp(scale, 0.01f, 100.0f);
     ApplyModelScale();
+}
+
+void DeferredRenderer::BuildAccelerationStructures(rhi::CommandList& commandList, std::uint32_t frameIndex)
+{
+    MRE_PROFILE_ZONE_N("BuildAccelerationStructures");
+
+    if (!m_device->IsRayTracingSupported())
+    {
+        return;
+    }
+
+    if (m_blasDirty)
+    {
+        for (const std::unique_ptr<ModelResources>& model : m_models)
+        {
+            for (const std::unique_ptr<rhi::AccelerationStructure>& blas : model->accelerationStructures)
+            {
+                if (blas != nullptr)
+                {
+                    commandList.BuildAccelerationStructure(*blas);
+                }
+            }
+        }
+        if (m_planeBlas != nullptr)
+        {
+            commandList.BuildAccelerationStructure(*m_planeBlas);
+        }
+        commandList.AccelerationStructureBarrier();
+        m_blasDirty = false;
+    }
+
+    MRE_ASSERT(frameIndex < m_tlas.size() && frameIndex < m_geometryDataBuffers.size(), "Frame index out of range");
+
+    // Gather the triangle geometry of every draw item as a top level acceleration structure
+    // instance. The instance custom index points into the per frame geometry data buffer.
+    m_geometryData.clear();
+    std::vector<rhi::AccelerationStructureInstance> instances{};
+    instances.reserve(m_sceneDrawItems.size() + m_modelDrawItems.size());
+
+    const auto appendItem = [this, &instances](const DrawItem& item) {
+        if (item.blas == nullptr)
+        {
+            return;
+        }
+
+        rhi::AccelerationStructureInstance instance{};
+        const glm::mat4& model = item.pushConstants.model;
+        for (int row = 0; row < 3; ++row)
+        {
+            for (int column = 0; column < 4; ++column)
+            {
+                instance.transform[row * 4 + column] = model[column][row];
+            }
+        }
+        instance.instanceCustomIndex = static_cast<std::uint32_t>(m_geometryData.size());
+        instance.instanceMask = 0xFF;
+        instance.bottomLevel = item.blas;
+        instances.push_back(instance);
+
+        GpuGeometryData geometry{};
+        geometry.baseColorFactor = item.pushConstants.baseColorFactor;
+        geometry.textureIndices = glm::uvec4{item.pushConstants.textureIndices, 0u, 0u};
+        geometry.samplerIndices = glm::uvec4{item.pushConstants.samplerIndices, 0u, 0u};
+        m_geometryData.push_back(geometry);
+    };
+
+    for (const DrawItem& item : m_sceneDrawItems)
+    {
+        appendItem(item);
+    }
+    for (const DrawItem& item : m_modelDrawItems)
+    {
+        appendItem(item);
+    }
+
+    if (instances.empty())
+    {
+        return;
+    }
+
+    if (m_tlas[frameIndex] == nullptr || m_tlasInstanceCount != instances.size())
+    {
+        const rhi::TopLevelAccelerationStructureDesc tlasDesc{
+            std::span<const rhi::AccelerationStructureInstance>{instances},
+            true};
+        m_tlas[frameIndex] = m_device->CreateTopLevelAccelerationStructure(tlasDesc);
+        m_tlasInstanceCount = instances.size();
+        if (m_tlas[frameIndex] == nullptr)
+        {
+            MRE_ERROR("Failed to create the top level acceleration structure");
+            return;
+        }
+    }
+    else
+    {
+        m_device->UpdateTopLevelAccelerationStructure(*m_tlas[frameIndex], instances);
+    }
+
+    commandList.BuildAccelerationStructure(*m_tlas[frameIndex]);
+    commandList.AccelerationStructureBarrier();
+
+    const std::uint64_t geometryBytes = m_geometryData.size() * sizeof(GpuGeometryData);
+    if (m_geometryDataBuffers[frameIndex] == nullptr ||
+        m_geometryDataBuffers[frameIndex]->GetSize() < geometryBytes)
+    {
+        m_geometryDataBuffers[frameIndex] =
+            m_device->CreateBuffer(rhi::BufferDesc{geometryBytes, rhi::BufferUsage::Storage, true});
+    }
+    if (m_geometryDataBuffers[frameIndex] != nullptr)
+    {
+        m_geometryDataBuffers[frameIndex]->Write(m_geometryData.data(), geometryBytes);
+    }
 }
 
 void DeferredRenderer::ApplyModelScale()
@@ -750,6 +891,7 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
     MRE_ASSERT(frameIndex < m_sceneSets.size(), "Frame index out of range");
 
     UpdateUniforms(frameIndex, view);
+    BuildAccelerationStructures(commandList, frameIndex);
 
     rhi::RenderingDesc gbufferDesc{};
     gbufferDesc.colorAttachments = {
@@ -1296,6 +1438,21 @@ bool DeferredRenderer::CreateScene()
     ground.pushConstants.params = glm::vec4{0.9f, 0.0f, 0.0f, 0.0f};
     const std::uint32_t whiteIndex = m_whiteTexture->GetBindlessIndex();
     ground.pushConstants.textureIndices = glm::uvec2{whiteIndex, whiteIndex};
+
+    if (m_device->IsRayTracingSupported() && m_planeVertexBuffer != nullptr && m_planeIndexBuffer != nullptr)
+    {
+        const rhi::BottomLevelAccelerationStructureDesc planeDesc{
+            m_planeVertexBuffer,
+            static_cast<std::uint32_t>(sizeof(Vertex)),
+            static_cast<std::uint32_t>(std::size(kPlaneVertices)),
+            m_planeIndexBuffer,
+            static_cast<std::uint32_t>(std::size(kPlaneIndices)),
+            true};
+        m_planeBlas = m_device->CreateBottomLevelAccelerationStructure(planeDesc);
+        ground.blas = m_planeBlas.get();
+        m_blasDirty = true;
+    }
+
     m_sceneDrawItems.push_back(ground);
 
     MRE_ASSERT(m_planeVertexBuffer != nullptr, "Failed to create the ground plane vertex buffer");

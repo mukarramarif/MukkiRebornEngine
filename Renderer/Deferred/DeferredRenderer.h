@@ -133,6 +133,15 @@ private:
         std::uint32_t indexCount = 0;
         std::uint32_t firstIndex = 0;
         ObjectPushConstants pushConstants{};
+        const rhi::AccelerationStructure* blas = nullptr;
+    };
+
+    // Per draw item data read by ray traced effects (global illumination color bleeding).
+    struct GpuGeometryData
+    {
+        glm::vec4 baseColorFactor{1.0f};
+        glm::uvec4 textureIndices{0u}; // x: base color texture, y: metallic-roughness texture
+        glm::uvec4 samplerIndices{0u}; // x: base color sampler, y: metallic-roughness sampler
     };
 
     struct Material
@@ -153,6 +162,7 @@ private:
         std::vector<Material> materials{};
         std::vector<std::unique_ptr<rhi::Buffer>> vertexBuffers{};
         std::vector<std::unique_ptr<rhi::Buffer>> indexBuffers{};
+        std::vector<std::unique_ptr<rhi::AccelerationStructure>> accelerationStructures{};
         std::vector<DrawItem> drawItems{};
         SceneObjectBounds fittedBounds{};
         std::uint64_t vertexCount = 0;
@@ -221,6 +231,7 @@ private:
         rhi::CommandList& secondary,
         const rhi::RenderingDesc& desc);
     void ApplyModelScale();
+    void BuildAccelerationStructures(rhi::CommandList& commandList, std::uint32_t frameIndex);
     [[nodiscard]] std::optional<std::size_t> UploadModel(const std::filesystem::path& path, GltfModel& model);
     [[nodiscard]] std::optional<std::size_t> LoadModelResources(const std::filesystem::path& path);
     void AddModelInstance(std::size_t modelIndex, const glm::mat4& transform);
@@ -286,6 +297,12 @@ private:
     std::vector<DrawItem> m_modelDrawItems{};
     std::vector<glm::mat4> m_modelBaseTransforms{};
     std::vector<std::unique_ptr<ModelResources>> m_models{};
+    std::unique_ptr<rhi::AccelerationStructure> m_planeBlas{};
+    std::vector<std::unique_ptr<rhi::AccelerationStructure>> m_tlas{};
+    std::vector<std::unique_ptr<rhi::Buffer>> m_geometryDataBuffers{};
+    std::vector<GpuGeometryData> m_geometryData{};
+    std::size_t m_tlasInstanceCount = 0;
+    bool m_blasDirty = false;
     std::unordered_map<std::string, std::size_t> m_modelCache{};
     std::vector<SceneObjectInstance> m_objectInstances{};
     std::vector<std::vector<std::unique_ptr<rhi::CommandList>>> m_gbufferSecondaries{};

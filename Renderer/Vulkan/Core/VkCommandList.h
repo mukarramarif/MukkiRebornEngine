@@ -52,6 +52,8 @@ public:
     void Dispatch(std::uint32_t groupCountX, std::uint32_t groupCountY, std::uint32_t groupCountZ) override;
     void ShaderMemoryBarrier(rhi::ShaderStageMask before, rhi::ShaderStageMask after) override;
     void SetDepthBias(float constantFactor, float slopeFactor, float clamp) override;
+    void BuildAccelerationStructure(const rhi::AccelerationStructure& accelerationStructure) override;
+    void AccelerationStructureBarrier() override;
     void BeginGpuZone(const char* name) override;
     void EndGpuZone() override;
 

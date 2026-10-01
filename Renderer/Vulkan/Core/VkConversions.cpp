@@ -90,6 +90,14 @@ vk::BufferUsageFlags ToVkBufferUsage(rhi::BufferUsage usage)
         return vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst;
     case rhi::BufferUsage::Staging:
         return vk::BufferUsageFlagBits::eTransferSrc;
+    case rhi::BufferUsage::AccelerationStructure:
+        return vk::BufferUsageFlagBits::eAccelerationStructureStorageKHR |
+               vk::BufferUsageFlagBits::eShaderDeviceAddress;
+    case rhi::BufferUsage::AccelerationStructureInput:
+        return vk::BufferUsageFlagBits::eAccelerationStructureBuildInputReadOnlyKHR |
+               vk::BufferUsageFlagBits::eShaderDeviceAddress;
+    case rhi::BufferUsage::AccelerationStructureScratch:
+        return vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress;
     }
 
     MRE_UNREACHABLE();
@@ -177,6 +185,8 @@ vk::DescriptorType ToVkDescriptorType(rhi::DescriptorType type)
         return vk::DescriptorType::eSampledImage;
     case rhi::DescriptorType::Sampler:
         return vk::DescriptorType::eSampler;
+    case rhi::DescriptorType::AccelerationStructure:
+        return vk::DescriptorType::eAccelerationStructureKHR;
     }
 
     MRE_UNREACHABLE();

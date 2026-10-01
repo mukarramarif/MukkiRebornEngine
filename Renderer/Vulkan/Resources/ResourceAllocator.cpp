@@ -1,11 +1,13 @@
 #include "Renderer/Vulkan/Resources/ResourceAllocator.h"
 
 #include "Renderer/Vulkan/Core/VkConversions.h"
+#include "Renderer/Vulkan/Resources/AccelerationStructure.h"
 #include "Renderer/Vulkan/Resources/Buffer.h"
 #include "Renderer/Vulkan/Resources/Texture.h"
 #include "Utilities/Assert.h"
 #include "Utilities/Log.h"
 
+#include <array>
 #include <cstring>
 #include <vector>
 
@@ -65,7 +67,8 @@ void VkResourceAllocator::Init(
     const vk::raii::Device& device,
     VmaAllocator allocator,
     vk::Queue queue,
-    std::uint32_t queueFamily)
+    std::uint32_t queueFamily,
+    const RayTracingDispatch* rayTracingDispatch)
 {
     MRE_ASSERT(allocator != VK_NULL_HANDLE, "VkResourceAllocator::Init requires a valid VMA allocator");
     MRE_ASSERT(queue != nullptr, "VkResourceAllocator::Init requires a valid queue");
@@ -73,6 +76,7 @@ void VkResourceAllocator::Init(
     m_device = &device;
     m_allocator = allocator;
     m_queue = queue;
+    m_rayTracingDispatch = rayTracingDispatch;
 
     const vk::CommandPoolCreateInfo poolInfo = vk::CommandPoolCreateInfo{}
                                                    .setFlags(vk::CommandPoolCreateFlagBits::eTransient)
@@ -103,6 +107,11 @@ std::unique_ptr<rhi::Buffer> VkResourceAllocator::CreateBuffer(
     const bool useStaging = initialData != nullptr && initialDataSize > 0 && !desc.hostVisible;
 
     vk::BufferUsageFlags usage = ToVkBufferUsage(desc.usage);
+    if (desc.deviceAddress)
+    {
+        usage |= vk::BufferUsageFlagBits::eShaderDeviceAddress |
+                 vk::BufferUsageFlagBits::eAccelerationStructureBuildInputReadOnlyKHR;
+    }
     if (useStaging)
     {
         usage |= vk::BufferUsageFlagBits::eTransferDst;
@@ -115,6 +124,7 @@ std::unique_ptr<rhi::Buffer> VkResourceAllocator::CreateBuffer(
 
     VmaAllocationCreateInfo allocationInfo{};
     allocationInfo.usage = desc.hostVisible ? VMA_MEMORY_USAGE_AUTO : VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    allocationInfo.minAlignment = desc.alignment;
     if (desc.hostVisible)
     {
         allocationInfo.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
@@ -131,7 +141,22 @@ std::unique_ptr<rhi::Buffer> VkResourceAllocator::CreateBuffer(
         return nullptr;
     }
 
-    auto vkBuffer = std::make_unique<VkBuffer>(m_allocator, buffer, allocation, desc.size, desc.hostVisible);
+    std::uint64_t deviceAddress = 0;
+    if (desc.deviceAddress || desc.usage == rhi::BufferUsage::AccelerationStructure ||
+        desc.usage == rhi::BufferUsage::AccelerationStructureInput ||
+        desc.usage == rhi::BufferUsage::AccelerationStructureScratch)
+    {
+        const vk::BufferDeviceAddressInfo addressInfo = vk::BufferDeviceAddressInfo{}.setBuffer(buffer);
+        deviceAddress = m_device->getBufferAddress(addressInfo);
+    }
+
+    auto vkBuffer = std::make_unique<VkBuffer>(
+        m_allocator,
+        buffer,
+        allocation,
+        desc.size,
+        desc.hostVisible,
+        deviceAddress);
 
     if (initialData != nullptr && initialDataSize > 0)
     {
@@ -384,6 +409,181 @@ std::unique_ptr<rhi::Texture> VkResourceAllocator::CreateTexture(const rhi::Text
         layout);
 }
 
+std::unique_ptr<rhi::AccelerationStructure> VkResourceAllocator::CreateBottomLevelAccelerationStructure(
+    const rhi::BottomLevelAccelerationStructureDesc& desc)
+{
+    MRE_ASSERT(m_device != nullptr, "VkResourceAllocator requires an initialized device");
+    MRE_ASSERT(m_rayTracingDispatch != nullptr, "Bottom level structures require ray tracing support");
+    MRE_ASSERT(desc.vertexBuffer != nullptr, "Bottom level structures require a vertex buffer");
+    MRE_ASSERT(desc.indexBuffer != nullptr, "Bottom level structures require an index buffer");
+    MRE_ASSERT(desc.vertexStride > 0, "Bottom level structures require a vertex stride");
+    MRE_ASSERT(desc.indexCount >= 3 && desc.indexCount % 3 == 0, "Invalid triangle index count");
+
+    const vk::AccelerationStructureGeometryTrianglesDataKHR triangles =
+        vk::AccelerationStructureGeometryTrianglesDataKHR{}
+            .setVertexFormat(vk::Format::eR32G32B32Sfloat)
+            .setVertexData(desc.vertexBuffer->GetDeviceAddress())
+            .setVertexStride(desc.vertexStride)
+            .setMaxVertex(desc.vertexCount > 0 ? desc.vertexCount - 1 : 0)
+            .setIndexType(vk::IndexType::eUint32)
+            .setIndexData(desc.indexBuffer->GetDeviceAddress());
+
+    const vk::AccelerationStructureGeometryKHR geometry =
+        vk::AccelerationStructureGeometryKHR{}
+            .setGeometryType(vk::GeometryTypeKHR::eTriangles)
+            .setGeometry(vk::AccelerationStructureGeometryDataKHR{triangles})
+            .setFlags(vk::GeometryFlagBitsKHR::eOpaque);
+
+    const vk::AccelerationStructureBuildGeometryInfoKHR buildInfo =
+        vk::AccelerationStructureBuildGeometryInfoKHR{}
+            .setType(vk::AccelerationStructureTypeKHR::eBottomLevel)
+            .setFlags(desc.fastTrace ? vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastTrace
+                                     : vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastBuild)
+            .setMode(vk::BuildAccelerationStructureModeKHR::eBuild)
+            .setGeometries(geometry);
+
+    const std::uint32_t primitiveCount = desc.indexCount / 3;
+    const std::array<std::uint32_t, 1> maxPrimitiveCounts{primitiveCount};
+    const vk::Device device = *m_device;
+    const vk::AccelerationStructureBuildSizesInfoKHR sizes =
+        device.getAccelerationStructureBuildSizesKHR(
+            vk::AccelerationStructureBuildTypeKHR::eDevice,
+            buildInfo,
+            maxPrimitiveCounts,
+            *m_rayTracingDispatch);
+
+    std::unique_ptr<rhi::Buffer> backingBuffer = CreateBuffer(rhi::BufferDesc{sizes.accelerationStructureSize, rhi::BufferUsage::AccelerationStructure, false}, nullptr, 0);
+    std::unique_ptr<rhi::Buffer> scratchBuffer = CreateBuffer(rhi::BufferDesc{sizes.buildScratchSize, rhi::BufferUsage::AccelerationStructureScratch, false, false, 256}, nullptr, 0);
+    if (backingBuffer == nullptr || scratchBuffer == nullptr)
+    {
+        MRE_ERROR("Failed to allocate bottom level acceleration structure buffers");
+        return nullptr;
+    }
+
+    const auto* backing = static_cast<const VkBuffer*>(backingBuffer.get());
+    const vk::AccelerationStructureCreateInfoKHR createInfo =
+        vk::AccelerationStructureCreateInfoKHR{}
+            .setBuffer(backing->GetHandle())
+            .setOffset(0)
+            .setSize(sizes.accelerationStructureSize)
+            .setType(vk::AccelerationStructureTypeKHR::eBottomLevel);
+
+    const vk::AccelerationStructureKHR structure =
+        device.createAccelerationStructureKHR(createInfo, nullptr, *m_rayTracingDispatch);
+    const vk::AccelerationStructureDeviceAddressInfoKHR addressInfo =
+        vk::AccelerationStructureDeviceAddressInfoKHR{}.setAccelerationStructure(structure);
+    const std::uint64_t address =
+        device.getAccelerationStructureAddressKHR(addressInfo, *m_rayTracingDispatch);
+
+    vk::AccelerationStructureBuildRangeInfoKHR buildRange{};
+    buildRange.primitiveCount = primitiveCount;
+
+    return std::make_unique<VkAccelerationStructure>(
+        device,
+        *m_rayTracingDispatch,
+        structure,
+        std::move(backingBuffer),
+        std::move(scratchBuffer),
+        nullptr,
+        address,
+        sizes.accelerationStructureSize,
+        vk::AccelerationStructureTypeKHR::eBottomLevel,
+        desc.fastTrace ? vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastTrace
+                       : vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastBuild,
+        geometry,
+        buildRange);
+}
+
+std::unique_ptr<rhi::AccelerationStructure> VkResourceAllocator::CreateTopLevelAccelerationStructure(
+    const rhi::TopLevelAccelerationStructureDesc& desc)
+{
+    MRE_ASSERT(m_device != nullptr, "VkResourceAllocator requires an initialized device");
+    MRE_ASSERT(m_rayTracingDispatch != nullptr, "Top level structures require ray tracing support");
+    MRE_ASSERT(!desc.instances.empty(), "Top level structures require at least one instance");
+
+    const std::vector<vk::AccelerationStructureInstanceKHR> nativeInstances = ToVkInstances(desc.instances);
+    const std::uint64_t instanceBytes = nativeInstances.size() * sizeof(vk::AccelerationStructureInstanceKHR);
+
+    std::unique_ptr<rhi::Buffer> instanceBuffer = CreateBuffer(
+        rhi::BufferDesc{instanceBytes, rhi::BufferUsage::AccelerationStructureInput, true},
+        nativeInstances.data(),
+        instanceBytes);
+    if (instanceBuffer == nullptr)
+    {
+        MRE_ERROR("Failed to allocate the acceleration structure instance buffer");
+        return nullptr;
+    }
+
+    const vk::AccelerationStructureGeometryInstancesDataKHR instances =
+        vk::AccelerationStructureGeometryInstancesDataKHR{}
+            .setArrayOfPointers(false)
+            .setData(instanceBuffer->GetDeviceAddress());
+
+    const vk::AccelerationStructureGeometryKHR geometry =
+        vk::AccelerationStructureGeometryKHR{}
+            .setGeometryType(vk::GeometryTypeKHR::eInstances)
+            .setGeometry(vk::AccelerationStructureGeometryDataKHR{instances})
+            .setFlags(vk::GeometryFlagBitsKHR::eOpaque);
+
+    const vk::AccelerationStructureBuildGeometryInfoKHR buildInfo =
+        vk::AccelerationStructureBuildGeometryInfoKHR{}
+            .setType(vk::AccelerationStructureTypeKHR::eTopLevel)
+            .setFlags(desc.fastTrace ? vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastTrace
+                                     : vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastBuild)
+            .setMode(vk::BuildAccelerationStructureModeKHR::eBuild)
+            .setGeometries(geometry);
+
+    const std::array<std::uint32_t, 1> maxPrimitiveCounts{static_cast<std::uint32_t>(nativeInstances.size())};
+    const vk::Device device = *m_device;
+    const vk::AccelerationStructureBuildSizesInfoKHR sizes =
+        device.getAccelerationStructureBuildSizesKHR(
+            vk::AccelerationStructureBuildTypeKHR::eDevice,
+            buildInfo,
+            maxPrimitiveCounts,
+            *m_rayTracingDispatch);
+
+    std::unique_ptr<rhi::Buffer> backingBuffer = CreateBuffer(rhi::BufferDesc{sizes.accelerationStructureSize, rhi::BufferUsage::AccelerationStructure, false}, nullptr, 0);
+    std::unique_ptr<rhi::Buffer> scratchBuffer = CreateBuffer(rhi::BufferDesc{sizes.buildScratchSize, rhi::BufferUsage::AccelerationStructureScratch, false, false, 256}, nullptr, 0);
+    if (backingBuffer == nullptr || scratchBuffer == nullptr)
+    {
+        MRE_ERROR("Failed to allocate top level acceleration structure buffers");
+        return nullptr;
+    }
+
+    const auto* backing = static_cast<const VkBuffer*>(backingBuffer.get());
+    const vk::AccelerationStructureCreateInfoKHR createInfo =
+        vk::AccelerationStructureCreateInfoKHR{}
+            .setBuffer(backing->GetHandle())
+            .setOffset(0)
+            .setSize(sizes.accelerationStructureSize)
+            .setType(vk::AccelerationStructureTypeKHR::eTopLevel);
+
+    const vk::AccelerationStructureKHR structure =
+        device.createAccelerationStructureKHR(createInfo, nullptr, *m_rayTracingDispatch);
+    const vk::AccelerationStructureDeviceAddressInfoKHR addressInfo =
+        vk::AccelerationStructureDeviceAddressInfoKHR{}.setAccelerationStructure(structure);
+    const std::uint64_t address =
+        device.getAccelerationStructureAddressKHR(addressInfo, *m_rayTracingDispatch);
+
+    vk::AccelerationStructureBuildRangeInfoKHR buildRange{};
+    buildRange.primitiveCount = static_cast<std::uint32_t>(nativeInstances.size());
+
+    return std::make_unique<VkAccelerationStructure>(
+        device,
+        *m_rayTracingDispatch,
+        structure,
+        std::move(backingBuffer),
+        std::move(scratchBuffer),
+        std::move(instanceBuffer),
+        address,
+        sizes.accelerationStructureSize,
+        vk::AccelerationStructureTypeKHR::eTopLevel,
+        desc.fastTrace ? vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastTrace
+                       : vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastBuild,
+        geometry,
+        buildRange);
+}
+
 void VkResourceAllocator::ImmediateSubmit(const std::function<void(vk::CommandBuffer)>& record)
 {
     MRE_ASSERT(m_device != nullptr, "VkResourceAllocator::ImmediateSubmit requires an initialized allocator");
@@ -407,3 +607,4 @@ void VkResourceAllocator::ImmediateSubmit(const std::function<void(vk::CommandBu
 }
 
 } // namespace mukki::vulkan
+

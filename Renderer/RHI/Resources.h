@@ -38,6 +38,9 @@ enum class BufferUsage : std::uint8_t
     Uniform,
     Storage,
     Staging,
+    AccelerationStructure,      // backing storage for an acceleration structure
+    AccelerationStructureInput, // vertex/index/instance data read by an acceleration structure build
+    AccelerationStructureScratch,
 };
 
 enum class TextureUsage : std::uint8_t
@@ -90,6 +93,7 @@ enum class DescriptorType : std::uint8_t
     CombinedImageSampler,
     SampledImage,
     Sampler,
+    AccelerationStructure,
 };
 
 inline constexpr std::uint32_t kMaxBindlessTextures = 4096;
@@ -114,6 +118,8 @@ struct BufferDesc
     std::uint64_t size = 0;
     BufferUsage usage = BufferUsage::Vertex;
     bool hostVisible = false;
+    bool deviceAddress = false; // expose a buffer device address (ray tracing)
+    std::uint32_t alignment = 0; // optional allocation alignment, 0 for the backend default
 };
 
 class Buffer
@@ -126,10 +132,55 @@ public:
 
     [[nodiscard]] virtual std::uint64_t GetSize() const = 0;
     [[nodiscard]] virtual bool IsHostVisible() const = 0;
+    [[nodiscard]] virtual std::uint64_t GetDeviceAddress() const = 0;
     virtual void Write(const void* data, std::uint64_t size, std::uint64_t offset = 0) = 0;
 
 protected:
     Buffer() = default;
+};
+
+class AccelerationStructure
+{
+public:
+    virtual ~AccelerationStructure();
+
+    AccelerationStructure(const AccelerationStructure&) = delete;
+    AccelerationStructure& operator=(const AccelerationStructure&) = delete;
+
+    // Device address of the acceleration structure handle, used for ray tracing descriptors.
+    [[nodiscard]] virtual std::uint64_t GetDeviceAddress() const = 0;
+    [[nodiscard]] virtual std::uint64_t GetSize() const = 0;
+
+protected:
+    AccelerationStructure() = default;
+};
+
+// Row-major 3x4 transform followed by instance metadata, matching VkAccelerationStructureInstanceKHR.
+struct AccelerationStructureInstance
+{
+    float transform[12] = {
+        1.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 1.0f, 0.0f};
+    std::uint32_t instanceCustomIndex = 0;
+    std::uint32_t instanceMask = 0xFF;
+    const AccelerationStructure* bottomLevel = nullptr;
+};
+
+struct BottomLevelAccelerationStructureDesc
+{
+    const Buffer* vertexBuffer = nullptr;
+    std::uint32_t vertexStride = 0;
+    std::uint32_t vertexCount = 0;
+    const Buffer* indexBuffer = nullptr;
+    std::uint32_t indexCount = 0;
+    bool fastTrace = true;
+};
+
+struct TopLevelAccelerationStructureDesc
+{
+    std::span<const AccelerationStructureInstance> instances{};
+    bool fastTrace = true;
 };
 
 struct TextureDesc
@@ -311,6 +362,9 @@ public:
     virtual void BindTexture(std::uint32_t binding, const Texture& texture, std::uint32_t arrayIndex) = 0;
     virtual void BindSampler(std::uint32_t binding, const Sampler& sampler) = 0;
     virtual void BindSampler(std::uint32_t binding, const Sampler& sampler, std::uint32_t arrayIndex) = 0;
+    virtual void BindAccelerationStructure(
+        std::uint32_t binding,
+        const AccelerationStructure& accelerationStructure) = 0;
 
 protected:
     DescriptorSet() = default;

@@ -9,6 +9,7 @@
 #include <vulkan/vulkan_raii.hpp>
 
 #include "Renderer/RHI/Resources.h"
+#include "Renderer/Vulkan/Core/VkRayTracingDispatch.h"
 
 namespace mukki::vulkan
 {
@@ -22,7 +23,12 @@ public:
     VkResourceAllocator(const VkResourceAllocator&) = delete;
     VkResourceAllocator& operator=(const VkResourceAllocator&) = delete;
 
-    void Init(const vk::raii::Device& device, VmaAllocator allocator, vk::Queue queue, std::uint32_t queueFamily);
+    void Init(
+        const vk::raii::Device& device,
+        VmaAllocator allocator,
+        vk::Queue queue,
+        std::uint32_t queueFamily,
+        const RayTracingDispatch* rayTracingDispatch);
     void Shutdown();
 
     [[nodiscard]] std::unique_ptr<rhi::Buffer> CreateBuffer(
@@ -31,6 +37,11 @@ public:
         std::uint64_t initialDataSize);
     [[nodiscard]] std::unique_ptr<rhi::Texture> CreateTexture(const rhi::TextureDesc& desc);
 
+    [[nodiscard]] std::unique_ptr<rhi::AccelerationStructure> CreateBottomLevelAccelerationStructure(
+        const rhi::BottomLevelAccelerationStructureDesc& desc);
+    [[nodiscard]] std::unique_ptr<rhi::AccelerationStructure> CreateTopLevelAccelerationStructure(
+        const rhi::TopLevelAccelerationStructureDesc& desc);
+
 private:
     void ImmediateSubmit(const std::function<void(vk::CommandBuffer)>& record);
 
@@ -38,6 +49,7 @@ private:
     VmaAllocator m_allocator = VK_NULL_HANDLE;
     vk::Queue m_queue{nullptr};
     vk::raii::CommandPool m_commandPool{nullptr};
+    const RayTracingDispatch* m_rayTracingDispatch = nullptr;
 };
 
 } // namespace mukki::vulkan

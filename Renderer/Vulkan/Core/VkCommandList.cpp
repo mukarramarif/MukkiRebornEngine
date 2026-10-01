@@ -2,6 +2,7 @@
 
 #include "Renderer/Vulkan/Core/VkConversions.h"
 #include "Renderer/Vulkan/Core/VkPipeline.h"
+#include "Renderer/Vulkan/Resources/AccelerationStructure.h"
 #include "Renderer/Vulkan/Resources/Buffer.h"
 #include "Renderer/Vulkan/Resources/DescriptorSet.h"
 #include "Renderer/Vulkan/Resources/Texture.h"
@@ -606,6 +607,31 @@ void VkCommandList::SetDepthBias(float constantFactor, float slopeFactor, float 
     MRE_ASSERT(m_hasBoundPipeline, "VkCommandList::SetDepthBias requires a bound pipeline");
 
     m_commandBuffer.setDepthBias(constantFactor, clamp, slopeFactor);
+}
+
+void VkCommandList::BuildAccelerationStructure(const rhi::AccelerationStructure& accelerationStructure)
+{
+    MRE_ASSERT(m_recording, "VkCommandList::BuildAccelerationStructure called outside of a recording scope");
+    MRE_ASSERT(
+        !m_rendering,
+        "VkCommandList::BuildAccelerationStructure cannot be called inside a rendering scope");
+
+    const auto& vkAccelerationStructure = static_cast<const VkAccelerationStructure&>(accelerationStructure);
+    vkAccelerationStructure.RecordBuild(*m_commandBuffer);
+}
+
+void VkCommandList::AccelerationStructureBarrier()
+{
+    MRE_ASSERT(m_recording, "VkCommandList::AccelerationStructureBarrier called outside of a recording scope");
+
+    const vk::MemoryBarrier2 barrier = vk::MemoryBarrier2{}
+                                           .setSrcStageMask(vk::PipelineStageFlagBits2::eAccelerationStructureBuildKHR)
+                                           .setSrcAccessMask(vk::AccessFlagBits2::eAccelerationStructureWriteKHR)
+                                           .setDstStageMask(
+                                               vk::PipelineStageFlagBits2::eComputeShader |
+                                               vk::PipelineStageFlagBits2::eFragmentShader)
+                                           .setDstAccessMask(vk::AccessFlagBits2::eAccelerationStructureReadKHR);
+    m_commandBuffer.pipelineBarrier2(vk::DependencyInfo{}.setMemoryBarriers(barrier));
 }
 
 void VkCommandList::SetViewportAndScissor(

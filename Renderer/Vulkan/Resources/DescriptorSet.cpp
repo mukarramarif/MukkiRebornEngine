@@ -1,6 +1,9 @@
 #include "Renderer/Vulkan/Resources/DescriptorSet.h"
 
+#include <array>
+
 #include "Renderer/Vulkan/Core/VkConversions.h"
+#include "Renderer/Vulkan/Resources/AccelerationStructure.h"
 #include "Renderer/Vulkan/Resources/Buffer.h"
 #include "Renderer/Vulkan/Resources/Sampler.h"
 #include "Renderer/Vulkan/Resources/Texture.h"
@@ -181,6 +184,28 @@ void VkDescriptorSet::BindSampler(std::uint32_t binding, const rhi::Sampler& sam
                                              .setDstBinding(binding)
                                              .setDescriptorType(vk::DescriptorType::eSampler)
                                              .setImageInfo(imageInfo);
+
+    m_device->updateDescriptorSets(write, {});
+}
+
+void VkDescriptorSet::BindAccelerationStructure(
+    std::uint32_t binding,
+    const rhi::AccelerationStructure& accelerationStructure)
+{
+    MRE_ASSERT(m_device != nullptr, "VkDescriptorSet requires a valid device");
+    MRE_ASSERT(m_set != nullptr, "VkDescriptorSet requires a valid descriptor set");
+
+    const auto& vkAccelerationStructure = static_cast<const VkAccelerationStructure&>(accelerationStructure);
+    const std::array<vk::AccelerationStructureKHR, 1> structures{vkAccelerationStructure.GetStructure()};
+    const vk::WriteDescriptorSetAccelerationStructureKHR accelerationStructureInfo =
+        vk::WriteDescriptorSetAccelerationStructureKHR{}.setAccelerationStructures(structures);
+
+    const vk::WriteDescriptorSet write = vk::WriteDescriptorSet{}
+                                             .setDstSet(*m_set)
+                                             .setDstBinding(binding)
+                                             .setDescriptorType(vk::DescriptorType::eAccelerationStructureKHR)
+                                             .setDescriptorCount(1)
+                                             .setPNext(&accelerationStructureInfo);
 
     m_device->updateDescriptorSets(write, {});
 }
