@@ -1,11 +1,14 @@
 #pragma once
 
 #include <cstdint>
+#include <span>
 #include <string_view>
 #include <vector>
 
 namespace mukki::rhi
 {
+
+struct ShaderReflection;
 
 enum class Format : std::uint8_t
 {
@@ -17,6 +20,7 @@ enum class Format : std::uint8_t
     R16G16B16A16Sfloat,
     R32G32Sfloat,
     R32G32B32Sfloat,
+    R32G32B32A32Sfloat,
     D32Sfloat,
 };
 
@@ -202,6 +206,10 @@ public:
 
     [[nodiscard]] virtual ShaderStage GetStage() const = 0;
 
+    // Interface metadata parsed from the compiled shader, used to generate descriptor set layouts
+    // and pipeline state automatically.
+    [[nodiscard]] virtual const ShaderReflection& GetReflection() const = 0;
+
 protected:
     Shader() = default;
 };
@@ -235,6 +243,30 @@ private:
     std::uint32_t m_bindingStride = 0;
 };
 
+struct ShaderReflectionBinding
+{
+    std::uint32_t set = 0;
+    std::uint32_t binding = 0;
+    DescriptorType type = DescriptorType::UniformBuffer;
+    std::uint32_t arrayCount = 1;
+    ShaderStageMask stages = ShaderStageMask::None;
+};
+
+struct ShaderReflectionPushConstant
+{
+    std::uint32_t offset = 0;
+    std::uint32_t size = 0;
+    ShaderStageMask stages = ShaderStageMask::None;
+};
+
+struct ShaderReflection
+{
+    ShaderStage stage = ShaderStage::Vertex;
+    std::vector<ShaderReflectionBinding> bindings{};
+    std::vector<ShaderReflectionPushConstant> pushConstants{};
+    std::vector<VertexAttribute> vertexInputs{};
+};
+
 struct DescriptorBinding
 {
     std::uint32_t binding = 0;
@@ -243,6 +275,12 @@ struct DescriptorBinding
     std::uint32_t arrayCount = 1;
     bool updateAfterBind = false;
 };
+
+// Merges the reflected bindings of the given shader stages for one descriptor set. Bindings shared
+// by several stages get their stage masks combined.
+[[nodiscard]] std::vector<DescriptorBinding> MergeShaderReflectionBindings(
+    std::span<const Shader* const> shaders,
+    std::uint32_t setIndex);
 
 class DescriptorSetLayout
 {
@@ -302,6 +340,11 @@ struct PipelineDesc
     Format depthFormat = Format::Undefined;
 };
 
+// Fills the reflection-driven parts of a pipeline description from the given shader stages: the
+// vertex input layout and the push constant range. Descriptor set layouts are not touched; create
+// them with Device::CreateDescriptorSetLayout and MergeShaderReflectionBindings.
+void ApplyShaderReflection(PipelineDesc& desc, std::span<const Shader* const> shaders);
+
 class Pipeline
 {
 public:
@@ -311,6 +354,7 @@ public:
     Pipeline& operator=(const Pipeline&) = delete;
 
     [[nodiscard]] virtual bool IsCompute() const = 0;
+    [[nodiscard]] virtual std::uint32_t GetPushConstantSize() const = 0;
 
 protected:
     Pipeline() = default;

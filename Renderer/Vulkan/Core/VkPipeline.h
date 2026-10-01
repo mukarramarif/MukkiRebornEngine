@@ -17,10 +17,12 @@ public:
     [[nodiscard]] vk::Pipeline GetHandle() const { return *m_pipeline; }
     [[nodiscard]] vk::PipelineLayout GetLayout() const { return *m_layout; }
     [[nodiscard]] bool IsCompute() const override { return m_isCompute; }
+    [[nodiscard]] std::uint32_t GetPushConstantSize() const override { return m_pushConstantSize; }
 
 private:
     vk::raii::PipelineLayout m_layout{nullptr};
     vk::raii::Pipeline m_pipeline{nullptr};
+    std::uint32_t m_pushConstantSize = 0;
     bool m_isCompute = false;
 };
 

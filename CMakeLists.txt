@@ -26,6 +26,7 @@ find_package(glm CONFIG REQUIRED)
 find_package(VulkanMemoryAllocator CONFIG REQUIRED)
 find_package(imgui CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
+find_package(unofficial-spirv-reflect CONFIG REQUIRED)
 find_package(Threads REQUIRED)
 
 if(MRE_ENABLE_TRACY)
@@ -141,7 +142,7 @@ target_compile_definitions(mukki_engine PRIVATE
     VMA_STATIC_VULKAN_FUNCTIONS=1
     VMA_DYNAMIC_VULKAN_FUNCTIONS=0
 )
-target_link_libraries(mukki_engine PRIVATE nlohmann_json::nlohmann_json)
+target_link_libraries(mukki_engine PRIVATE nlohmann_json::nlohmann_json unofficial::spirv-reflect)
 target_link_libraries(mukki_engine
     PUBLIC
         Vulkan::Vulkan

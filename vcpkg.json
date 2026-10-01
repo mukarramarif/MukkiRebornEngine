@@ -28,6 +28,7 @@
     "glm",
     "gtest",
     "nlohmann-json",
+    "spirv-reflect",
     "tinygltf",
     "vulkan",
     "vulkan-memory-allocator",

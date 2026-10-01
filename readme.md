@@ -46,6 +46,13 @@ Shader compilation uses `slangc` from the Vulkan SDK, found through the `VULKAN_
 variable (or on `PATH`). If `slangc` is missing, CMake prints a warning, shader targets are skipped
 and the sandbox will fail to load its shaders.
 
+Compiled SPIR-V is reflected with [SPIRV-Reflect](https://github.com/KhronosGroup/SPIRV-Reflect)
+when a shader is loaded (`rhi::Shader::GetReflection`). Descriptor set layouts
+(`rhi::MergeShaderReflectionBindings`), vertex input layouts and push constant ranges
+(`rhi::ApplyShaderReflection`) are generated from the shader interface instead of being declared by
+hand. The bindless texture set is the only hand-written layout because update-after-bind descriptor
+indexing and runtime arrays cannot be expressed in reflection.
+
 ## Build
 
 Windows (Visual Studio generator, Debug or Release):
