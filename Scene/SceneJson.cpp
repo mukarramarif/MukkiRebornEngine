@@ -234,6 +234,41 @@ bool SceneJson::Parse(
         }
     }
 
+    if (const auto probesIt = root.find("probes"); probesIt != root.end())
+    {
+        if (!probesIt->is_array())
+        {
+            error = "'probes' must be an array";
+            return false;
+        }
+
+        for (std::size_t index = 0; index < probesIt->size(); ++index)
+        {
+            const Json& node = (*probesIt)[index];
+            if (!node.is_object())
+            {
+                error = Indexed("probes", index, "must be an object");
+                return false;
+            }
+
+            SceneProbe probe{};
+            std::string entryError;
+            if (!ReadString(node, "name", probe.name, false, entryError) ||
+                !ReadVec3(node, "position", probe.position, entryError))
+            {
+                error = Indexed("probes", index, std::move(entryError));
+                return false;
+            }
+            if (probe.name.empty())
+            {
+                probe.name = "Probe " + std::to_string(index);
+            }
+            probe.radius = node.value("radius", 0.5f);
+            probe.enabled = node.value("enabled", true);
+            scene.probes.push_back(std::move(probe));
+        }
+    }
+
     if (const auto lightsIt = root.find("lights"); lightsIt != root.end())
     {
         if (!lightsIt->is_array())
@@ -317,6 +352,18 @@ std::string SceneJson::Serialize(const SceneDescription& scene)
         objects.push_back(std::move(node));
     }
     root["objects"] = std::move(objects);
+
+    Json probes = Json::array();
+    for (const SceneProbe& probe : scene.probes)
+    {
+        Json node;
+        node["name"] = probe.name;
+        node["position"] = Vec3ToJson(probe.position);
+        node["radius"] = probe.radius;
+        node["enabled"] = probe.enabled;
+        probes.push_back(std::move(node));
+    }
+    root["probes"] = std::move(probes);
 
     Json lights = Json::array();
     for (const SceneLight& sceneLight : scene.lights)

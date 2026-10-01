@@ -48,6 +48,8 @@ struct GltfMaterial
     int baseColorTexture = -1;
     int metallicRoughnessTexture = -1;
     bool doubleSided = false;
+    bool alphaMask = false;
+    float alphaCutoff = 0.5f;
 };
 
 struct GltfImage

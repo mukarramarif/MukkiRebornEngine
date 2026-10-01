@@ -91,7 +91,8 @@ CMake options:
 ## Run
 
 The sandbox renders a deferred scene (G-buffer pass + PBR lighting pass with ACES tonemapping) with
-an ImGui overlay, including a debug window showing the G-buffer channels. Compiled Slang shaders are
+an ImGui overlay, including a debug window showing the G-buffer channels. On ray tracing capable
+GPUs the lighting is augmented with ray traced global illumination. Compiled Slang shaders are
 copied next to the executable automatically.
 
 ```powershell
@@ -220,18 +221,67 @@ The renderer implements shadow mapping for all light types:
   per-instance bounding spheres.
 - The lighting pass filters with hardware comparison samplers (3x3 PCF) and a whole-shadow-map
   normal bias.
+- Alpha-masked materials (glTF `MASK`) are cut out in both the G-buffer and the shadow pass, so the
+  chain rails and foliage in Sponza cast shaped shadows instead of solid quads.
+- On ray tracing hardware the `Shadows` section can switch the sun to **ray traced sun shadows**
+  (`RT shadow samples`, `RT sun angular radius`): a compute pass traces jittered rays from the
+  G-buffer and the lighting pass reads the resulting full-resolution visibility mask instead of the
+  cascades. Spot and point lights keep using shadow maps.
 
 The `Scene` window exposes `Enabled`, `Distance`, `Depth bias` and `Normal bias` sliders for
 tuning, and every light editor has a `Casts shadows` checkbox (subject to the spot/point slot
 budgets above).
 
+### Global illumination
+
+On GPUs with ray query support the renderer adds path-traced global illumination on top of the
+clustered lights:
+
+- One bottom-level acceleration structure per glTF primitive plus one for the ground plane; a
+  top-level structure with per-instance transforms is rebuilt every frame from the motion-vector
+  object data.
+- The trace pass runs at half resolution (adjustable 0.25x-1x) and shoots cosine-weighted diffuse
+  rays plus GGX VNDF specular rays (`Trace samples` path pairs per pixel). Sun visibility uses the
+  smoothed ray traced sun shadow mask when it is enabled and falls back to `sunShadowSamples`
+  jittered rays within `Sun angular radius` otherwise. Hits are shaded with the bindless material
+  textures, and the previous frame's indirect result feeds multi-bounce energy back in.
+- Fireflies are rejected against the accumulated moments (mean + 4 sigma) before the history
+  clamp, the a-trous taps are clamped to the center variance, and the history accumulates up to 64
+  frames (`Temporal alpha min`).
+- **GI probes**: world space probes added from the `Probes` section (independent of the glTF objects)
+  feed the irradiance probe pass. `gi_probes.comp.slang`
+  traces `Probe rays` uniform-sphere rays per probe with the same hit shading as the path tracer,
+  projects the result onto SH L1 and blends it with the previous frame (`Probe hysteresis`). The
+  lighting pass blends the surrounding probes by inverse distance, and the per-pixel trace/denoiser
+  is skipped while probes are active (`Use probes for GI`) so the indirect lighting is not counted
+  twice. Place several probes around the scene for smooth indirect; they update every frame and
+  follow the objects when moved.
+- A hand-rolled SVGF denoiser accumulates edge-aware temporally (depth, normal, luminance and
+  hit-distance rejection, variance from the first two moments), then runs 4 iterations of a
+  depth/normal/roughness-aware a-trous filter and a joint bilateral upsample back to full
+  resolution. Diffuse and specular are denoised as separate signals.
+- Storage textures stay in the `GENERAL` layout for their whole lifetime and are transitioned once
+  at creation; each a-trous iteration owns its descriptor set because updating a set that is bound
+  to a recording command buffer invalidates that command buffer.
+
+The `Scene` window exposes the GI controls: `Ray traced GI`, `Trace scale`, `GI intensity`,
+`Max ray distance`, `Bounce feedback`, `Specular min roughness`, the temporal/edge-stop
+parameters, `À-trous iterations` and `Sun shadow ray`. Devices without ray tracing report
+`(ray tracing unavailable)` and render the clustered lights only.
+
 In the sandbox, the `Scenes` window browses and loads the JSON scenes found in `Sandbox/Scenes`
 (with a global transform scale). The `Scene` window lists the loaded objects and lights:
 
 - Selecting an object lets you edit its position, rotation (degrees, YXZ) and scale; the change is
-  applied to the renderer immediately.
+  applied to the renderer immediately. The `Probes` section below the objects manages the
+  world-space GI probes (`Add probe` places one in front of the camera, `Add grid` drops a 3x2x3
+  grid, and the selected probe has position/radius/enabled controls); they are persisted in the
+  scene JSON and bytecode.
 - Selecting a light opens a `Type` dropdown (directional/point/spot) plus position, direction,
   color, `Strength`, range and cone controls.
+- `Show light gizmos` draws wireframe markers for the lights in the viewport: range spheres for
+  point lights, inner/outer cones and a direction line for spot lights, and an arrow plus ring for
+  the sun. `Show probe gizmos` toggles the probe markers.
 
 `Reload JSON -> bytecode` recompiles the source file, `Compile bytecode` writes the current
 in-memory edits to `<exe>\scenes\<name>.mres`, and `Save JSON` dumps them back to
@@ -244,7 +294,9 @@ in-memory edits to `<exe>\scenes\<name>.mres`, and `Save JSON` dumps them back t
 - `Core/` - engine core (version, time)
 - `Renderer/RHI/` - vendor-agnostic render hardware interface (device, command lists, resources)
 - `Renderer/Vulkan/` - Vulkan backend implementation
+- `Renderer/Debug/` - world-space debug line builder (light/probe gizmos)
 - `Renderer/Deferred/` - deferred renderer (G-buffer, lighting, tonemapping)
+- `Renderer/GlobalIllumination/` - ray traced GI settings, uniforms and the a-trous schedule
 - `Renderer/Lighting/` - light types and the clustered light grid
 - `Renderer/Shaders/` - Slang shaders compiled at build time
 - `Renderer/BufferManager` - vertex/index/uniform buffer management

@@ -56,6 +56,9 @@ vk::ImageUsageFlags ToVkTextureUsage(rhi::TextureUsage usage)
         return vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled;
     case rhi::TextureUsage::DepthAttachment:
         return vk::ImageUsageFlagBits::eDepthStencilAttachment | vk::ImageUsageFlagBits::eSampled;
+    case rhi::TextureUsage::Storage:
+        return vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled |
+               vk::ImageUsageFlagBits::eTransferDst;
     }
 
     MRE_UNREACHABLE();
@@ -109,8 +112,11 @@ std::unique_ptr<rhi::Buffer> VkResourceAllocator::CreateBuffer(
     vk::BufferUsageFlags usage = ToVkBufferUsage(desc.usage);
     if (desc.deviceAddress)
     {
+        // Geometry buffers registered in the bindless array are read as storage buffers by ray
+        // traced shaders.
         usage |= vk::BufferUsageFlagBits::eShaderDeviceAddress |
-                 vk::BufferUsageFlagBits::eAccelerationStructureBuildInputReadOnlyKHR;
+                 vk::BufferUsageFlagBits::eAccelerationStructureBuildInputReadOnlyKHR |
+                 vk::BufferUsageFlagBits::eStorageBuffer;
     }
     if (useStaging)
     {
@@ -265,8 +271,17 @@ std::unique_ptr<rhi::Texture> VkResourceAllocator::CreateTexture(const rhi::Text
         return nullptr;
     }
 
-    vk::ImageLayout layout = desc.usage == rhi::TextureUsage::Sampled ? vk::ImageLayout::eShaderReadOnlyOptimal
-                                                                     : vk::ImageLayout::eUndefined;
+    vk::ImageLayout layout = vk::ImageLayout::eUndefined;
+    if (desc.usage == rhi::TextureUsage::Sampled)
+    {
+        layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+    }
+    else if (desc.usage == rhi::TextureUsage::Storage)
+    {
+        // Storage textures are read and written by compute passes, so they stay in the general
+        // layout for their whole lifetime.
+        layout = vk::ImageLayout::eGeneral;
+    }
 
     if (hasData)
     {
@@ -362,6 +377,24 @@ std::unique_ptr<rhi::Texture> VkResourceAllocator::CreateTexture(const rhi::Text
             commandBuffer.pipelineBarrier2(vk::DependencyInfo{}.setImageMemoryBarriers(toShaderRead));
         });
         layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+    }
+    else if (desc.usage == rhi::TextureUsage::Storage)
+    {
+        // Storage textures stay in the general layout for their whole lifetime; transition them up
+        // front so descriptors written before the first compute pass reference a valid layout.
+        ImmediateSubmit([&](vk::CommandBuffer commandBuffer) {
+            const vk::ImageMemoryBarrier2 toGeneral = MakeImageBarrier(
+                image,
+                vk::ImageLayout::eUndefined,
+                vk::ImageLayout::eGeneral,
+                aspect,
+                vk::PipelineStageFlagBits2::eNone,
+                vk::AccessFlagBits2::eNone,
+                vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eFragmentShader,
+                vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+                desc.arrayLayers);
+            commandBuffer.pipelineBarrier2(vk::DependencyInfo{}.setImageMemoryBarriers(toGeneral));
+        });
     }
 
     const vk::ImageViewCreateInfo viewInfo = vk::ImageViewCreateInfo{}

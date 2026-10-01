@@ -470,6 +470,8 @@ bool LoadGltfModel(const std::filesystem::path& path, GltfModel& model)
         converted.metallicFactor = static_cast<float>(material.pbrMetallicRoughness.metallicFactor);
         converted.roughnessFactor = static_cast<float>(material.pbrMetallicRoughness.roughnessFactor);
         converted.doubleSided = material.doubleSided;
+        converted.alphaMask = material.alphaMode == "MASK";
+        converted.alphaCutoff = static_cast<float>(material.alphaCutoff);
 
         const int baseColorTextureIndex = material.pbrMetallicRoughness.baseColorTexture.index;
         if (baseColorTextureIndex >= 0 && baseColorTextureIndex < static_cast<int>(gltf.textures.size()))

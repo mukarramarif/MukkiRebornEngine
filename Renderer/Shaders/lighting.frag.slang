@@ -1,6 +1,7 @@
 struct SceneUniform
 {
     float4x4 viewProjection;
+    float4x4 previousViewProjection;
     float4x4 view;
     float4 cameraPosition;
     float4 ambientColor;
@@ -21,7 +22,17 @@ struct ShadowUniform
 {
     float4x4 viewProjections[20]; // 4 cascades + 4 spots + 2 point lights * 6 faces
     float4 cascadeSplits;
-    float4 params; // x: depthBias, y: normalBias, z: distance, w: enabled
+    float4 params;   // x: depthBias, y: normalBias, z: distance, w: enabled
+    float4 rtParams; // x: ray traced sun shadows enabled, y/z/w: unused
+};
+
+struct GpuGiProbe
+{
+    float4 position; // xyz: world position
+    float4 sh0;      // L0 rgb
+    float4 shX;
+    float4 shY;
+    float4 shZ;
 };
 
 [[vk::binding(0, 0)]] ConstantBuffer<SceneUniform> gScene;
@@ -36,6 +47,9 @@ struct ShadowUniform
 [[vk::binding(9, 0)]] SamplerComparisonState gShadowSampler;
 [[vk::binding(10, 0)]] Texture2DArray gSpotShadowMap;
 [[vk::binding(11, 0)]] Texture2D gPointShadowMap;
+[[vk::binding(12, 0)]] Texture2D gIndirect;
+[[vk::binding(13, 0)]] Texture2D<float> gRtSunShadow;
+[[vk::binding(14, 0)]] StructuredBuffer<GpuGiProbe> gGiProbes;
 
 static const uint kMaxLightsPerCluster = 64;
 static const uint kLightTypeDirectional = 0;
@@ -45,6 +59,7 @@ static const float kShadowMapSize = 1024.0;
 static const float kShadowCompareBiasScale = 0.0002;
 static const float kPerspectiveCompareBiasScale = 0.001;
 
+static const uint kMaxGiProbes = 64;
 static const uint kShadowCascadeCount = 4;
 static const uint kMaxSpotShadowLights = 4;
 static const uint kSpotShadowOffset = kShadowCascadeCount;
@@ -120,11 +135,30 @@ float distanceAttenuation(float distance, float range)
     return cutoff * cutoff / distanceSquared;
 }
 
-float sampleShadowFactor(float3 worldPosition, float3 normal)
+float sampleShadowFactor(float3 worldPosition, float3 normal, int2 pixel)
 {
     if (gShadow.params.w < 0.5)
     {
         return 1.0;
+    }
+
+    if (gShadow.rtParams.x > 0.5)
+    {
+        // Ray traced sun visibility. The mask is binary per sample, so average a small
+        // neighborhood to soften the shadow edges.
+        const int2 size = int2(gScene.screenSize.xy);
+        float visibility = 0.0;
+        [unroll]
+        for (int y = -1; y <= 1; ++y)
+        {
+            [unroll]
+            for (int x = -1; x <= 1; ++x)
+            {
+                const int2 tap = clamp(pixel + int2(x, y), int2(0, 0), size - 1);
+                visibility += gRtSunShadow.Load(int3(tap, 0)).r;
+            }
+        }
+        return visibility / 9.0;
     }
 
     const float viewDepth = -mul(gScene.view, float4(worldPosition, 1.0)).z;
@@ -323,7 +357,7 @@ float4 fragmentMain(VertexOutput input) : SV_Target
 
     float3 color = gScene.ambientColor.rgb * albedo;
 
-    const float shadowFactor = sampleShadowFactor(worldPosition.xyz, normal);
+    const float shadowFactor = sampleShadowFactor(worldPosition.xyz, normal, int2(input.position.xy));
 
     const uint clusterIndex = clusterIndexOf(worldPosition.xyz, input.position.xy);
     const uint clusterBase = clusterIndex * kMaxLightsPerCluster;
@@ -405,6 +439,32 @@ float4 fragmentMain(VertexOutput input) : SV_Target
                 lightDirection,
                 radiance,
                 nDotL);
+        }
+    }
+
+    if (gScene.screenSize.w > 0.5)
+    {
+        color += gIndirect.Load(int3(int2(input.position.xy), 0)).rgb;
+    }
+    else if (gScene.ambientColor.w > 0.5)
+    {
+        // Probe GI: inverse distance blend of the surrounding irradiance probes.
+        const uint probeCount = min(uint(gScene.ambientColor.w + 0.5), kMaxGiProbes);
+        float3 indirect = 0.0;
+        float weightSum = 0.0;
+        for (uint probeIndex = 0; probeIndex < probeCount; ++probeIndex)
+        {
+            const GpuGiProbe probe = gGiProbes[probeIndex];
+            const float3 offset = probe.position.xyz - worldPosition.xyz;
+            const float weight = 1.0 / (dot(offset, offset) + 0.05);
+            indirect +=
+                (probe.sh0.rgb + probe.shX.rgb * normal.x + probe.shY.rgb * normal.y +
+                 probe.shZ.rgb * normal.z) * weight;
+            weightSum += weight;
+        }
+        if (weightSum > 0.0)
+        {
+            color += albedo * indirect / weightSum;
         }
     }
 

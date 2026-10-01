@@ -44,6 +44,8 @@ rhi::DescriptorType FromSpvDescriptorType(SpvReflectDescriptorType type)
         return rhi::DescriptorType::UniformBuffer;
     case SPV_REFLECT_DESCRIPTOR_TYPE_STORAGE_BUFFER:
         return rhi::DescriptorType::StorageBuffer;
+    case SPV_REFLECT_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+        return rhi::DescriptorType::StorageImage;
     case SPV_REFLECT_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:
         return rhi::DescriptorType::AccelerationStructure;
     default:

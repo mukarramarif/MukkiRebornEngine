@@ -97,8 +97,10 @@ add_library(mukki_engine STATIC
     Core/JobSystem.cpp
     Core/Time.cpp
     Renderer/BufferManager.cpp
+    Renderer/Debug/DebugLines.cpp
     Renderer/Deferred/DeferredRenderer.cpp
     Renderer/Deferred/GBuffer.cpp
+    Renderer/GlobalIllumination/GiAtrousSchedule.cpp
     Renderer/Lighting/ClusterGrid.cpp
     Renderer/Lighting/Light.cpp
     Renderer/Lighting/ShadowCascade.cpp
@@ -183,6 +185,14 @@ if(MRE_BUILD_SANDBOX)
         Renderer/Shaders/cluster_culling.comp.slang
         Renderer/Shaders/shadow.vert.slang
         Renderer/Shaders/shadow.frag.slang
+        Renderer/Shaders/gi_trace.comp.slang
+        Renderer/Shaders/gi_temporal.comp.slang
+        Renderer/Shaders/gi_atrous.comp.slang
+        Renderer/Shaders/gi_upsample.comp.slang
+        Renderer/Shaders/gi_probes.comp.slang
+        Renderer/Shaders/rt_shadows.comp.slang
+        Renderer/Shaders/debug_line.vert.slang
+        Renderer/Shaders/debug_line.frag.slang
     )
 endif()
 

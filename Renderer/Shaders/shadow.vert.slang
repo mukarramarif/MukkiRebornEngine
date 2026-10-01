@@ -17,7 +17,8 @@ struct ShadowUniform
 {
     float4x4 viewProjections[20]; // 4 cascades + 4 spots + 2 point lights * 6 faces
     float4 cascadeSplits;
-    float4 params; // x: depthBias, y: normalBias, z: distance, w: enabled
+    float4 params;   // x: depthBias, y: normalBias, z: distance, w: enabled
+    float4 rtParams; // x: ray traced sun shadows enabled, y/z/w: unused
 };
 
 [[vk::binding(0, 0)]] ConstantBuffer<ShadowUniform> gShadow;
@@ -26,11 +27,22 @@ struct ShadowUniform
 struct VertexInput
 {
     [[vk::location(0)]] float3 position : POSITION;
+    [[vk::location(2)]] float2 uv : TEXCOORD0;
+};
+
+struct VertexOutput
+{
+    float4 position : SV_Position;
+    [[vk::location(0)]] float2 uv : TEXCOORD0;
 };
 
 [shader("vertex")]
-float4 vertexMain(VertexInput input) : SV_Position
+VertexOutput vertexMain(VertexInput input)
 {
     const float4 worldPosition = mul(gPush.object.model, float4(input.position, 1.0));
-    return mul(gShadow.viewProjections[gPush.viewIndex], worldPosition);
+
+    VertexOutput output;
+    output.position = mul(gShadow.viewProjections[gPush.viewIndex], worldPosition);
+    output.uv = input.uv;
+    return output;
 }

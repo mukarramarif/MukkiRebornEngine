@@ -2,6 +2,7 @@
 
 #include "Assets/GltfLoader.h"
 #include "Core/JobSystem.h"
+#include "Renderer/GlobalIllumination/GiAtrousSchedule.h"
 #include "Renderer/RHI/Device.h"
 #include "Scene/SceneDescription.h"
 #include "Utilities/Assert.h"
@@ -118,19 +119,33 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
         rhi::DescriptorBinding{
             0,
             rhi::DescriptorType::SampledImage,
-            rhi::ShaderStageMask::Fragment,
+            rhi::ShaderStageMask::FragmentCompute,
             rhi::kMaxBindlessTextures,
             true},
         rhi::DescriptorBinding{
             1,
             rhi::DescriptorType::Sampler,
-            rhi::ShaderStageMask::Fragment,
+            rhi::ShaderStageMask::FragmentCompute,
             rhi::kMaxBindlessSamplers},
+        rhi::DescriptorBinding{
+            2,
+            rhi::DescriptorType::StorageBuffer,
+            rhi::ShaderStageMask::FragmentCompute,
+            rhi::kMaxBindlessBuffers,
+            true},
     };
-    const std::array<const rhi::Shader*, 1> sceneStages{m_gbufferVertexShader.get()};
+    const std::array<const rhi::Shader*, 2> sceneStages{
+        m_gbufferVertexShader.get(),
+        m_gbufferFragmentShader.get()};
     const std::array<const rhi::Shader*, 1> lightingStages{m_lightingFragmentShader.get()};
     const std::array<const rhi::Shader*, 1> clusterStages{m_clusterCullingShader.get()};
-    const std::array<const rhi::Shader*, 1> shadowStages{m_shadowVertexShader.get()};
+    const std::array<const rhi::Shader*, 2> shadowStages{
+        m_shadowVertexShader.get(),
+        m_shadowFragmentShader.get()};
+    const std::array<const rhi::Shader*, 1> giTraceStages{m_giTraceShader.get()};
+    const std::array<const rhi::Shader*, 1> giTemporalStages{m_giTemporalShader.get()};
+    const std::array<const rhi::Shader*, 1> giAtrousStages{m_giAtrousShader.get()};
+    const std::array<const rhi::Shader*, 1> giUpsampleStages{m_giUpsampleShader.get()};
 
     m_sceneSetLayout =
         device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(sceneStages, 0));
@@ -141,6 +156,26 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
         device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(clusterStages, 0));
     m_shadowSetLayout =
         device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(shadowStages, 0));
+    m_giTraceSetLayout =
+        device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(giTraceStages, 0));
+    m_giTemporalSetLayout =
+        device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(giTemporalStages, 0));
+    m_giAtrousSetLayout =
+        device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(giAtrousStages, 0));
+    m_giUpsampleSetLayout =
+        device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(giUpsampleStages, 0));
+
+    // Ray traced sun shadows are optional; only devices with ray query support get the resources.
+    if (device.IsRayTracingSupported())
+    {
+        const std::array<const rhi::Shader*, 1> rtShadowStages{m_rtShadowShader.get()};
+        m_rtShadowSetLayout =
+            device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(rtShadowStages, 0));
+
+        const std::array<const rhi::Shader*, 1> giProbeStages{m_giProbeShader.get()};
+        m_giProbeSetLayout =
+            device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(giProbeStages, 0));
+    }
 
     MRE_ASSERT(
         m_sceneSetLayout != nullptr && m_bindlessSetLayout != nullptr &&
@@ -154,6 +189,7 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
     const std::uint32_t framesInFlight = device.GetFramesInFlight();
     m_tlas.resize(framesInFlight);
     m_geometryDataBuffers.resize(framesInFlight);
+    m_objectDataBuffers.clear();
     m_uniformBuffers.reserve(framesInFlight);
     m_sceneSets.reserve(framesInFlight);
     for (std::uint32_t frame = 0; frame < framesInFlight; ++frame)
@@ -163,12 +199,23 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
             &m_sceneUniform,
             sizeof(SceneUniform)));
 
+        m_objectDataBuffers.push_back(device.CreateBuffer(
+            rhi::BufferDesc{kMaxObjectData * sizeof(GpuObjectData), rhi::BufferUsage::Storage, true}));
+        MRE_ASSERT(m_objectDataBuffers.back() != nullptr, "Failed to create the object data buffer");
+
         std::unique_ptr<rhi::DescriptorSet> sceneSet = device.CreateDescriptorSet(*m_sceneSetLayout);
         sceneSet->BindBuffer(0, *m_uniformBuffers.back());
+        sceneSet->BindBuffer(1, *m_objectDataBuffers.back());
         m_sceneSets.push_back(std::move(sceneSet));
     }
 
     if (!CreateClusterResources(device) || !CreateShadowResources(device))
+    {
+        Shutdown();
+        return false;
+    }
+
+    if (!CreateGiResources(device))
     {
         Shutdown();
         return false;
@@ -194,6 +241,18 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
     }
 
     if (!CreateScene() || !CreatePipelines(device))
+    {
+        Shutdown();
+        return false;
+    }
+
+    if (!CreateRtShadowResources(device))
+    {
+        Shutdown();
+        return false;
+    }
+
+    if (!CreateGiProbeResources(device))
     {
         Shutdown();
         return false;
@@ -231,9 +290,24 @@ void DeferredRenderer::Shutdown()
     m_tlas.clear();
     m_geometryDataBuffers.clear();
     m_geometryData.clear();
+    m_objectDataBuffers.clear();
+    m_previousModels.clear();
     m_planeBlas.reset();
     m_tlasInstanceCount = 0;
     m_blasDirty = false;
+    m_gi.clear();
+    m_giAtrousPipeline.reset();
+    m_giUpsamplePipeline.reset();
+    m_giTemporalPipeline.reset();
+    m_giTracePipeline.reset();
+    m_giAtrousShader.reset();
+    m_giUpsampleShader.reset();
+    m_giTemporalShader.reset();
+    m_giTraceShader.reset();
+    m_giUpsampleSetLayout.reset();
+    m_giAtrousSetLayout.reset();
+    m_giTemporalSetLayout.reset();
+    m_giTraceSetLayout.reset();
     m_shadowMap.reset();
     m_spotShadowMap.reset();
     m_pointShadowMap.reset();
@@ -303,6 +377,16 @@ void DeferredRenderer::Resize(std::uint32_t width, std::uint32_t height)
     if (!CreateClusterResources(*m_device))
     {
         MRE_CRITICAL("Failed to recreate the clustered light resources");
+    }
+
+    if (!CreateGiResources(*m_device))
+    {
+        MRE_CRITICAL("Failed to recreate the global illumination resources");
+    }
+
+    if (!CreateRtShadowResources(*m_device))
+    {
+        MRE_CRITICAL("Failed to recreate the ray traced shadow resources");
     }
 }
 
@@ -528,6 +612,12 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
             primitive.indices.data(),
             indexBytes));
 
+        // Register the buffers in the bindless storage buffer array used by ray traced hit shading.
+        resources->vertexBufferIndices.push_back(m_nextBindlessBuffer++);
+        resources->indexBufferIndices.push_back(m_nextBindlessBuffer++);
+        m_bindlessSet->BindStorageBuffer(2, *resources->vertexBuffers.back(), resources->vertexBufferIndices.back());
+        m_bindlessSet->BindStorageBuffer(2, *resources->indexBuffers.back(), resources->indexBufferIndices.back());
+
         if (rayTracingSupported)
         {
             const rhi::BottomLevelAccelerationStructureDesc blasDesc{
@@ -564,6 +654,8 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
             {
                 item.blas = resources->accelerationStructures[primitiveIndex].get();
             }
+            item.vertexBufferIndex = resources->vertexBufferIndices[primitiveIndex];
+            item.indexBufferIndex = resources->indexBufferIndices[primitiveIndex];
 
             const std::uint32_t whiteIndex = m_whiteTexture->GetBindlessIndex();
             item.pushConstants.textureIndices = glm::uvec2{whiteIndex, whiteIndex};
@@ -576,8 +668,8 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
                 item.pushConstants.params = glm::vec4{
                     material.roughnessFactor,
                     material.metallicFactor,
-                    0.0f,
-                    0.0f};
+                    material.alphaMask ? 1.0f : 0.0f,
+                    material.alphaCutoff};
 
                 const Material& gpuMaterial = resources->materials[static_cast<std::size_t>(primitive.materialIndex)];
                 if (gpuMaterial.baseColorTexture != nullptr)
@@ -756,6 +848,59 @@ void DeferredRenderer::SetModelScale(float scale)
     ApplyModelScale();
 }
 
+void DeferredRenderer::UpdateObjectData(std::uint32_t frameIndex)
+{
+    MRE_ASSERT(frameIndex < m_objectDataBuffers.size(), "Frame index out of range");
+    MRE_ASSERT(m_objectDataBuffers[frameIndex] != nullptr, "Object data buffer is missing");
+
+    const std::size_t itemCount = m_sceneDrawItems.size() + m_modelDrawItems.size();
+    MRE_ASSERT(itemCount <= kMaxObjectData, "Too many draw items for the object data buffer");
+    if (itemCount > kMaxObjectData)
+    {
+        return;
+    }
+
+    if (m_previousModels.size() != itemCount)
+    {
+        // Draw items were added or removed: assume no motion for one frame.
+        m_previousModels.clear();
+        m_previousModels.reserve(itemCount);
+        for (const DrawItem& item : m_sceneDrawItems)
+        {
+            m_previousModels.push_back(item.pushConstants.model);
+        }
+        for (const DrawItem& item : m_modelDrawItems)
+        {
+            m_previousModels.push_back(item.pushConstants.model);
+        }
+    }
+
+    std::vector<GpuObjectData> objectData{};
+    objectData.resize(itemCount);
+
+    std::size_t index = 0;
+    const auto updateItem = [this, &objectData, &index](DrawItem& item) {
+        objectData[index].previousModel = m_previousModels[index];
+        item.pushConstants.drawIndex = static_cast<std::uint32_t>(index);
+        m_previousModels[index] = item.pushConstants.model;
+        ++index;
+    };
+
+    for (DrawItem& item : m_sceneDrawItems)
+    {
+        updateItem(item);
+    }
+    for (DrawItem& item : m_modelDrawItems)
+    {
+        updateItem(item);
+    }
+
+    if (!objectData.empty())
+    {
+        m_objectDataBuffers[frameIndex]->Write(objectData.data(), objectData.size() * sizeof(GpuObjectData));
+    }
+}
+
 void DeferredRenderer::BuildAccelerationStructures(rhi::CommandList& commandList, std::uint32_t frameIndex)
 {
     MRE_PROFILE_ZONE_N("BuildAccelerationStructures");
@@ -815,8 +960,14 @@ void DeferredRenderer::BuildAccelerationStructures(rhi::CommandList& commandList
 
         GpuGeometryData geometry{};
         geometry.baseColorFactor = item.pushConstants.baseColorFactor;
+        geometry.bufferIndices = glm::uvec4{
+            item.vertexBufferIndex,
+            item.indexBufferIndex,
+            static_cast<std::uint32_t>(sizeof(GltfVertex)),
+            0u};
         geometry.textureIndices = glm::uvec4{item.pushConstants.textureIndices, 0u, 0u};
         geometry.samplerIndices = glm::uvec4{item.pushConstants.samplerIndices, 0u, 0u};
+        geometry.params = glm::vec4{item.pushConstants.params.x, item.pushConstants.params.y, 0.0f, 0.0f};
         m_geometryData.push_back(geometry);
     };
 
@@ -868,6 +1019,341 @@ void DeferredRenderer::BuildAccelerationStructures(rhi::CommandList& commandList
     }
 }
 
+bool DeferredRenderer::CreateGiResources(rhi::Device& device)
+{
+    MRE_ASSERT(m_giTraceSetLayout != nullptr, "GI set layouts must exist before creating resources");
+
+    m_gi.clear();
+    m_gi.resize(device.GetFramesInFlight());
+
+    const std::uint32_t fullWidth = m_gbuffer.GetWidth();
+    const std::uint32_t fullHeight = m_gbuffer.GetHeight();
+    const auto halfWidth = std::max(
+        1u,
+        static_cast<std::uint32_t>(std::lround(static_cast<double>(fullWidth) * m_giSettings.resolutionScale)));
+    const auto halfHeight = std::max(
+        1u,
+        static_cast<std::uint32_t>(std::lround(static_cast<double>(fullHeight) * m_giSettings.resolutionScale)));
+
+    const auto createStorage = [&device](std::uint32_t width, std::uint32_t height, rhi::Format format) {
+        return device.CreateTexture(rhi::TextureDesc{width, height, format, rhi::TextureUsage::Storage});
+    };
+
+    for (GiFrameResources& gi : m_gi)
+    {
+        gi.diffuseNoisy = createStorage(halfWidth, halfHeight, rhi::Format::R16G16B16A16Sfloat);
+        gi.specularNoisy = createStorage(halfWidth, halfHeight, rhi::Format::R16G16B16A16Sfloat);
+        gi.hitDistance = createStorage(halfWidth, halfHeight, rhi::Format::R16Sfloat);
+        for (std::uint32_t parity = 0; parity < 2; ++parity)
+        {
+            gi.diffuseHistory[parity] = createStorage(halfWidth, halfHeight, rhi::Format::R16G16B16A16Sfloat);
+            gi.specularHistory[parity] = createStorage(halfWidth, halfHeight, rhi::Format::R16G16B16A16Sfloat);
+            gi.diffuseMoments[parity] = createStorage(halfWidth, halfHeight, rhi::Format::R16G16B16A16Sfloat);
+            gi.specularMoments[parity] = createStorage(halfWidth, halfHeight, rhi::Format::R16G16B16A16Sfloat);
+        }
+        gi.diffuseFiltered = createStorage(halfWidth, halfHeight, rhi::Format::R16G16B16A16Sfloat);
+        gi.specularFiltered = createStorage(halfWidth, halfHeight, rhi::Format::R16G16B16A16Sfloat);
+        gi.indirect = createStorage(fullWidth, fullHeight, rhi::Format::R16G16B16A16Sfloat);
+        gi.historyParity = 0;
+        gi.historyValid = false;
+
+        if (gi.diffuseNoisy == nullptr || gi.specularNoisy == nullptr || gi.hitDistance == nullptr ||
+            gi.diffuseHistory[0] == nullptr || gi.diffuseHistory[1] == nullptr ||
+            gi.specularHistory[0] == nullptr || gi.specularHistory[1] == nullptr ||
+            gi.diffuseMoments[0] == nullptr || gi.diffuseMoments[1] == nullptr ||
+            gi.specularMoments[0] == nullptr || gi.specularMoments[1] == nullptr ||
+            gi.diffuseFiltered == nullptr || gi.specularFiltered == nullptr || gi.indirect == nullptr)
+        {
+            MRE_CRITICAL("Failed to create the global illumination textures");
+            return false;
+        }
+
+        gi.uniformBuffer = device.CreateBuffer(
+            rhi::BufferDesc{sizeof(GiUniform), rhi::BufferUsage::Uniform, true});
+        gi.traceSet = device.CreateDescriptorSet(*m_giTraceSetLayout);
+        gi.temporalSet = device.CreateDescriptorSet(*m_giTemporalSetLayout);
+        gi.upsampleSet = device.CreateDescriptorSet(*m_giUpsampleSetLayout);
+        for (std::unique_ptr<rhi::DescriptorSet>& atrousSet : gi.atrousSets)
+        {
+            atrousSet = device.CreateDescriptorSet(*m_giAtrousSetLayout);
+        }
+
+        const bool atrousSetsCreated = std::all_of(
+            gi.atrousSets.begin(),
+            gi.atrousSets.end(),
+            [](const std::unique_ptr<rhi::DescriptorSet>& atrousSet) { return atrousSet != nullptr; });
+
+        if (gi.uniformBuffer == nullptr || gi.traceSet == nullptr || gi.temporalSet == nullptr ||
+            !atrousSetsCreated || gi.upsampleSet == nullptr)
+        {
+            MRE_CRITICAL("Failed to create the global illumination descriptor sets");
+            return false;
+        }
+    }
+
+    m_lightingSetsDirty = true;
+    MRE_INFO("Global illumination resources created ({}x{} half resolution)", halfWidth, halfHeight);
+    return true;
+}
+
+void DeferredRenderer::SetGiSettings(const GiSettings& settings)
+{
+    const bool scaleChanged =
+        std::abs(settings.resolutionScale - m_giSettings.resolutionScale) > 1e-4f;
+    m_giSettings = settings;
+
+    if (m_initialized && scaleChanged && m_device != nullptr)
+    {
+        m_device->WaitIdle();
+        if (!CreateGiResources(*m_device))
+        {
+            MRE_CRITICAL("Failed to recreate the global illumination resources");
+        }
+    }
+}
+
+bool DeferredRenderer::IsGiActive() const
+{
+    return m_giSettings.enabled && m_device != nullptr && m_device->IsRayTracingSupported();
+}
+
+void DeferredRenderer::UpdateGiUniform(std::uint32_t frameIndex, const FrameView& view)
+{
+    if (m_gi.size() <= frameIndex)
+    {
+        return;
+    }
+
+    const Light* sun = FindShadowLight();
+    if (sun == nullptr)
+    {
+        for (const Light& light : m_lights)
+        {
+            if (light.type == LightType::Directional)
+            {
+                sun = &light;
+                break;
+            }
+        }
+    }
+
+    m_giUniform = GiUniform{};
+    m_giUniform.inverseViewProjection = glm::inverse(view.viewProjection);
+    m_giUniform.previousViewProjection = view.previousViewProjection;
+    m_giUniform.viewProjection = view.viewProjection;
+    m_giUniform.screenSize = glm::vec4{
+        static_cast<float>(m_gbuffer.GetWidth()),
+        static_cast<float>(m_gbuffer.GetHeight()),
+        0.0f,
+        0.0f};
+    m_giUniform.halfSize = glm::vec4{
+        static_cast<float>(m_gi[frameIndex].diffuseNoisy->GetWidth()),
+        static_cast<float>(m_gi[frameIndex].diffuseNoisy->GetHeight()),
+        0.0f,
+        0.0f};
+    m_giUniform.cameraPosition = glm::vec4{view.position, 1.0f};
+    m_giUniform.skyColor = glm::vec4{glm::vec3{m_sceneUniform.ambientColor}, 1.0f};
+    if (sun != nullptr)
+    {
+        const float length = glm::length(sun->direction);
+        const glm::vec3 direction = length > 1e-4f ? -sun->direction / length : glm::vec3{0.0f, -1.0f, 0.0f};
+        m_giUniform.sunDirectionIntensity = glm::vec4{direction, sun->intensity};
+        m_giUniform.sunColor = glm::vec4{sun->color, 1.0f};
+    }
+    m_giUniform.params = glm::vec4{
+        m_giSettings.maxDistance,
+        static_cast<float>(m_giFrameCounter),
+        m_giSettings.specularMinRoughness,
+        m_giSettings.feedbackIntensity};
+    m_giUniform.params2 = glm::vec4{
+        m_giSettings.temporalAlphaMin,
+        m_giSettings.phiDepth,
+        m_giSettings.phiNormal,
+        m_giSettings.phiLuminance};
+    m_giUniform.params3 = glm::vec4{
+        m_giSettings.phiHitDistance,
+        m_giSettings.intensity,
+        (m_giSettings.sunShadowRay && sun != nullptr && sun->castShadows) ? 1.0f : 0.0f,
+        m_gi[frameIndex].historyValid ? 0.0f : 1.0f};
+    m_giUniform.params4 = glm::vec4{
+        static_cast<float>(m_giSettings.sunShadowSamples),
+        m_giSettings.sunAngularRadiusDegrees * 3.14159265358979323846f / 180.0f,
+        static_cast<float>(m_giSettings.traceSamples),
+        IsRtShadowActive() ? 1.0f : 0.0f};
+    m_giUniform.params5 = glm::vec4{
+        static_cast<float>(std::clamp(m_giSettings.probeRays, 1u, 256u)),
+        std::clamp(m_giSettings.probeHysteresis, 0.0f, 0.98f),
+        IsProbeGiActive() ? static_cast<float>(m_giProbeData.size()) : 0.0f,
+        0.0f};
+
+    m_gi[frameIndex].uniformBuffer->Write(&m_giUniform, sizeof(GiUniform));
+
+    // Probes never use the screen space feedback term.
+    if (frameIndex < m_giProbeUniformBuffers.size() && m_giProbeUniformBuffers[frameIndex] != nullptr)
+    {
+        m_giProbeUniform = m_giUniform;
+        m_giProbeUniform.params.w = 0.0f;
+        m_giProbeUniformBuffers[frameIndex]->Write(&m_giProbeUniform, sizeof(GiUniform));
+    }
+
+    ++m_giFrameCounter;
+}
+
+void DeferredRenderer::BindGiDescriptors(std::uint32_t frameIndex)
+{
+    if (m_gi.size() <= frameIndex)
+    {
+        return;
+    }
+
+    GiFrameResources& gi = m_gi[frameIndex];
+    const std::uint32_t parity = gi.historyParity;
+
+    // Trace.
+    gi.traceSet->BindBuffer(0, *gi.uniformBuffer);
+    if (m_tlas[frameIndex] != nullptr)
+    {
+        gi.traceSet->BindAccelerationStructure(1, *m_tlas[frameIndex]);
+    }
+    if (m_geometryDataBuffers[frameIndex] != nullptr)
+    {
+        gi.traceSet->BindBuffer(2, *m_geometryDataBuffers[frameIndex]);
+    }
+    gi.traceSet->BindTexture(3, m_gbuffer.GetDepth(), 0u);
+    gi.traceSet->BindTexture(4, m_gbuffer.GetNormal(), 0u);
+    gi.traceSet->BindTexture(5, *gi.indirect, 0u);
+    gi.traceSet->BindStorageImage(6, *gi.diffuseNoisy);
+    gi.traceSet->BindStorageImage(7, *gi.specularNoisy);
+    gi.traceSet->BindStorageImage(8, *gi.hitDistance);
+    gi.traceSet->BindTexture(
+        9,
+        m_rtSunShadowMask != nullptr ? *m_rtSunShadowMask : *m_whiteTexture,
+        0u);
+
+    // Temporal: reads history[parity], writes history[parity ^ 1].
+    gi.temporalSet->BindBuffer(0, *gi.uniformBuffer);
+    gi.temporalSet->BindTexture(1, m_gbuffer.GetDepth(), 0u);
+    gi.temporalSet->BindTexture(2, m_gbuffer.GetNormal(), 0u);
+    gi.temporalSet->BindTexture(3, m_gbuffer.GetMotion(), 0u);
+    gi.temporalSet->BindTexture(4, *gi.diffuseNoisy, 0u);
+    gi.temporalSet->BindTexture(5, *gi.specularNoisy, 0u);
+    gi.temporalSet->BindTexture(6, *gi.diffuseHistory[parity], 0u);
+    gi.temporalSet->BindTexture(7, *gi.specularHistory[parity], 0u);
+    gi.temporalSet->BindTexture(8, *gi.diffuseMoments[parity], 0u);
+    gi.temporalSet->BindTexture(9, *gi.specularMoments[parity], 0u);
+    gi.temporalSet->BindStorageImage(10, *gi.diffuseHistory[parity ^ 1]);
+    gi.temporalSet->BindStorageImage(11, *gi.specularHistory[parity ^ 1]);
+    gi.temporalSet->BindStorageImage(12, *gi.diffuseMoments[parity ^ 1]);
+    gi.temporalSet->BindStorageImage(13, *gi.specularMoments[parity ^ 1]);
+
+    // À-trous: one descriptor set per iteration so a set bound to the command buffer is never
+    // updated afterwards. The schedule always ends on the filtered texture.
+    const std::vector<GiAtrousStep> atrousSteps =
+        BuildGiAtrousSchedule(m_giSettings.atrousIterations, kMaxAtrousIterations);
+    for (std::uint32_t signal = 0; signal < 2; ++signal)
+    {
+        const auto atrousTexture = [&](GiAtrousTexture which) -> rhi::Texture* {
+            if (which == GiAtrousTexture::History)
+            {
+                return signal == 0 ? gi.diffuseHistory[parity ^ 1].get()
+                                   : gi.specularHistory[parity ^ 1].get();
+            }
+            if (which == GiAtrousTexture::Noisy)
+            {
+                return signal == 0 ? gi.diffuseNoisy.get() : gi.specularNoisy.get();
+            }
+            return signal == 0 ? gi.diffuseFiltered.get() : gi.specularFiltered.get();
+        };
+        rhi::Texture* const moments =
+            signal == 0 ? gi.diffuseMoments[parity ^ 1].get() : gi.specularMoments[parity ^ 1].get();
+
+        for (std::uint32_t stepIndex = 0; stepIndex < atrousSteps.size(); ++stepIndex)
+        {
+            const GiAtrousStep& step = atrousSteps[stepIndex];
+            rhi::DescriptorSet& set = *gi.atrousSets[signal * kMaxAtrousIterations + stepIndex];
+            set.BindBuffer(0, *gi.uniformBuffer);
+            set.BindTexture(1, m_gbuffer.GetDepth(), 0u);
+            set.BindTexture(2, m_gbuffer.GetNormal(), 0u);
+            set.BindTexture(3, *gi.hitDistance, 0u);
+            set.BindTexture(4, *atrousTexture(step.input), 0u);
+            set.BindTexture(5, *moments, 0u);
+            set.BindStorageImage(6, *atrousTexture(step.output));
+        }
+    }
+
+    gi.upsampleSet->BindBuffer(0, *gi.uniformBuffer);
+    gi.upsampleSet->BindTexture(1, *gi.diffuseFiltered, 0u);
+    gi.upsampleSet->BindTexture(2, *gi.specularFiltered, 0u);
+    gi.upsampleSet->BindTexture(3, m_gbuffer.GetAlbedo(), 0u);
+    gi.upsampleSet->BindTexture(4, m_gbuffer.GetNormal(), 0u);
+    gi.upsampleSet->BindTexture(5, m_gbuffer.GetDepth(), 0u);
+    gi.upsampleSet->BindStorageImage(6, *gi.indirect);
+}
+
+void DeferredRenderer::RecordGiPasses(rhi::CommandList& commandList, std::uint32_t frameIndex)
+{
+    if (!IsPerPixelGiActive() || m_gi.size() <= frameIndex)
+    {
+        return;
+    }
+
+    GiFrameResources& gi = m_gi[frameIndex];
+    if (gi.traceSet == nullptr || m_tlas[frameIndex] == nullptr ||
+        m_geometryDataBuffers[frameIndex] == nullptr)
+    {
+        return;
+    }
+
+    const std::uint32_t halfWidth = gi.diffuseNoisy->GetWidth();
+    const std::uint32_t halfHeight = gi.diffuseNoisy->GetHeight();
+    const std::uint32_t groupsX = (halfWidth + 7) / 8;
+    const std::uint32_t groupsY = (halfHeight + 7) / 8;
+    const std::uint32_t iterations =
+        std::clamp(m_giSettings.atrousIterations, 1u, kMaxAtrousIterations);
+
+    // Bind after the G-buffer pass so the G-buffer textures are in a sampled layout.
+    BindGiDescriptors(frameIndex);
+
+    commandList.BeginGpuZone("GlobalIllumination");
+
+    commandList.BindPipeline(*m_giTracePipeline);
+    commandList.BindDescriptorSet(0, *gi.traceSet);
+    commandList.BindDescriptorSet(1, *m_bindlessSet);
+    commandList.Dispatch(groupsX, groupsY, 1);
+    commandList.ShaderMemoryBarrier(rhi::ShaderStageMask::Compute, rhi::ShaderStageMask::Compute);
+
+    commandList.BindPipeline(*m_giTemporalPipeline);
+    commandList.BindDescriptorSet(0, *gi.temporalSet);
+    commandList.Dispatch(groupsX, groupsY, 1);
+    commandList.ShaderMemoryBarrier(rhi::ShaderStageMask::Compute, rhi::ShaderStageMask::Compute);
+
+    commandList.BindPipeline(*m_giAtrousPipeline);
+    for (std::uint32_t signal = 0; signal < 2; ++signal)
+    {
+        for (std::uint32_t iteration = 0; iteration < iterations; ++iteration)
+        {
+            commandList.BindDescriptorSet(0, *gi.atrousSets[signal * kMaxAtrousIterations + iteration]);
+            const GiAtrousPushConstants pushConstants{signal, iteration};
+            commandList.SetPushConstants(&pushConstants, sizeof(pushConstants), rhi::ShaderStageMask::Compute);
+            commandList.Dispatch(groupsX, groupsY, 1);
+            commandList.ShaderMemoryBarrier(rhi::ShaderStageMask::Compute, rhi::ShaderStageMask::Compute);
+        }
+    }
+
+    commandList.BindPipeline(*m_giUpsamplePipeline);
+    commandList.BindDescriptorSet(0, *gi.upsampleSet);
+    commandList.Dispatch(
+        (m_gbuffer.GetWidth() + 7) / 8,
+        (m_gbuffer.GetHeight() + 7) / 8,
+        1);
+    commandList.ShaderMemoryBarrier(rhi::ShaderStageMask::Compute, rhi::ShaderStageMask::Fragment);
+
+    gi.historyParity ^= 1;
+    gi.historyValid = true;
+
+    commandList.EndGpuZone();
+}
+
 void DeferredRenderer::ApplyModelScale()
 {
     MRE_ASSERT(
@@ -891,6 +1377,7 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
     MRE_ASSERT(frameIndex < m_sceneSets.size(), "Frame index out of range");
 
     UpdateUniforms(frameIndex, view);
+    UpdateObjectData(frameIndex);
     BuildAccelerationStructures(commandList, frameIndex);
 
     rhi::RenderingDesc gbufferDesc{};
@@ -898,6 +1385,7 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
         rhi::ColorAttachment{&m_gbuffer.GetAlbedo(), rhi::ClearColor{0.0f, 0.0f, 0.0f, 1.0f}, true},
         rhi::ColorAttachment{&m_gbuffer.GetNormal(), rhi::ClearColor{0.5f, 0.5f, 1.0f, 1.0f}, true},
         rhi::ColorAttachment{&m_gbuffer.GetPosition(), rhi::ClearColor{0.0f, 0.0f, 0.0f, 0.0f}, true},
+        rhi::ColorAttachment{&m_gbuffer.GetMotion(), rhi::ClearColor{0.0f, 0.0f, 0.0f, 0.0f}, true},
     };
     gbufferDesc.depthAttachment = rhi::DepthAttachment{&m_gbuffer.GetDepth(), 1.0f, true};
 
@@ -958,6 +1446,7 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
                 commandList.BeginRendering(shadowDesc);
                 commandList.BindPipeline(*m_shadowPipeline);
                 commandList.BindDescriptorSet(0, *m_shadowSets[frameIndex]);
+                commandList.BindDescriptorSet(1, *m_bindlessSet);
                 commandList.SetDepthBias(
                     m_shadowSettings.depthBias,
                     m_shadowSettings.depthBias * 1.5f,
@@ -974,7 +1463,7 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
                     commandList.SetPushConstants(
                         &pushConstants,
                         pushConstantSize,
-                        rhi::ShaderStageMask::Vertex);
+                        rhi::ShaderStageMask::VertexFragment);
                     commandList.DrawIndexed(item->indexCount, item->firstIndex);
                 }
                 commandList.EndRendering();
@@ -1031,6 +1520,20 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
 
     commandList.EndGpuZone();
 
+    const bool probeGiActive = IsProbeGiActive();
+    if (probeGiActive != m_probeGiActiveLastFrame)
+    {
+        // Switching modes invalidates the per-pixel GI history.
+        for (GiFrameResources& gi : m_gi)
+        {
+            gi.historyValid = false;
+        }
+        m_probeGiActiveLastFrame = probeGiActive;
+    }
+
+    RecordRtShadowPass(commandList, frameIndex);
+    RecordGiProbes(commandList, frameIndex);
+
     if (m_lightingSetsDirty)
     {
         CreateLightingSets(*m_device);
@@ -1050,13 +1553,132 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
         commandList.ShaderMemoryBarrier(rhi::ShaderStageMask::Compute, rhi::ShaderStageMask::Fragment);
     }
 
+    RecordGiPasses(commandList, frameIndex);
+
     commandList.BeginGpuZone("Lighting");
     commandList.BeginSwapchainRendering(rhi::ClearColor{0.0f, 0.0f, 0.0f, 1.0f}, true);
     commandList.BindPipeline(*m_lightingPipeline);
     commandList.BindDescriptorSet(0, *m_lightingSets[frameIndex]);
     commandList.Draw(3);
+    RecordDebugLines(commandList, view);
     commandList.EndSwapchainRendering();
     commandList.EndGpuZone();
+}
+
+void DeferredRenderer::RecordDebugLines(rhi::CommandList& commandList, const FrameView& view)
+{
+    if (m_debugLinePipeline == nullptr || (!m_showLightGizmos && !m_showProbeGizmos))
+    {
+        return;
+    }
+
+    DebugLines lines{};
+    if (m_showLightGizmos)
+    {
+        for (const Light& light : m_lights)
+        {
+            const glm::vec4 color{light.color.r, light.color.g, light.color.b, 1.0f};
+            const float directionLength = glm::length(light.direction);
+            const glm::vec3 direction = directionLength > 1e-4f
+                ? light.direction / directionLength
+                : glm::vec3{0.0f, -1.0f, 0.0f};
+
+            switch (light.type)
+            {
+            case LightType::Directional:
+                lines.AddDirectionalLight(direction, color);
+                break;
+            case LightType::Point:
+                lines.AddPointLight(light.position, std::max(light.range, 0.1f), color);
+                break;
+            case LightType::Spot:
+                lines.AddSpotLight(
+                    light.position,
+                    direction,
+                    std::max(light.range, 0.1f),
+                    light.innerConeAngle,
+                    light.outerConeAngle,
+                    color);
+                break;
+            }
+        }
+    }
+
+    if (m_showProbeGizmos)
+    {
+        // Draw the actual GI probes so the markers match what the lighting pass samples. The
+        // arrow points along the dominant SH direction and is tinted by the probe irradiance.
+        for (std::size_t index = 0; index < m_giProbes.size(); ++index)
+        {
+            const GiProbe& marker = m_giProbes[index];
+            if (index >= m_giProbeData.size())
+            {
+                // Probes beyond the GPU budget still get a plain marker.
+                lines.AddProbe(marker);
+                continue;
+            }
+
+            const GpuGiProbe& probe = m_giProbeData[index];
+            const glm::vec3 position{probe.position};
+            lines.AddSphere(position, marker.radius, marker.color);
+            lines.AddCross(
+                position,
+                marker.radius * 0.6f,
+                glm::vec4{
+                    marker.color.r * 0.7f,
+                    marker.color.g * 0.7f,
+                    marker.color.b * 0.7f,
+                    marker.color.a});
+
+            const glm::vec3 direction{
+                probe.shX.r + probe.shX.g + probe.shX.b,
+                probe.shY.r + probe.shY.g + probe.shY.b,
+                probe.shZ.r + probe.shZ.g + probe.shZ.b};
+            const float directionLength = glm::length(direction);
+            if (directionLength > 1e-4f)
+            {
+                const glm::vec3 irradiance =
+                    glm::clamp(glm::vec3{probe.sh0}, glm::vec3{0.0f}, glm::vec3{1.0f});
+                lines.AddArrow(
+                    position,
+                    direction / directionLength,
+                    0.6f,
+                    glm::vec4{irradiance, 1.0f});
+            }
+        }
+    }
+
+    if (lines.Empty())
+    {
+        return;
+    }
+
+    const std::uint32_t frameIndex = m_device->GetFrameIndex();
+    if (m_debugLineBuffers.size() <= frameIndex)
+    {
+        m_debugLineBuffers.resize(m_device->GetFramesInFlight());
+    }
+
+    const std::uint64_t bytes = lines.VertexData().size() * sizeof(float);
+    if (m_debugLineBuffers[frameIndex] == nullptr ||
+        m_debugLineBuffers[frameIndex]->GetSize() < bytes)
+    {
+        const std::uint64_t capacity = std::max<std::uint64_t>(bytes * 2, 1u << 16);
+        m_debugLineBuffers[frameIndex] = m_device->CreateBuffer(
+            rhi::BufferDesc{capacity, rhi::BufferUsage::Vertex, true});
+        MRE_ASSERT(m_debugLineBuffers[frameIndex] != nullptr, "Failed to create the debug line buffer");
+    }
+
+    m_debugLineBuffers[frameIndex]->Write(lines.VertexData().data(), bytes);
+
+    const glm::mat4 viewProjection = view.viewProjection;
+    commandList.BindPipeline(*m_debugLinePipeline);
+    commandList.SetPushConstants(
+        &viewProjection,
+        sizeof(viewProjection),
+        rhi::ShaderStageMask::Vertex);
+    commandList.BindVertexBuffer(*m_debugLineBuffers[frameIndex]);
+    commandList.Draw(lines.VertexCount());
 }
 
 std::uint32_t DeferredRenderer::RecordGBufferSecondaries(
@@ -1305,6 +1927,7 @@ void DeferredRenderer::RecordShadowView(
     secondary.BeginSecondary(desc);
     secondary.BindPipeline(*m_shadowPipeline);
     secondary.BindDescriptorSet(0, *m_shadowSets[frameIndex]);
+    secondary.BindDescriptorSet(1, *m_bindlessSet);
     secondary.SetDepthBias(m_shadowSettings.depthBias, m_shadowSettings.depthBias * 1.5f, 0.0f);
     secondary.BeginGpuZone("ShadowView");
 
@@ -1320,7 +1943,7 @@ void DeferredRenderer::RecordShadowView(
         secondary.SetPushConstants(
             &pushConstants,
             pushConstantSize,
-            rhi::ShaderStageMask::Vertex);
+            rhi::ShaderStageMask::VertexFragment);
         secondary.DrawIndexed(item->indexCount, item->firstIndex);
     }
 
@@ -1351,11 +1974,39 @@ bool DeferredRenderer::LoadShaders(rhi::Device& device, const std::filesystem::p
     m_shadowFragmentShader = device.CreateShader(
         rhi::ShaderStage::Fragment,
         shaderDirectory / "shadow.frag.spv");
+    m_giTraceShader = device.CreateShader(
+        rhi::ShaderStage::Compute,
+        shaderDirectory / "gi_trace.comp.spv");
+    m_giTemporalShader = device.CreateShader(
+        rhi::ShaderStage::Compute,
+        shaderDirectory / "gi_temporal.comp.spv");
+    m_giAtrousShader = device.CreateShader(
+        rhi::ShaderStage::Compute,
+        shaderDirectory / "gi_atrous.comp.spv");
+    m_giUpsampleShader = device.CreateShader(
+        rhi::ShaderStage::Compute,
+        shaderDirectory / "gi_upsample.comp.spv");
+    m_rtShadowShader = device.CreateShader(
+        rhi::ShaderStage::Compute,
+        shaderDirectory / "rt_shadows.comp.spv");
+    m_giProbeShader = device.CreateShader(
+        rhi::ShaderStage::Compute,
+        shaderDirectory / "gi_probes.comp.spv");
+    m_debugLineVertexShader = device.CreateShader(
+        rhi::ShaderStage::Vertex,
+        shaderDirectory / "debug_line.vert.spv");
+    m_debugLineFragmentShader = device.CreateShader(
+        rhi::ShaderStage::Fragment,
+        shaderDirectory / "debug_line.frag.spv");
 
     if (m_gbufferVertexShader == nullptr || m_gbufferFragmentShader == nullptr ||
         m_lightingVertexShader == nullptr || m_lightingFragmentShader == nullptr ||
         m_clusterCullingShader == nullptr || m_shadowVertexShader == nullptr ||
-        m_shadowFragmentShader == nullptr)
+        m_shadowFragmentShader == nullptr || m_giTraceShader == nullptr ||
+        m_giTemporalShader == nullptr || m_giAtrousShader == nullptr ||
+        m_giUpsampleShader == nullptr || m_rtShadowShader == nullptr ||
+        m_giProbeShader == nullptr ||
+        m_debugLineVertexShader == nullptr || m_debugLineFragmentShader == nullptr)
     {
         MRE_CRITICAL("Failed to load the deferred shaders from '{}'", PathToUtf8(shaderDirectory));
         return false;
@@ -1381,7 +2032,8 @@ bool DeferredRenderer::CreatePipelines(rhi::Device& device)
     gbufferPipelineDesc.colorFormats = {
         rhi::Format::R8G8B8A8Unorm,
         rhi::Format::R8G8B8A8Unorm,
-        rhi::Format::R16G16B16A16Sfloat};
+        rhi::Format::R16G16B16A16Sfloat,
+        rhi::Format::R16G16Sfloat};
     gbufferPipelineDesc.depthFormat = rhi::Format::D32Sfloat;
     m_gbufferPipeline = device.CreatePipeline(gbufferPipelineDesc);
 
@@ -1401,24 +2053,85 @@ bool DeferredRenderer::CreatePipelines(rhi::Device& device)
     clusterPipelineDesc.descriptorSetLayouts = {m_clusterSetLayout.get()};
     m_clusterCullingPipeline = device.CreatePipeline(clusterPipelineDesc);
 
-    const std::array<const rhi::Shader*, 1> shadowStages{m_shadowVertexShader.get()};
+    const std::array<const rhi::Shader*, 2> shadowStages{
+        m_shadowVertexShader.get(),
+        m_shadowFragmentShader.get()};
 
     rhi::PipelineDesc shadowPipelineDesc{};
     shadowPipelineDesc.vertexShader = m_shadowVertexShader.get();
     shadowPipelineDesc.fragmentShader = m_shadowFragmentShader.get();
     rhi::ApplyShaderReflection(shadowPipelineDesc, shadowStages);
-    // The shadow pass only consumes positions but binds the same interleaved vertex buffers.
+    // The shadow pass consumes positions and UVs from the interleaved GltfVertex layout
+    // (position at byte 0, uv at byte 24); reflection cannot infer the interleaved offsets.
+    shadowPipelineDesc.vertexLayout = rhi::VertexLayout{};
+    shadowPipelineDesc.vertexLayout.AddAttribute(0, rhi::Format::R32G32B32Sfloat, 0);
+    shadowPipelineDesc.vertexLayout.AddAttribute(2, rhi::Format::R32G32Sfloat, 24);
     shadowPipelineDesc.vertexLayout.SetBindingStride(gbufferPipelineDesc.vertexLayout.GetStride());
     shadowPipelineDesc.depthTest = true;
     shadowPipelineDesc.depthWrite = true;
     shadowPipelineDesc.depthBiasEnable = true;
     shadowPipelineDesc.cullMode = rhi::CullMode::None;
-    shadowPipelineDesc.descriptorSetLayouts = {m_shadowSetLayout.get()};
+    // The fragment stage alpha-tests masked materials through the bindless textures.
+    shadowPipelineDesc.descriptorSetLayouts = {m_shadowSetLayout.get(), m_bindlessSetLayout.get()};
     shadowPipelineDesc.depthFormat = rhi::Format::D32Sfloat;
     m_shadowPipeline = device.CreatePipeline(shadowPipelineDesc);
 
+    const auto createGiPipeline = [&device](
+                                      const rhi::Shader& shader,
+                                      const rhi::DescriptorSetLayout& layout,
+                                      std::uint32_t pushConstantSize,
+                                      const rhi::DescriptorSetLayout* secondLayout = nullptr) {
+        rhi::PipelineDesc desc{};
+        desc.computeShader = &shader;
+        desc.descriptorSetLayouts = {&layout};
+        if (secondLayout != nullptr)
+        {
+            desc.descriptorSetLayouts.push_back(secondLayout);
+        }
+        desc.pushConstantSize = pushConstantSize;
+        desc.pushConstantStages = rhi::ShaderStageMask::Compute;
+        return device.CreatePipeline(desc);
+    };
+
+    // The trace pass also samples the bindless textures and reads the bindless geometry buffers.
+    m_giTracePipeline = createGiPipeline(*m_giTraceShader, *m_giTraceSetLayout, 0, m_bindlessSetLayout.get());
+    m_giTemporalPipeline = createGiPipeline(*m_giTemporalShader, *m_giTemporalSetLayout, 0);
+    m_giAtrousPipeline = createGiPipeline(*m_giAtrousShader, *m_giAtrousSetLayout, sizeof(GiAtrousPushConstants));
+    m_giUpsamplePipeline = createGiPipeline(*m_giUpsampleShader, *m_giUpsampleSetLayout, 0);
+
+    if (m_rtShadowSetLayout != nullptr)
+    {
+        m_rtShadowPipeline = createGiPipeline(*m_rtShadowShader, *m_rtShadowSetLayout, 0);
+    }
+
+    if (m_giProbeSetLayout != nullptr)
+    {
+        m_giProbePipeline =
+            createGiPipeline(*m_giProbeShader, *m_giProbeSetLayout, 0, m_bindlessSetLayout.get());
+    }
+
+    const std::array<const rhi::Shader*, 2> debugLineStages{
+        m_debugLineVertexShader.get(),
+        m_debugLineFragmentShader.get()};
+    rhi::PipelineDesc debugLinePipelineDesc{};
+    debugLinePipelineDesc.vertexShader = m_debugLineVertexShader.get();
+    debugLinePipelineDesc.fragmentShader = m_debugLineFragmentShader.get();
+    rhi::ApplyShaderReflection(debugLinePipelineDesc, debugLineStages);
+    debugLinePipelineDesc.topology = rhi::PrimitiveTopology::LineList;
+    debugLinePipelineDesc.depthTest = false;
+    debugLinePipelineDesc.depthWrite = false;
+    debugLinePipelineDesc.blend = true;
+    debugLinePipelineDesc.cullMode = rhi::CullMode::None;
+    debugLinePipelineDesc.colorFormats = {device.GetSwapchainInfo().format};
+    m_debugLinePipeline = device.CreatePipeline(debugLinePipelineDesc);
+
     return m_gbufferPipeline != nullptr && m_lightingPipeline != nullptr &&
-           m_clusterCullingPipeline != nullptr && m_shadowPipeline != nullptr;
+           m_clusterCullingPipeline != nullptr && m_shadowPipeline != nullptr &&
+           m_giTracePipeline != nullptr && m_giTemporalPipeline != nullptr &&
+           m_giAtrousPipeline != nullptr && m_giUpsamplePipeline != nullptr &&
+           m_debugLinePipeline != nullptr &&
+           (m_rtShadowSetLayout == nullptr || m_rtShadowPipeline != nullptr) &&
+           (m_giProbeSetLayout == nullptr || m_giProbePipeline != nullptr);
 }
 
 bool DeferredRenderer::CreateScene()
@@ -1438,6 +2151,10 @@ bool DeferredRenderer::CreateScene()
     ground.pushConstants.params = glm::vec4{0.9f, 0.0f, 0.0f, 0.0f};
     const std::uint32_t whiteIndex = m_whiteTexture->GetBindlessIndex();
     ground.pushConstants.textureIndices = glm::uvec2{whiteIndex, whiteIndex};
+    ground.vertexBufferIndex = m_nextBindlessBuffer++;
+    ground.indexBufferIndex = m_nextBindlessBuffer++;
+    m_bindlessSet->BindStorageBuffer(2, *m_planeVertexBuffer, ground.vertexBufferIndex);
+    m_bindlessSet->BindStorageBuffer(2, *m_planeIndexBuffer, ground.indexBufferIndex);
 
     if (m_device->IsRayTracingSupported() && m_planeVertexBuffer != nullptr && m_planeIndexBuffer != nullptr)
     {
@@ -1483,6 +2200,15 @@ void DeferredRenderer::CreateLightingSets(rhi::Device& device)
         lightingSet->BindSampler(9, *m_shadowSampler);
         lightingSet->BindTexture(10, *m_spotShadowMap, 0u);
         lightingSet->BindTexture(11, *m_pointShadowMap, 0u);
+        MRE_ASSERT(!m_gi.empty(), "GI resources must exist before creating the lighting sets");
+        lightingSet->BindTexture(12, *m_gi[frame].indirect, 0u);
+        lightingSet->BindTexture(
+            13,
+            m_rtSunShadowMask != nullptr ? *m_rtSunShadowMask : *m_whiteTexture,
+            0u);
+        lightingSet->BindStorageBuffer(
+            14,
+            m_giProbeBuffer != nullptr ? *m_giProbeBuffer : *m_giProbeDummyBuffer);
         m_lightingSets.push_back(std::move(lightingSet));
     }
 }
@@ -1656,6 +2382,31 @@ std::uint32_t DeferredRenderer::GetLightCount() const
     return static_cast<std::uint32_t>(std::min(m_lights.size(), static_cast<std::size_t>(kMaxLights)));
 }
 
+void DeferredRenderer::SetGiProbes(std::span<const GiProbe> probes)
+{
+    m_giProbes.assign(probes.begin(), probes.end());
+
+    // Probe markers double as the GI probe set; rebuilding resets their accumulated irradiance.
+    const std::size_t probeCount = std::min<std::size_t>(m_giProbes.size(), kMaxGiProbes);
+    bool changed = probeCount != m_giProbeData.size();
+    for (std::size_t index = 0; !changed && index < probeCount; ++index)
+    {
+        changed = m_giProbeData[index].position.x != m_giProbes[index].position.x ||
+                  m_giProbeData[index].position.y != m_giProbes[index].position.y ||
+                  m_giProbeData[index].position.z != m_giProbes[index].position.z;
+    }
+
+    if (changed)
+    {
+        m_giProbeData.assign(probeCount, GpuGiProbe{});
+        for (std::size_t index = 0; index < probeCount; ++index)
+        {
+            m_giProbeData[index].position = glm::vec4{m_giProbes[index].position, 1.0f};
+        }
+        m_giProbeDataDirty = true;
+    }
+}
+
 void DeferredRenderer::UpdateUniforms(std::uint32_t frameIndex, const FrameView& view)
 {
     MRE_ASSERT(frameIndex < m_uniformBuffers.size(), "Frame index out of range");
@@ -1700,6 +2451,7 @@ void DeferredRenderer::UpdateUniforms(std::uint32_t frameIndex, const FrameView&
     }
 
     m_sceneUniform.viewProjection = view.viewProjection;
+    m_sceneUniform.previousViewProjection = view.previousViewProjection;
     m_sceneUniform.view = view.view;
     m_sceneUniform.cameraPosition = glm::vec4{view.position, 1.0f};
     m_sceneUniform.clusterParams = glm::vec4{
@@ -1716,7 +2468,10 @@ void DeferredRenderer::UpdateUniforms(std::uint32_t frameIndex, const FrameView&
         static_cast<float>(m_gbuffer.GetWidth()),
         static_cast<float>(m_gbuffer.GetHeight()),
         m_clusterDebugView ? 1.0f : 0.0f,
-        0.0f};
+        IsPerPixelGiActive() ? 1.0f : 0.0f};
+    // ambientColor.w carries the active GI probe count to the lighting pass (0 disables them).
+    m_sceneUniform.ambientColor.w =
+        IsProbeGiActive() ? static_cast<float>(m_giProbeData.size()) : 0.0f;
     m_uniformBuffers[frameIndex]->Write(&m_sceneUniform, sizeof(SceneUniform));
 
     m_clusterUniform.inverseView = glm::inverse(view.view);
@@ -1742,6 +2497,8 @@ void DeferredRenderer::UpdateUniforms(std::uint32_t frameIndex, const FrameView&
         m_zeroClusterCounts.size() * sizeof(std::uint32_t));
 
     UpdateShadowUniforms(frameIndex, view);
+    UpdateGiUniform(frameIndex, view);
+    UpdateRtShadowUniform(frameIndex);
 }
 
 const Light* DeferredRenderer::FindShadowLight() const
@@ -1805,7 +2562,224 @@ void DeferredRenderer::UpdateShadowUniforms(std::uint32_t frameIndex, const Fram
         }
     }
 
+    m_shadowUniform.rtParams.x = IsRtShadowActive() ? 1.0f : 0.0f;
+
     m_shadowUniformBuffers[frameIndex]->Write(&m_shadowUniform, sizeof(ShadowUniform));
+}
+
+bool DeferredRenderer::IsRtShadowActive() const
+{
+    return m_shadowSettings.rtSunShadows && m_shadowSettings.enabled &&
+           m_device != nullptr && m_device->IsRayTracingSupported() &&
+           m_rtShadowPipeline != nullptr && m_rtSunShadowMask != nullptr &&
+           FindShadowLight() != nullptr;
+}
+
+bool DeferredRenderer::CreateRtShadowResources(rhi::Device& device)
+{
+    m_rtShadowUniformBuffers.clear();
+    m_rtShadowSets.clear();
+    m_rtSunShadowMask.reset();
+
+    if (!device.IsRayTracingSupported() || m_rtShadowPipeline == nullptr)
+    {
+        return true;
+    }
+
+    m_rtSunShadowMask = device.CreateTexture(rhi::TextureDesc{
+        m_gbuffer.GetWidth(),
+        m_gbuffer.GetHeight(),
+        rhi::Format::R16Sfloat,
+        rhi::TextureUsage::Storage});
+    if (m_rtSunShadowMask == nullptr)
+    {
+        MRE_CRITICAL("Failed to create the ray traced sun shadow mask");
+        return false;
+    }
+
+    const std::uint32_t framesInFlight = device.GetFramesInFlight();
+    m_rtShadowUniformBuffers.reserve(framesInFlight);
+    m_rtShadowSets.reserve(framesInFlight);
+    for (std::uint32_t frame = 0; frame < framesInFlight; ++frame)
+    {
+        m_rtShadowUniformBuffers.push_back(device.CreateBuffer(
+            rhi::BufferDesc{sizeof(RtShadowUniform), rhi::BufferUsage::Uniform, true}));
+
+        std::unique_ptr<rhi::DescriptorSet> set = device.CreateDescriptorSet(*m_rtShadowSetLayout);
+        set->BindBuffer(0, *m_rtShadowUniformBuffers.back());
+        m_rtShadowSets.push_back(std::move(set));
+    }
+
+    m_lightingSetsDirty = true;
+    MRE_INFO(
+        "Ray traced sun shadow resources created ({}x{})",
+        m_gbuffer.GetWidth(),
+        m_gbuffer.GetHeight());
+    return true;
+}
+
+void DeferredRenderer::UpdateRtShadowUniform(std::uint32_t frameIndex)
+{
+    if (m_rtShadowSets.size() <= frameIndex || !IsRtShadowActive())
+    {
+        return;
+    }
+
+    const Light* sun = FindShadowLight();
+    if (sun == nullptr)
+    {
+        return;
+    }
+
+    const float length = glm::length(sun->direction);
+    const glm::vec3 direction = length > 1e-4f ? -sun->direction / length : glm::vec3{0.0f, -1.0f, 0.0f};
+
+    m_rtShadowUniform.screenSize = glm::vec4{
+        static_cast<float>(m_gbuffer.GetWidth()),
+        static_cast<float>(m_gbuffer.GetHeight()),
+        0.0f,
+        0.0f};
+    m_rtShadowUniform.sunDirectionIntensity = glm::vec4{direction, sun->intensity};
+    m_rtShadowUniform.params = glm::vec4{
+        static_cast<float>(std::clamp(m_shadowSettings.rtShadowSamples, 1u, 16u)),
+        m_shadowSettings.rtSunAngularRadiusDegrees * 3.14159265358979323846f / 180.0f,
+        static_cast<float>(m_giFrameCounter),
+        std::max(m_shadowSettings.normalBias, 0.0f)};
+
+    m_rtShadowUniformBuffers[frameIndex]->Write(&m_rtShadowUniform, sizeof(RtShadowUniform));
+}
+
+void DeferredRenderer::RecordRtShadowPass(rhi::CommandList& commandList, std::uint32_t frameIndex)
+{
+    if (!IsRtShadowActive() || m_rtShadowSets.size() <= frameIndex)
+    {
+        return;
+    }
+
+    // Bind after the G-buffer pass so the position/normal textures are shader readable.
+    m_rtShadowSets[frameIndex]->BindAccelerationStructure(1, *m_tlas[frameIndex]);
+    m_rtShadowSets[frameIndex]->BindTexture(2, m_gbuffer.GetPosition(), 0u);
+    m_rtShadowSets[frameIndex]->BindTexture(3, m_gbuffer.GetNormal(), 0u);
+    m_rtShadowSets[frameIndex]->BindStorageImage(4, *m_rtSunShadowMask);
+
+    commandList.BeginGpuZone("RtSunShadows");
+    commandList.BindPipeline(*m_rtShadowPipeline);
+    commandList.BindDescriptorSet(0, *m_rtShadowSets[frameIndex]);
+    commandList.Dispatch(
+        (m_gbuffer.GetWidth() + 7) / 8,
+        (m_gbuffer.GetHeight() + 7) / 8,
+        1);
+    // The GI trace samples the mask in a later compute pass, so include compute in the barrier.
+    commandList.ShaderMemoryBarrier(
+        rhi::ShaderStageMask::Compute,
+        rhi::ShaderStageMask::FragmentCompute);
+    commandList.EndGpuZone();
+}
+
+bool DeferredRenderer::IsProbeGiActive() const
+{
+    return m_giSettings.enabled && m_giSettings.useProbes &&
+           m_device != nullptr && m_device->IsRayTracingSupported() &&
+           m_giProbePipeline != nullptr && !m_giProbeData.empty();
+}
+
+bool DeferredRenderer::IsPerPixelGiActive() const
+{
+    if (!IsGiActive())
+    {
+        return false;
+    }
+
+    // Probe mode replaces the per-pixel trace so indirect lighting is not counted twice.
+    return !IsProbeGiActive();
+}
+
+bool DeferredRenderer::CreateGiProbeResources(rhi::Device& device)
+{
+    m_giProbeUniformBuffers.clear();
+    m_giProbeSets.clear();
+    m_giProbeDummyBuffer.reset();
+
+    if (!device.IsRayTracingSupported() || m_giProbePipeline == nullptr)
+    {
+        return true;
+    }
+
+    const GpuGiProbe zeroProbe{};
+    m_giProbeDummyBuffer = device.CreateBuffer(
+        rhi::BufferDesc{sizeof(GpuGiProbe), rhi::BufferUsage::Storage, true},
+        &zeroProbe,
+        sizeof(GpuGiProbe));
+    if (m_giProbeDummyBuffer == nullptr)
+    {
+        MRE_CRITICAL("Failed to create the dummy GI probe buffer");
+        return false;
+    }
+
+    const std::uint32_t framesInFlight = device.GetFramesInFlight();
+    m_giProbeUniformBuffers.reserve(framesInFlight);
+    m_giProbeSets.reserve(framesInFlight);
+    for (std::uint32_t frame = 0; frame < framesInFlight; ++frame)
+    {
+        m_giProbeUniformBuffers.push_back(device.CreateBuffer(
+            rhi::BufferDesc{sizeof(GiUniform), rhi::BufferUsage::Uniform, true}));
+
+        std::unique_ptr<rhi::DescriptorSet> set = device.CreateDescriptorSet(*m_giProbeSetLayout);
+        set->BindBuffer(0, *m_giProbeUniformBuffers.back());
+        m_giProbeSets.push_back(std::move(set));
+    }
+
+    m_lightingSetsDirty = true;
+    MRE_INFO("GI probe resources created (up to {} probes)", kMaxGiProbes);
+    return true;
+}
+
+void DeferredRenderer::RecordGiProbes(rhi::CommandList& commandList, std::uint32_t frameIndex)
+{
+    if (!IsProbeGiActive() || m_giProbeSets.size() <= frameIndex ||
+        m_tlas.empty() || m_tlas[frameIndex] == nullptr)
+    {
+        return;
+    }
+
+    const std::uint64_t probeBytes = m_giProbeData.size() * sizeof(GpuGiProbe);
+    if (m_giProbeDataDirty)
+    {
+        if (m_giProbeBuffer == nullptr || m_giProbeBuffer->GetSize() < probeBytes)
+        {
+            m_giProbeBuffer = m_device->CreateBuffer(
+                rhi::BufferDesc{probeBytes, rhi::BufferUsage::Storage, true});
+            MRE_ASSERT(m_giProbeBuffer != nullptr, "Failed to create the GI probe buffer");
+            m_lightingSetsDirty = true;
+        }
+        m_giProbeBuffer->Write(m_giProbeData.data(), probeBytes);
+        m_giProbeDataDirty = false;
+    }
+
+    // Bind after the G-buffer pass so the depth texture is shader readable.
+    rhi::DescriptorSet& set = *m_giProbeSets[frameIndex];
+    set.BindAccelerationStructure(1, *m_tlas[frameIndex]);
+    if (frameIndex < m_geometryDataBuffers.size() && m_geometryDataBuffers[frameIndex] != nullptr)
+    {
+        set.BindStorageBuffer(2, *m_geometryDataBuffers[frameIndex]);
+    }
+    set.BindTexture(3, m_gbuffer.GetDepth(), 0u);
+    set.BindTexture(4, *m_whiteTexture, 0u);
+    set.BindStorageBuffer(5, *m_giProbeBuffer);
+    set.BindStorageBuffer(6, *m_giProbeBuffer);
+    set.BindTexture(
+        9,
+        m_rtSunShadowMask != nullptr ? *m_rtSunShadowMask : *m_whiteTexture,
+        0u);
+
+    const std::uint32_t probeCount = static_cast<std::uint32_t>(m_giProbeData.size());
+    commandList.BeginGpuZone("GiProbes");
+    commandList.BindPipeline(*m_giProbePipeline);
+    commandList.BindDescriptorSet(0, set);
+    commandList.BindDescriptorSet(1, *m_bindlessSet);
+    commandList.Dispatch((probeCount + 63) / 64, 1, 1);
+    commandList.ShaderMemoryBarrier(rhi::ShaderStageMask::Compute, rhi::ShaderStageMask::Fragment);
+    commandList.EndGpuZone();
 }
 
 std::uint32_t DeferredRenderer::GetSamplerIndex(rhi::AddressMode addressModeU, rhi::AddressMode addressModeV)

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -16,8 +17,10 @@
 
 #include "Assets/AsyncGltfLoader.h"
 #include "Renderer/BufferManager.h"
+#include "Renderer/Debug/DebugLines.h"
 #include "Renderer/Deferred/GBuffer.h"
 #include "Renderer/FrameView.h"
+#include "Renderer/GlobalIllumination/GiTypes.h"
 #include "Renderer/Lighting/ClusterGrid.h"
 #include "Renderer/Lighting/Light.h"
 #include "Renderer/Lighting/ShadowCascade.h"
@@ -33,6 +36,7 @@ struct SceneDescription;
 struct SceneUniform
 {
     glm::mat4 viewProjection{1.0f};
+    glm::mat4 previousViewProjection{1.0f};
     glm::mat4 view{1.0f};
     glm::vec4 cameraPosition{0.0f};
     glm::vec4 ambientColor{0.0f};
@@ -57,6 +61,13 @@ struct ObjectPushConstants
     glm::vec4 params{0.0f};
     glm::uvec2 textureIndices{0u};
     glm::uvec2 samplerIndices{0u};
+    std::uint32_t drawIndex = 0;
+};
+
+// Per draw item data indexed by ObjectPushConstants::drawIndex.
+struct GpuObjectData
+{
+    glm::mat4 previousModel{1.0f};
 };
 
 class DeferredRenderer
@@ -98,10 +109,25 @@ public:
     void SetClusterDebugView(bool enabled) { m_clusterDebugView = enabled; }
     [[nodiscard]] bool IsClusterDebugViewEnabled() const { return m_clusterDebugView; }
 
+    // World space debug gizmos: wireframe markers for lights and world space GI probes.
+    void SetGiProbes(std::span<const GiProbe> probes);
+    void SetGizmoView(bool showLights, bool showProbes)
+    {
+        m_showLightGizmos = showLights;
+        m_showProbeGizmos = showProbes;
+    }
+    [[nodiscard]] bool AreLightGizmosEnabled() const { return m_showLightGizmos; }
+    [[nodiscard]] bool AreProbeGizmosEnabled() const { return m_showProbeGizmos; }
+
     // Directional cascaded shadow map settings. Shadows come from the first directional light that
     // has Light::castShadows set.
     void SetShadowSettings(const ShadowSettings& settings) { m_shadowSettings = settings; }
     [[nodiscard]] const ShadowSettings& GetShadowSettings() const { return m_shadowSettings; }
+
+    // Ray traced diffuse and glossy global illumination settings.
+    void SetGiSettings(const GiSettings& settings);
+    [[nodiscard]] const GiSettings& GetGiSettings() const { return m_giSettings; }
+    [[nodiscard]] bool IsGiActive() const;
 
     bool LoadModel(const std::filesystem::path& path);
     void RequestModelLoad(const std::filesystem::path& path);
@@ -124,6 +150,7 @@ public:
     [[nodiscard]] rhi::Texture& GetAlbedoTexture() { return m_gbuffer.GetAlbedo(); }
     [[nodiscard]] rhi::Texture& GetNormalTexture() { return m_gbuffer.GetNormal(); }
     [[nodiscard]] rhi::Texture& GetPositionTexture() { return m_gbuffer.GetPosition(); }
+    [[nodiscard]] rhi::Texture& GetMotionTexture() { return m_gbuffer.GetMotion(); }
 
 private:
     struct DrawItem
@@ -134,15 +161,21 @@ private:
         std::uint32_t firstIndex = 0;
         ObjectPushConstants pushConstants{};
         const rhi::AccelerationStructure* blas = nullptr;
+        std::uint32_t vertexBufferIndex = 0;
+        std::uint32_t indexBufferIndex = 0;
     };
 
     // Per draw item data read by ray traced effects (global illumination color bleeding).
     struct GpuGeometryData
     {
-        glm::vec4 baseColorFactor{1.0f};
-        glm::uvec4 textureIndices{0u}; // x: base color texture, y: metallic-roughness texture
-        glm::uvec4 samplerIndices{0u}; // x: base color sampler, y: metallic-roughness sampler
+        glm::vec4 baseColorFactor{1.0f}; // rgb: albedo, a: unused
+        glm::uvec4 bufferIndices{0u};    // x: vertex buffer, y: index buffer, z: vertex stride
+        glm::uvec4 textureIndices{0u};   // x: base color texture, y: metallic-roughness texture
+        glm::uvec4 samplerIndices{0u};   // x: base color sampler, y: metallic-roughness sampler
+        glm::vec4 params{0.0f};          // x: roughness, y: metalness
     };
+
+    inline static constexpr std::uint32_t kMaxObjectData = 2048;
 
     struct Material
     {
@@ -162,6 +195,8 @@ private:
         std::vector<Material> materials{};
         std::vector<std::unique_ptr<rhi::Buffer>> vertexBuffers{};
         std::vector<std::unique_ptr<rhi::Buffer>> indexBuffers{};
+        std::vector<std::uint32_t> vertexBufferIndices{};
+        std::vector<std::uint32_t> indexBufferIndices{};
         std::vector<std::unique_ptr<rhi::AccelerationStructure>> accelerationStructures{};
         std::vector<DrawItem> drawItems{};
         SceneObjectBounds fittedBounds{};
@@ -189,6 +224,15 @@ private:
         glm::mat4 viewProjections[kMaxShadowViews]{}; // cascades, spot maps, point cube faces
         glm::vec4 cascadeSplits{0.0f}; // x, y, z: split distances between cascades
         glm::vec4 params{0.0f};        // x: depthBias, y: normalBias, z: distance, w: enabled
+        glm::vec4 rtParams{0.0f};      // x: ray traced sun shadows enabled, y/z/w: unused
+    };
+
+    // Matches Renderer/Shaders/rt_shadows.comp.slang.
+    struct RtShadowUniform
+    {
+        glm::vec4 screenSize{0.0f};            // x: width, y: height
+        glm::vec4 sunDirectionIntensity{0.0f}; // xyz: toward the sun, w: intensity
+        glm::vec4 params{0.0f}; // x: samples, y: angular radius (radians), z: frame counter, w: normal bias
     };
 
     // One shadow map render view: a cascade layer, a spot layer or a point cube face (rendered
@@ -207,6 +251,36 @@ private:
         const DrawItem* item = nullptr;
         glm::vec3 center{0.0f};
         float radius = 0.0f;
+    };
+
+    struct GiAtrousPushConstants
+    {
+        std::uint32_t signal = 0;
+        std::uint32_t iteration = 0;
+    };
+
+    static constexpr std::uint32_t kMaxAtrousIterations = 8;
+
+    struct GiFrameResources
+    {
+        std::unique_ptr<rhi::Texture> diffuseNoisy{};
+        std::unique_ptr<rhi::Texture> specularNoisy{};
+        std::unique_ptr<rhi::Texture> hitDistance{};
+        std::unique_ptr<rhi::Texture> diffuseHistory[2]{};
+        std::unique_ptr<rhi::Texture> specularHistory[2]{};
+        std::unique_ptr<rhi::Texture> diffuseMoments[2]{};
+        std::unique_ptr<rhi::Texture> specularMoments[2]{};
+        std::unique_ptr<rhi::Texture> diffuseFiltered{};
+        std::unique_ptr<rhi::Texture> specularFiltered{};
+        std::unique_ptr<rhi::Texture> indirect{};
+        std::unique_ptr<rhi::Buffer> uniformBuffer{};
+        std::unique_ptr<rhi::DescriptorSet> traceSet{};
+        std::unique_ptr<rhi::DescriptorSet> temporalSet{};
+        // One descriptor set per iteration and signal: a set must never be updated after binding.
+        std::array<std::unique_ptr<rhi::DescriptorSet>, kMaxAtrousIterations * 2> atrousSets{};
+        std::unique_ptr<rhi::DescriptorSet> upsampleSet{};
+        std::uint32_t historyParity = 0;
+        bool historyValid = false;
     };
 
     bool LoadShaders(rhi::Device& device, const std::filesystem::path& shaderDirectory);
@@ -231,7 +305,21 @@ private:
         rhi::CommandList& secondary,
         const rhi::RenderingDesc& desc);
     void ApplyModelScale();
+    void UpdateObjectData(std::uint32_t frameIndex);
     void BuildAccelerationStructures(rhi::CommandList& commandList, std::uint32_t frameIndex);
+    bool CreateGiResources(rhi::Device& device);
+    void UpdateGiUniform(std::uint32_t frameIndex, const FrameView& view);
+    void BindGiDescriptors(std::uint32_t frameIndex);
+    void RecordGiPasses(rhi::CommandList& commandList, std::uint32_t frameIndex);
+    bool CreateRtShadowResources(rhi::Device& device);
+    void UpdateRtShadowUniform(std::uint32_t frameIndex);
+    void RecordRtShadowPass(rhi::CommandList& commandList, std::uint32_t frameIndex);
+    [[nodiscard]] bool IsRtShadowActive() const;
+    bool CreateGiProbeResources(rhi::Device& device);
+    void RecordGiProbes(rhi::CommandList& commandList, std::uint32_t frameIndex);
+    [[nodiscard]] bool IsProbeGiActive() const;
+    [[nodiscard]] bool IsPerPixelGiActive() const;
+    void RecordDebugLines(rhi::CommandList& commandList, const FrameView& view);
     [[nodiscard]] std::optional<std::size_t> UploadModel(const std::filesystem::path& path, GltfModel& model);
     [[nodiscard]] std::optional<std::size_t> LoadModelResources(const std::filesystem::path& path);
     void AddModelInstance(std::size_t modelIndex, const glm::mat4& transform);
@@ -298,10 +386,56 @@ private:
     std::vector<glm::mat4> m_modelBaseTransforms{};
     std::vector<std::unique_ptr<ModelResources>> m_models{};
     std::unique_ptr<rhi::AccelerationStructure> m_planeBlas{};
+    std::vector<std::unique_ptr<rhi::Buffer>> m_objectDataBuffers{};
+    std::vector<glm::mat4> m_previousModels{};
+    std::vector<GiFrameResources> m_gi{};
+    std::unique_ptr<rhi::DescriptorSetLayout> m_giTraceSetLayout{};
+    std::unique_ptr<rhi::DescriptorSetLayout> m_giTemporalSetLayout{};
+    std::unique_ptr<rhi::DescriptorSetLayout> m_giAtrousSetLayout{};
+    std::unique_ptr<rhi::DescriptorSetLayout> m_giUpsampleSetLayout{};
+    std::unique_ptr<rhi::Shader> m_giTraceShader{};
+    std::unique_ptr<rhi::Shader> m_giTemporalShader{};
+    std::unique_ptr<rhi::Shader> m_giAtrousShader{};
+    std::unique_ptr<rhi::Shader> m_giUpsampleShader{};
+    std::unique_ptr<rhi::Pipeline> m_giTracePipeline{};
+    std::unique_ptr<rhi::Pipeline> m_giTemporalPipeline{};
+    std::unique_ptr<rhi::Pipeline> m_giAtrousPipeline{};
+    std::unique_ptr<rhi::Pipeline> m_giUpsamplePipeline{};
+    GiUniform m_giUniform{};
+    GiSettings m_giSettings{};
+    std::uint32_t m_giFrameCounter = 0;
+    std::unique_ptr<rhi::Shader> m_rtShadowShader{};
+    std::unique_ptr<rhi::DescriptorSetLayout> m_rtShadowSetLayout{};
+    std::unique_ptr<rhi::Pipeline> m_rtShadowPipeline{};
+    std::unique_ptr<rhi::Texture> m_rtSunShadowMask{};
+    std::vector<std::unique_ptr<rhi::Buffer>> m_rtShadowUniformBuffers{};
+    std::vector<std::unique_ptr<rhi::DescriptorSet>> m_rtShadowSets{};
+    RtShadowUniform m_rtShadowUniform{};
+    std::unique_ptr<rhi::Shader> m_giProbeShader{};
+    std::unique_ptr<rhi::DescriptorSetLayout> m_giProbeSetLayout{};
+    std::unique_ptr<rhi::Pipeline> m_giProbePipeline{};
+    std::vector<std::unique_ptr<rhi::Buffer>> m_giProbeUniformBuffers{};
+    std::vector<std::unique_ptr<rhi::DescriptorSet>> m_giProbeSets{};
+    std::unique_ptr<rhi::Buffer> m_giProbeBuffer{};
+    std::unique_ptr<rhi::Buffer> m_giProbeDummyBuffer{};
+    std::vector<GpuGiProbe> m_giProbeData{};
+    bool m_giProbeDataDirty = false;
+    bool m_probeGiActiveLastFrame = false;
+    GiUniform m_giProbeUniform{};
+    std::unique_ptr<rhi::Shader> m_debugLineVertexShader{};
+    std::unique_ptr<rhi::Shader> m_debugLineFragmentShader{};
+    std::unique_ptr<rhi::Pipeline> m_debugLinePipeline{};
+    std::vector<std::unique_ptr<rhi::Buffer>> m_debugLineBuffers{};
+    std::size_t m_debugLineBufferCapacity = 0;
+    std::vector<GiProbe> m_giProbes{};
+    bool m_showLightGizmos = true;
+    bool m_showProbeGizmos = true;
+    glm::mat4 m_inverseViewProjection{1.0f};
     std::vector<std::unique_ptr<rhi::AccelerationStructure>> m_tlas{};
     std::vector<std::unique_ptr<rhi::Buffer>> m_geometryDataBuffers{};
     std::vector<GpuGeometryData> m_geometryData{};
     std::size_t m_tlasInstanceCount = 0;
+    std::uint32_t m_nextBindlessBuffer = 0;
     bool m_blasDirty = false;
     std::unordered_map<std::string, std::size_t> m_modelCache{};
     std::vector<SceneObjectInstance> m_objectInstances{};

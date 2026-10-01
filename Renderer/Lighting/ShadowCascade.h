@@ -44,6 +44,11 @@ struct ShadowSettings
     float lambda = 0.95f;      // 0 = uniform splits, 1 = logarithmic splits
     float depthBias = 1.25f;   // constant depth bias applied in the shadow pass
     float normalBias = 0.03f;  // world-space offset along the surface normal when sampling
+    // Optional hardware ray traced sun shadows. When enabled the lighting pass resolves the sun
+    // visibility from a traced mask instead of the cascaded shadow map.
+    bool rtSunShadows = true;
+    std::uint32_t rtShadowSamples = 4;
+    float rtSunAngularRadiusDegrees = 0.5f;
 };
 
 struct ShadowCascade

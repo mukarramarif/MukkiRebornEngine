@@ -13,7 +13,7 @@
       "name": "Sponza",
       "model": "Sponza/glTF/Sponza.gltf",
       "position": [0.0, 0.0, 0.0],
-      "rotation": [0.0, 40.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0],
       "scale": [20.0, 20.0, 20.0]
     },
     {
@@ -51,6 +51,14 @@
       "rotation": [0.0, 180.0, 0.0],
       "scale": [0.8, 0.8, 0.8]
     }
+  ],
+  "probes": [
+    { "name": "Probe Center", "position": [0.0, 2.5, 0.0], "radius": 0.4 },
+    { "name": "Probe Left", "position": [-4.0, 2.0, 0.0], "radius": 0.4 },
+    { "name": "Probe Right", "position": [4.0, 2.0, 0.0], "radius": 0.4 },
+    { "name": "Probe Front", "position": [0.0, 2.0, 4.0], "radius": 0.4 },
+    { "name": "Probe Back", "position": [0.0, 2.0, -4.0], "radius": 0.4 },
+    { "name": "Probe High", "position": [0.0, 5.0, 0.0], "radius": 0.4 }
   ],
   "lights": [
     {

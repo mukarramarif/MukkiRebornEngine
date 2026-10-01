@@ -19,6 +19,7 @@ bool GBuffer::Init(rhi::Device& device, std::uint32_t width, std::uint32_t heigh
 
 void GBuffer::Shutdown()
 {
+    m_motion.reset();
     m_depth.reset();
     m_position.reset();
     m_normal.reset();
@@ -41,6 +42,7 @@ bool GBuffer::Resize(rhi::Device& device, std::uint32_t width, std::uint32_t hei
 
     MRE_INFO("Resizing the G-buffer to {}x{}", width, height);
 
+    m_motion.reset();
     m_depth.reset();
     m_position.reset();
     m_normal.reset();
@@ -73,13 +75,20 @@ bool GBuffer::CreateTextures(rhi::Device& device)
         m_height,
         rhi::Format::D32Sfloat,
         rhi::TextureUsage::DepthAttachment};
+    const rhi::TextureDesc motionDesc{
+        m_width,
+        m_height,
+        rhi::Format::R16G16Sfloat,
+        rhi::TextureUsage::ColorAttachment};
 
     m_albedo = device.CreateTexture(albedoDesc);
     m_normal = device.CreateTexture(normalDesc);
     m_position = device.CreateTexture(positionDesc);
     m_depth = device.CreateTexture(depthDesc);
+    m_motion = device.CreateTexture(motionDesc);
 
-    if (m_albedo == nullptr || m_normal == nullptr || m_position == nullptr || m_depth == nullptr)
+    if (m_albedo == nullptr || m_normal == nullptr || m_position == nullptr || m_depth == nullptr ||
+        m_motion == nullptr)
     {
         MRE_CRITICAL("Failed to create the G-buffer textures");
         Shutdown();

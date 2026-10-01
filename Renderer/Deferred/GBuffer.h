@@ -34,6 +34,7 @@ public:
     [[nodiscard]] rhi::Texture& GetNormal() { return *m_normal; }
     [[nodiscard]] rhi::Texture& GetPosition() { return *m_position; }
     [[nodiscard]] rhi::Texture& GetDepth() { return *m_depth; }
+    [[nodiscard]] rhi::Texture& GetMotion() { return *m_motion; }
 
 private:
     bool CreateTextures(rhi::Device& device);
@@ -42,6 +43,7 @@ private:
     std::unique_ptr<rhi::Texture> m_normal{};
     std::unique_ptr<rhi::Texture> m_position{};
     std::unique_ptr<rhi::Texture> m_depth{};
+    std::unique_ptr<rhi::Texture> m_motion{};
     std::uint32_t m_width = 0;
     std::uint32_t m_height = 0;
 };

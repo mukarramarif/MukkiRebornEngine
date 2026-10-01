@@ -24,6 +24,17 @@ constexpr const char* kSceneText = R"({
       "model": "Duck.gltf"
     }
   ],
+  "probes": [
+    {
+      "name": "Center",
+      "position": [0.0, 2.5, 0.0],
+      "radius": 0.75
+    },
+    {
+      "position": [-4.0, 1.5, 0.0],
+      "enabled": false
+    }
+  ],
   "lights": [
     {
       "name": "Sun",
@@ -81,6 +92,14 @@ TEST(SceneJson, ParsesObjectsAndLights)
     EXPECT_EQ(scene.objects[1].name, "Object 1");
     EXPECT_FLOAT_EQ(scene.objects[1].scale.y, 1.0f);
 
+    ASSERT_EQ(scene.probes.size(), 2u);
+    EXPECT_EQ(scene.probes[0].name, "Center");
+    EXPECT_FLOAT_EQ(scene.probes[0].position.y, 2.5f);
+    EXPECT_FLOAT_EQ(scene.probes[0].radius, 0.75f);
+    EXPECT_TRUE(scene.probes[0].enabled);
+    EXPECT_EQ(scene.probes[1].name, "Probe 1");
+    EXPECT_FALSE(scene.probes[1].enabled);
+
     ASSERT_EQ(scene.lights.size(), 3u);
     EXPECT_EQ(scene.lights[0].name, "Sun");
     EXPECT_EQ(scene.lights[0].light.type, mukki::LightType::Directional);
@@ -112,6 +131,7 @@ TEST(SceneJson, RoundTripsThroughSerialization)
     EXPECT_EQ(reloaded.assetRoot, scene.assetRoot);
     ASSERT_EQ(reloaded.objects.size(), scene.objects.size());
     ASSERT_EQ(reloaded.lights.size(), scene.lights.size());
+    ASSERT_EQ(reloaded.probes.size(), scene.probes.size());
 
     for (std::size_t index = 0; index < scene.objects.size(); ++index)
     {
@@ -120,6 +140,14 @@ TEST(SceneJson, RoundTripsThroughSerialization)
         EXPECT_FLOAT_EQ(reloaded.objects[index].position.x, scene.objects[index].position.x);
         EXPECT_FLOAT_EQ(reloaded.objects[index].rotation.z, scene.objects[index].rotation.z);
         EXPECT_FLOAT_EQ(reloaded.objects[index].scale.z, scene.objects[index].scale.z);
+    }
+
+    for (std::size_t index = 0; index < scene.probes.size(); ++index)
+    {
+        EXPECT_EQ(reloaded.probes[index].name, scene.probes[index].name);
+        EXPECT_FLOAT_EQ(reloaded.probes[index].position.y, scene.probes[index].position.y);
+        EXPECT_FLOAT_EQ(reloaded.probes[index].radius, scene.probes[index].radius);
+        EXPECT_EQ(reloaded.probes[index].enabled, scene.probes[index].enabled);
     }
 
     for (std::size_t index = 0; index < scene.lights.size(); ++index)

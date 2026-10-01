@@ -1,6 +1,7 @@
 struct SceneUniform
 {
     float4x4 viewProjection;
+    float4x4 previousViewProjection;
     float4x4 view;
     float4 cameraPosition;
     float4 ambientColor;
@@ -9,8 +10,6 @@ struct SceneUniform
     float4 screenSize;
 };
 
-[[vk::binding(0, 0)]] ConstantBuffer<SceneUniform> gScene;
-
 struct ObjectPushConstants
 {
     float4x4 model;
@@ -18,8 +17,16 @@ struct ObjectPushConstants
     float4 params;
     uint2 textureIndices;
     uint2 samplerIndices;
+    uint drawIndex;
 };
 
+struct GpuObjectData
+{
+    float4x4 previousModel;
+};
+
+[[vk::binding(0, 0)]] ConstantBuffer<SceneUniform> gScene;
+[[vk::binding(1, 0)]] StructuredBuffer<GpuObjectData> gObjects;
 [[vk::push_constant]] ConstantBuffer<ObjectPushConstants> gObject;
 
 struct VertexInput
@@ -35,17 +42,21 @@ struct VertexOutput
     [[vk::location(0)]] float3 worldPosition : WORLDPOS;
     [[vk::location(1)]] float3 normal : NORMAL;
     [[vk::location(2)]] float2 uv : TEXCOORD0;
+    [[vk::location(3)]] float4 previousClip : PREVIOUSCLIP;
 };
 
 [shader("vertex")]
 VertexOutput vertexMain(VertexInput input)
 {
-    const float4 worldPosition = mul(gObject.model, float4(input.position, 1.0));
+    const float4 localPosition = float4(input.position, 1.0);
+    const float4 worldPosition = mul(gObject.model, localPosition);
+    const float4 previousWorldPosition = mul(gObjects[gObject.drawIndex].previousModel, localPosition);
 
     VertexOutput output;
     output.position = mul(gScene.viewProjection, worldPosition);
     output.worldPosition = worldPosition.xyz;
     output.normal = mul((float3x3)gObject.model, input.normal);
     output.uv = input.uv;
+    output.previousClip = mul(gScene.previousViewProjection, previousWorldPosition);
     return output;
 }

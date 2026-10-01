@@ -17,7 +17,10 @@ enum class Format : std::uint8_t
     R8G8B8A8Srgb,
     B8G8R8A8Unorm,
     B8G8R8A8Srgb,
+    R16Sfloat,
+    R16G16Sfloat,
     R16G16B16A16Sfloat,
+    R32Sfloat,
     R32G32Sfloat,
     R32G32B32Sfloat,
     R32G32B32A32Sfloat,
@@ -48,6 +51,7 @@ enum class TextureUsage : std::uint8_t
     Sampled = 0,
     ColorAttachment,
     DepthAttachment,
+    Storage,
 };
 
 enum class ShaderStage : std::uint8_t
@@ -64,6 +68,7 @@ enum class ShaderStageMask : std::uint8_t
     Fragment = 2,
     Compute = 4,
     VertexFragment = 3,
+    FragmentCompute = 6,
 };
 
 enum class CullMode : std::uint8_t
@@ -71,6 +76,12 @@ enum class CullMode : std::uint8_t
     None = 0,
     Front,
     Back,
+};
+
+enum class PrimitiveTopology : std::uint8_t
+{
+    TriangleList = 0,
+    LineList,
 };
 
 enum class Filter : std::uint8_t
@@ -93,11 +104,13 @@ enum class DescriptorType : std::uint8_t
     CombinedImageSampler,
     SampledImage,
     Sampler,
+    StorageImage,
     AccelerationStructure,
 };
 
 inline constexpr std::uint32_t kMaxBindlessTextures = 4096;
 inline constexpr std::uint32_t kMaxBindlessSamplers = 16;
+inline constexpr std::uint32_t kMaxBindlessBuffers = 1024;
 
 struct Extent2D
 {
@@ -276,6 +289,8 @@ class VertexLayout
 {
 public:
     void AddAttribute(std::uint32_t location, Format format);
+    // Explicit offset for shaders that consume a subset of an interleaved vertex format.
+    void AddAttribute(std::uint32_t location, Format format, std::uint32_t offset);
 
     // Overrides the vertex binding stride for pipelines that only consume a prefix of the vertex
     // format (for example a depth-only shadow pipeline). Attribute offsets keep using the stride
@@ -362,6 +377,11 @@ public:
     virtual void BindTexture(std::uint32_t binding, const Texture& texture, std::uint32_t arrayIndex) = 0;
     virtual void BindSampler(std::uint32_t binding, const Sampler& sampler) = 0;
     virtual void BindSampler(std::uint32_t binding, const Sampler& sampler, std::uint32_t arrayIndex) = 0;
+    virtual void BindStorageImage(std::uint32_t binding, const Texture& texture) = 0;
+    virtual void BindStorageBuffer(
+        std::uint32_t binding,
+        const Buffer& buffer,
+        std::uint32_t arrayIndex = 0) = 0;
     virtual void BindAccelerationStructure(
         std::uint32_t binding,
         const AccelerationStructure& accelerationStructure) = 0;
@@ -387,6 +407,7 @@ struct PipelineDesc
     float depthBiasClamp = 0.0f;
     bool blend = false;
     CullMode cullMode = CullMode::Back;
+    PrimitiveTopology topology = PrimitiveTopology::TriangleList;
     std::uint32_t pushConstantSize = 0;
     ShaderStageMask pushConstantStages = ShaderStageMask::Vertex;
     std::vector<const DescriptorSetLayout*> descriptorSetLayouts{};

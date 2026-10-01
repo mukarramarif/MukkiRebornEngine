@@ -17,6 +17,12 @@ vk::Format ToVkFormat(rhi::Format format)
         return vk::Format::eB8G8R8A8Unorm;
     case rhi::Format::B8G8R8A8Srgb:
         return vk::Format::eB8G8R8A8Srgb;
+    case rhi::Format::R16Sfloat:
+        return vk::Format::eR16Sfloat;
+    case rhi::Format::R16G16Sfloat:
+        return vk::Format::eR16G16Sfloat;
+    case rhi::Format::R32Sfloat:
+        return vk::Format::eR32Sfloat;
     case rhi::Format::R16G16B16A16Sfloat:
         return vk::Format::eR16G16B16A16Sfloat;
     case rhi::Format::R32G32Sfloat:
@@ -46,6 +52,12 @@ rhi::Format FromVkFormat(vk::Format format)
         return rhi::Format::B8G8R8A8Unorm;
     case vk::Format::eB8G8R8A8Srgb:
         return rhi::Format::B8G8R8A8Srgb;
+    case vk::Format::eR16Sfloat:
+        return rhi::Format::R16Sfloat;
+    case vk::Format::eR16G16Sfloat:
+        return rhi::Format::R16G16Sfloat;
+    case vk::Format::eR32Sfloat:
+        return rhi::Format::R32Sfloat;
     case vk::Format::eR16G16B16A16Sfloat:
         return rhi::Format::R16G16B16A16Sfloat;
     case vk::Format::eR32G32Sfloat:
@@ -171,6 +183,19 @@ vk::CullModeFlags ToVkCullMode(rhi::CullMode mode)
     MRE_UNREACHABLE();
 }
 
+vk::PrimitiveTopology ToVkTopology(rhi::PrimitiveTopology topology)
+{
+    switch (topology)
+    {
+    case rhi::PrimitiveTopology::TriangleList:
+        return vk::PrimitiveTopology::eTriangleList;
+    case rhi::PrimitiveTopology::LineList:
+        return vk::PrimitiveTopology::eLineList;
+    }
+
+    MRE_UNREACHABLE();
+}
+
 vk::DescriptorType ToVkDescriptorType(rhi::DescriptorType type)
 {
     switch (type)
@@ -185,6 +210,8 @@ vk::DescriptorType ToVkDescriptorType(rhi::DescriptorType type)
         return vk::DescriptorType::eSampledImage;
     case rhi::DescriptorType::Sampler:
         return vk::DescriptorType::eSampler;
+    case rhi::DescriptorType::StorageImage:
+        return vk::DescriptorType::eStorageImage;
     case rhi::DescriptorType::AccelerationStructure:
         return vk::DescriptorType::eAccelerationStructureKHR;
     }
