@@ -14,6 +14,8 @@ namespace mukki::vulkan
 
 VkPipeline::VkPipeline(const vk::raii::Device& device, const rhi::PipelineDesc& desc)
 {
+    m_pushConstantSize = desc.pushConstantSize;
+
     vk::PipelineLayoutCreateInfo layoutInfo{};
     const vk::PushConstantRange pushConstantRange = vk::PushConstantRange{}
                                                         .setStageFlags(ToVkShaderStageMask(desc.pushConstantStages))

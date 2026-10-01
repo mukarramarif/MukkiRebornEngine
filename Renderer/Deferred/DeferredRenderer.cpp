@@ -106,9 +106,14 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
         return false;
     }
 
-    const std::vector<rhi::DescriptorBinding> sceneBindings{
-        rhi::DescriptorBinding{0, rhi::DescriptorType::UniformBuffer, rhi::ShaderStageMask::VertexFragment},
-    };
+    if (!LoadShaders(device, desc.shaderDirectory))
+    {
+        Shutdown();
+        return false;
+    }
+
+    // The bindless set is created by hand because descriptor indexing with update-after-bind cannot
+    // be expressed in shader reflection. Every other set layout comes from the compiled shaders.
     const std::vector<rhi::DescriptorBinding> bindlessBindings{
         rhi::DescriptorBinding{
             0,
@@ -122,34 +127,25 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
             rhi::ShaderStageMask::Fragment,
             rhi::kMaxBindlessSamplers},
     };
-    const std::vector<rhi::DescriptorBinding> lightingBindings{
-        rhi::DescriptorBinding{0, rhi::DescriptorType::UniformBuffer, rhi::ShaderStageMask::VertexFragment},
-        rhi::DescriptorBinding{1, rhi::DescriptorType::CombinedImageSampler, rhi::ShaderStageMask::Fragment},
-        rhi::DescriptorBinding{2, rhi::DescriptorType::CombinedImageSampler, rhi::ShaderStageMask::Fragment},
-        rhi::DescriptorBinding{3, rhi::DescriptorType::CombinedImageSampler, rhi::ShaderStageMask::Fragment},
-        rhi::DescriptorBinding{4, rhi::DescriptorType::StorageBuffer, rhi::ShaderStageMask::Fragment},
-        rhi::DescriptorBinding{5, rhi::DescriptorType::StorageBuffer, rhi::ShaderStageMask::Fragment},
-        rhi::DescriptorBinding{6, rhi::DescriptorType::StorageBuffer, rhi::ShaderStageMask::Fragment},
-        rhi::DescriptorBinding{7, rhi::DescriptorType::UniformBuffer, rhi::ShaderStageMask::Fragment},
-        rhi::DescriptorBinding{8, rhi::DescriptorType::SampledImage, rhi::ShaderStageMask::Fragment},
-        rhi::DescriptorBinding{9, rhi::DescriptorType::Sampler, rhi::ShaderStageMask::Fragment},
-        rhi::DescriptorBinding{10, rhi::DescriptorType::SampledImage, rhi::ShaderStageMask::Fragment},
-        rhi::DescriptorBinding{11, rhi::DescriptorType::SampledImage, rhi::ShaderStageMask::Fragment},
-    };
-    const std::vector<rhi::DescriptorBinding> clusterBindings{
-        rhi::DescriptorBinding{0, rhi::DescriptorType::UniformBuffer, rhi::ShaderStageMask::Compute},
-        rhi::DescriptorBinding{1, rhi::DescriptorType::StorageBuffer, rhi::ShaderStageMask::Compute},
-        rhi::DescriptorBinding{2, rhi::DescriptorType::StorageBuffer, rhi::ShaderStageMask::Compute},
-        rhi::DescriptorBinding{3, rhi::DescriptorType::StorageBuffer, rhi::ShaderStageMask::Compute},
-    };
-    const std::vector<rhi::DescriptorBinding> shadowBindings{
-        rhi::DescriptorBinding{0, rhi::DescriptorType::UniformBuffer, rhi::ShaderStageMask::Vertex},
-    };
-    m_sceneSetLayout = device.CreateDescriptorSetLayout(sceneBindings);
+    const std::array<const rhi::Shader*, 1> sceneStages{m_gbufferVertexShader.get()};
+    const std::array<const rhi::Shader*, 1> lightingStages{m_lightingFragmentShader.get()};
+    const std::array<const rhi::Shader*, 1> clusterStages{m_clusterCullingShader.get()};
+    const std::array<const rhi::Shader*, 1> shadowStages{m_shadowVertexShader.get()};
+
+    m_sceneSetLayout =
+        device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(sceneStages, 0));
     m_bindlessSetLayout = device.CreateDescriptorSetLayout(bindlessBindings);
-    m_lightingSetLayout = device.CreateDescriptorSetLayout(lightingBindings);
-    m_clusterSetLayout = device.CreateDescriptorSetLayout(clusterBindings);
-    m_shadowSetLayout = device.CreateDescriptorSetLayout(shadowBindings);
+    m_lightingSetLayout =
+        device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(lightingStages, 0));
+    m_clusterSetLayout =
+        device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(clusterStages, 0));
+    m_shadowSetLayout =
+        device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(shadowStages, 0));
+
+    MRE_ASSERT(
+        m_sceneSetLayout != nullptr && m_bindlessSetLayout != nullptr &&
+            m_lightingSetLayout != nullptr && m_clusterSetLayout != nullptr && m_shadowSetLayout != nullptr,
+        "Failed to create a descriptor set layout");
 
     m_bindlessSet = device.CreateDescriptorSet(*m_bindlessSetLayout);
     m_bindlessSet->BindTexture(0, *m_whiteTexture, m_whiteTexture->GetBindlessIndex());
@@ -195,7 +191,7 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
         }
     }
 
-    if (!CreateScene() || !CreatePipelines(device, desc.shaderDirectory))
+    if (!CreateScene() || !CreatePipelines(device))
     {
         Shutdown();
         return false;
@@ -827,6 +823,7 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
 
                 ShadowPushConstants pushConstants{};
                 pushConstants.viewIndex = shadowView.viewIndex;
+                const std::uint32_t pushConstantSize = m_shadowPipeline->GetPushConstantSize();
                 for (const DrawItem* item : shadowView.items)
                 {
                     pushConstants.object = item->pushConstants;
@@ -834,7 +831,7 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
                     commandList.BindIndexBuffer(*item->indexBuffer);
                     commandList.SetPushConstants(
                         &pushConstants,
-                        sizeof(ShadowPushConstants),
+                        pushConstantSize,
                         rhi::ShaderStageMask::Vertex);
                     commandList.DrawIndexed(item->indexCount, item->firstIndex);
                 }
@@ -1172,6 +1169,7 @@ void DeferredRenderer::RecordShadowView(
     ShadowPushConstants pushConstants{};
     pushConstants.viewIndex = shadowViewIndex;
 
+    const std::uint32_t pushConstantSize = m_shadowPipeline->GetPushConstantSize();
     for (const DrawItem* item : items)
     {
         pushConstants.object = item->pushConstants;
@@ -1179,7 +1177,7 @@ void DeferredRenderer::RecordShadowView(
         secondary.BindIndexBuffer(*item->indexBuffer);
         secondary.SetPushConstants(
             &pushConstants,
-            sizeof(ShadowPushConstants),
+            pushConstantSize,
             rhi::ShaderStageMask::Vertex);
         secondary.DrawIndexed(item->indexCount, item->firstIndex);
     }
@@ -1188,7 +1186,7 @@ void DeferredRenderer::RecordShadowView(
     secondary.End();
 }
 
-bool DeferredRenderer::CreatePipelines(rhi::Device& device, const std::filesystem::path& shaderDirectory)
+bool DeferredRenderer::LoadShaders(rhi::Device& device, const std::filesystem::path& shaderDirectory)
 {
     m_gbufferVertexShader = device.CreateShader(
         rhi::ShaderStage::Vertex,
@@ -1220,22 +1218,23 @@ bool DeferredRenderer::CreatePipelines(rhi::Device& device, const std::filesyste
         MRE_CRITICAL("Failed to load the deferred shaders from '{}'", PathToUtf8(shaderDirectory));
         return false;
     }
+    return true;
+}
 
-    rhi::VertexLayout vertexLayout{};
-    vertexLayout.AddAttribute(0, rhi::Format::R32G32B32Sfloat);
-    vertexLayout.AddAttribute(1, rhi::Format::R32G32B32Sfloat);
-    vertexLayout.AddAttribute(2, rhi::Format::R32G32Sfloat);
+bool DeferredRenderer::CreatePipelines(rhi::Device& device)
+{
+    const std::array<const rhi::Shader*, 2> gbufferStages{
+        m_gbufferVertexShader.get(),
+        m_gbufferFragmentShader.get()};
 
     rhi::PipelineDesc gbufferPipelineDesc{};
     gbufferPipelineDesc.vertexShader = m_gbufferVertexShader.get();
     gbufferPipelineDesc.fragmentShader = m_gbufferFragmentShader.get();
-    gbufferPipelineDesc.vertexLayout = vertexLayout;
+    rhi::ApplyShaderReflection(gbufferPipelineDesc, gbufferStages);
     gbufferPipelineDesc.depthTest = true;
     gbufferPipelineDesc.depthWrite = true;
     gbufferPipelineDesc.blend = false;
     gbufferPipelineDesc.cullMode = rhi::CullMode::None;
-    gbufferPipelineDesc.pushConstantSize = sizeof(ObjectPushConstants);
-    gbufferPipelineDesc.pushConstantStages = rhi::ShaderStageMask::VertexFragment;
     gbufferPipelineDesc.descriptorSetLayouts = {m_sceneSetLayout.get(), m_bindlessSetLayout.get()};
     gbufferPipelineDesc.colorFormats = {
         rhi::Format::R8G8B8A8Unorm,
@@ -1260,21 +1259,18 @@ bool DeferredRenderer::CreatePipelines(rhi::Device& device, const std::filesyste
     clusterPipelineDesc.descriptorSetLayouts = {m_clusterSetLayout.get()};
     m_clusterCullingPipeline = device.CreatePipeline(clusterPipelineDesc);
 
-    // The shadow pass only consumes positions but binds the same interleaved vertex buffers.
-    rhi::VertexLayout shadowVertexLayout{};
-    shadowVertexLayout.AddAttribute(0, rhi::Format::R32G32B32Sfloat);
-    shadowVertexLayout.SetBindingStride(vertexLayout.GetStride());
+    const std::array<const rhi::Shader*, 1> shadowStages{m_shadowVertexShader.get()};
 
     rhi::PipelineDesc shadowPipelineDesc{};
     shadowPipelineDesc.vertexShader = m_shadowVertexShader.get();
     shadowPipelineDesc.fragmentShader = m_shadowFragmentShader.get();
-    shadowPipelineDesc.vertexLayout = shadowVertexLayout;
+    rhi::ApplyShaderReflection(shadowPipelineDesc, shadowStages);
+    // The shadow pass only consumes positions but binds the same interleaved vertex buffers.
+    shadowPipelineDesc.vertexLayout.SetBindingStride(gbufferPipelineDesc.vertexLayout.GetStride());
     shadowPipelineDesc.depthTest = true;
     shadowPipelineDesc.depthWrite = true;
     shadowPipelineDesc.depthBiasEnable = true;
     shadowPipelineDesc.cullMode = rhi::CullMode::None;
-    shadowPipelineDesc.pushConstantSize = sizeof(ShadowPushConstants);
-    shadowPipelineDesc.pushConstantStages = rhi::ShaderStageMask::Vertex;
     shadowPipelineDesc.descriptorSetLayouts = {m_shadowSetLayout.get()};
     shadowPipelineDesc.depthFormat = rhi::Format::D32Sfloat;
     m_shadowPipeline = device.CreatePipeline(shadowPipelineDesc);

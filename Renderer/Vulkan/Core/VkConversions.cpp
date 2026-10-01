@@ -23,6 +23,8 @@ vk::Format ToVkFormat(rhi::Format format)
         return vk::Format::eR32G32Sfloat;
     case rhi::Format::R32G32B32Sfloat:
         return vk::Format::eR32G32B32Sfloat;
+    case rhi::Format::R32G32B32A32Sfloat:
+        return vk::Format::eR32G32B32A32Sfloat;
     case rhi::Format::D32Sfloat:
         return vk::Format::eD32Sfloat;
     case rhi::Format::Undefined:
@@ -50,6 +52,8 @@ rhi::Format FromVkFormat(vk::Format format)
         return rhi::Format::R32G32Sfloat;
     case vk::Format::eR32G32B32Sfloat:
         return rhi::Format::R32G32B32Sfloat;
+    case vk::Format::eR32G32B32A32Sfloat:
+        return rhi::Format::R32G32B32A32Sfloat;
     case vk::Format::eD32Sfloat:
         return rhi::Format::D32Sfloat;
     default:

@@ -199,7 +199,8 @@ private:
         float radius = 0.0f;
     };
 
-    bool CreatePipelines(rhi::Device& device, const std::filesystem::path& shaderDirectory);
+    bool LoadShaders(rhi::Device& device, const std::filesystem::path& shaderDirectory);
+    bool CreatePipelines(rhi::Device& device);
     bool CreateScene();
     bool CreateClusterResources(rhi::Device& device);
     bool CreateShadowResources(rhi::Device& device);

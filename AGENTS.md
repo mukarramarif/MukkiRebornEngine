@@ -17,7 +17,11 @@ must not expose backend types, and Vulkan types may only appear under `Renderer/
 - Modern Vulkan path: dynamic rendering, synchronization2, timeline semaphores; no
   `VkRenderPass`/`VkFramebuffer`.
 - 2 frames in flight, no MSAA initially.
-- Slang shaders compiled at build time with `slangc` (found through `$ENV{VULKAN_SDK}`).
+- Slang shaders compiled at build time with `slangc` (found through `$ENV{VULKAN_SDK}`). SPIR-V is
+  reflected at load time with SPIRV-Reflect (vcpkg port `spirv-reflect`, used only under
+  `Renderer/Vulkan/`); `rhi::MergeShaderReflectionBindings` and `rhi::ApplyShaderReflection` build
+  descriptor set layouts, vertex input layouts and push constant ranges from the shader interface.
+  Only the bindless set (update-after-bind runtime arrays) is declared by hand.
 - The engine will be using tinygltf and ktx libraries for loading glTF and KTX2 assets, respectively. The engine will support PBR materials and textures, as well as animation and skinning. tinygltf is pinned to 2.9.3 via a `vcpkg.json` override and served from `overlay-ports/tinygltf` because the registry port hashes are stale after GitHub regenerated its release tarballs. Sample models live in the shallow `ThirdParty/glTF-Sample-Models` submodule.
 - Scenes: authored as JSON with nlohmann/json under `Scene/` (`SceneJson`), compiled offline or
   in-tool into the little-endian `SceneBinary` bytecode (magic `MRES`), and loaded by the engine

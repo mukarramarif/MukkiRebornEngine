@@ -13,6 +13,7 @@ add_executable(mukki_tests
     test_resources.cpp
     test_scene_binary.cpp
     test_scene_json.cpp
+    test_shader_reflection.cpp
     test_shadow_cascades.cpp
     test_vk_conversions.cpp
 )

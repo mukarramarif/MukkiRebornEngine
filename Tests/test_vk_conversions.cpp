@@ -15,6 +15,9 @@ TEST(VkConversions, FormatsRoundTrip)
         Format::B8G8R8A8Unorm,
         Format::B8G8R8A8Srgb,
         Format::R16G16B16A16Sfloat,
+        Format::R32G32Sfloat,
+        Format::R32G32B32Sfloat,
+        Format::R32G32B32A32Sfloat,
         Format::D32Sfloat,
     };
 
@@ -29,7 +32,7 @@ TEST(VkConversions, FormatsRoundTrip)
 TEST(VkConversions, UndefinedMapsToUndefined)
 {
     EXPECT_EQ(mukki::vulkan::ToVkFormat(mukki::rhi::Format::Undefined), vk::Format::eUndefined);
-    EXPECT_EQ(mukki::vulkan::FromVkFormat(vk::Format::eR32G32B32A32Sfloat), mukki::rhi::Format::Undefined);
+    EXPECT_EQ(mukki::vulkan::FromVkFormat(vk::Format::eR8Unorm), mukki::rhi::Format::Undefined);
 }
 
 TEST(VkConversions, PresentModes)
@@ -44,6 +47,7 @@ TEST(VkConversions, DescriptorTypes)
     using mukki::rhi::DescriptorType;
 
     EXPECT_EQ(mukki::vulkan::ToVkDescriptorType(DescriptorType::UniformBuffer), vk::DescriptorType::eUniformBuffer);
+    EXPECT_EQ(mukki::vulkan::ToVkDescriptorType(DescriptorType::StorageBuffer), vk::DescriptorType::eStorageBuffer);
     EXPECT_EQ(
         mukki::vulkan::ToVkDescriptorType(DescriptorType::CombinedImageSampler),
         vk::DescriptorType::eCombinedImageSampler);
