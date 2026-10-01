@@ -50,6 +50,12 @@
       "position": [3.0, 2.0, -3.5],
       "rotation": [0.0, 180.0, 0.0],
       "scale": [0.8, 0.8, 0.8]
+    },{
+      "name": "Metal-RoughSpheres",
+      "model": "MetalRoughSpheres/glTF/MetalRoughSpheres.gltf",
+      "position": [-3.0, 2.0, -3.5],
+      "rotation": [0.0, 180.0, 0.0],
+      "scale": [0.8, 0.8, 0.8]
     }
   ],
   "probes": [

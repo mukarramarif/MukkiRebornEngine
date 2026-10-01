@@ -37,6 +37,16 @@ struct GiSettings
     float probeHysteresis = 0.9f; // fraction of the previous probe irradiance kept per update
 };
 
+// Ray traced glossy reflections. They reuse the GI trace resolution and the GI a-trous passes.
+struct ReflectionSettings
+{
+    bool enabled = true;
+    float intensity = 1.0f;
+    float maxRoughness = 0.45f;    // surfaces above this roughness do not trace reflections
+    float maxDistance = 60.0f;
+    std::uint32_t samples = 2;     // GGX VNDF rays per pixel (reuses the GI temporal alpha)
+};
+
 // Matches Renderer/Shaders/gi_*.slang.
 struct GiUniform
 {
@@ -53,7 +63,8 @@ struct GiUniform
     glm::vec4 params2{0.0f}; // x: temporalAlphaMin, y: phiDepth, z: phiNormal, w: phiLuminance
     glm::vec4 params3{0.0f}; // x: phiHitDistance, y: intensity, z: sunShadowRay, w: resetHistory
     glm::vec4 params4{0.0f}; // x: sunShadowSamples, y: sunAngularRadius (radians), z: traceSamples, w: rtSunMask
-    glm::vec4 params5{0.0f}; // x: probeRays, y: probeHysteresis, z: probeCount, w: unused
+    glm::vec4 params5{0.0f}; // x: probeRays, y: probeHysteresis, z: probeCount, w: reflectionResetHistory
+    glm::vec4 params6{0.0f}; // x: reflectionMaxDistance, y: reflectionMaxRoughness, z: reflectionSamples, w: reflectionIntensity
 };
 
 // CPU-side world space GI probe. The radius only controls the debug marker size.

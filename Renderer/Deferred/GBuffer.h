@@ -35,6 +35,8 @@ public:
     [[nodiscard]] rhi::Texture& GetPosition() { return *m_position; }
     [[nodiscard]] rhi::Texture& GetDepth() { return *m_depth; }
     [[nodiscard]] rhi::Texture& GetMotion() { return *m_motion; }
+    // Dielectric F0 from KHR_materials_specular (0.04 for plain metallic-roughness materials).
+    [[nodiscard]] rhi::Texture& GetSpecularF0() { return *m_specularF0; }
 
 private:
     bool CreateTextures(rhi::Device& device);
@@ -44,6 +46,7 @@ private:
     std::unique_ptr<rhi::Texture> m_position{};
     std::unique_ptr<rhi::Texture> m_depth{};
     std::unique_ptr<rhi::Texture> m_motion{};
+    std::unique_ptr<rhi::Texture> m_specularF0{};
     std::uint32_t m_width = 0;
     std::uint32_t m_height = 0;
 };

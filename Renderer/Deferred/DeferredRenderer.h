@@ -43,6 +43,7 @@ struct SceneUniform
     glm::vec4 clusterParams{0.0f}; // x: near, y: far, z: tile size, w: z slice count
     glm::uvec4 clusterGrid{0u};    // x, y, z grid dimensions, w: light count
     glm::vec4 screenSize{0.0f};    // x: width, y: height
+    glm::vec4 reflectionParams{0.0f}; // x: ray traced reflection intensity (0 disables)
 };
 
 struct ClusterUniform
@@ -68,6 +69,9 @@ struct ObjectPushConstants
 struct GpuObjectData
 {
     glm::mat4 previousModel{1.0f};
+    glm::vec4 specular{0.0f};           // x: specularFactor, yzw: specularColorFactor
+    glm::uvec4 specularTextureIndices{0u}; // x: specularTexture, y: specularColorTexture
+    glm::uvec4 specularSamplerIndices{0u}; // x: specular sampler, y: specular color sampler
 };
 
 class DeferredRenderer
@@ -129,6 +133,13 @@ public:
     [[nodiscard]] const GiSettings& GetGiSettings() const { return m_giSettings; }
     [[nodiscard]] bool IsGiActive() const;
 
+    // Ray traced glossy reflection settings. Reflections reuse the GI trace resolution.
+    void SetReflectionSettings(const ReflectionSettings& settings);
+    [[nodiscard]] const ReflectionSettings& GetReflectionSettings() const
+    {
+        return m_reflectionSettings;
+    }
+
     bool LoadModel(const std::filesystem::path& path);
     void RequestModelLoad(const std::filesystem::path& path);
     bool PollModelLoad();
@@ -163,6 +174,10 @@ private:
         const rhi::AccelerationStructure* blas = nullptr;
         std::uint32_t vertexBufferIndex = 0;
         std::uint32_t indexBufferIndex = 0;
+        // KHR_materials_specular material data (see GpuObjectData).
+        glm::vec4 specular{0.0f};
+        glm::uvec4 specularTextureIndices{0u};
+        glm::uvec4 specularSamplerIndices{0u};
     };
 
     // Per draw item data read by ray traced effects (global illumination color bleeding).
@@ -181,6 +196,8 @@ private:
     {
         std::unique_ptr<rhi::Texture> baseColorTexture{};
         std::unique_ptr<rhi::Texture> metallicRoughnessTexture{};
+        std::unique_ptr<rhi::Texture> specularTexture{};
+        std::unique_ptr<rhi::Texture> specularColorTexture{};
     };
 
     struct SceneObjectBounds
@@ -281,6 +298,20 @@ private:
         std::unique_ptr<rhi::DescriptorSet> upsampleSet{};
         std::uint32_t historyParity = 0;
         bool historyValid = false;
+
+        // Ray traced reflections share the GI trace resolution and the GI a-trous pipeline.
+        std::unique_ptr<rhi::Texture> reflectionNoisy{};
+        std::unique_ptr<rhi::Texture> reflectionHitDistance{};
+        std::unique_ptr<rhi::Texture> reflectionHistory[2]{};
+        std::unique_ptr<rhi::Texture> reflectionMoments[2]{};
+        std::unique_ptr<rhi::Texture> reflectionFiltered{};
+        std::unique_ptr<rhi::Texture> reflections{};
+        std::unique_ptr<rhi::DescriptorSet> reflectionTraceSet{};
+        std::unique_ptr<rhi::DescriptorSet> reflectionTemporalSet{};
+        std::array<std::unique_ptr<rhi::DescriptorSet>, kMaxAtrousIterations> reflectionAtrousSets{};
+        std::unique_ptr<rhi::DescriptorSet> reflectionUpsampleSet{};
+        std::uint32_t reflectionParity = 0;
+        bool reflectionValid = false;
     };
 
     bool LoadShaders(rhi::Device& device, const std::filesystem::path& shaderDirectory);
@@ -319,6 +350,11 @@ private:
     void RecordGiProbes(rhi::CommandList& commandList, std::uint32_t frameIndex);
     [[nodiscard]] bool IsProbeGiActive() const;
     [[nodiscard]] bool IsPerPixelGiActive() const;
+    bool CreateReflectionResources(rhi::Device& device);
+    void UpdateReflectionUniform(std::uint32_t frameIndex);
+    void BindReflectionDescriptors(std::uint32_t frameIndex);
+    void RecordReflectionPasses(rhi::CommandList& commandList, std::uint32_t frameIndex);
+    [[nodiscard]] bool IsReflectionActive() const;
     void RecordDebugLines(rhi::CommandList& commandList, const FrameView& view);
     [[nodiscard]] std::optional<std::size_t> UploadModel(const std::filesystem::path& path, GltfModel& model);
     [[nodiscard]] std::optional<std::size_t> LoadModelResources(const std::filesystem::path& path);
@@ -403,7 +439,18 @@ private:
     std::unique_ptr<rhi::Pipeline> m_giUpsamplePipeline{};
     GiUniform m_giUniform{};
     GiSettings m_giSettings{};
+    ReflectionSettings m_reflectionSettings{};
     std::uint32_t m_giFrameCounter = 0;
+    std::unique_ptr<rhi::Texture> m_blackTexture{};
+    std::unique_ptr<rhi::DescriptorSetLayout> m_reflectionTraceSetLayout{};
+    std::unique_ptr<rhi::DescriptorSetLayout> m_reflectionTemporalSetLayout{};
+    std::unique_ptr<rhi::DescriptorSetLayout> m_reflectionUpsampleSetLayout{};
+    std::unique_ptr<rhi::Shader> m_rtReflectionShader{};
+    std::unique_ptr<rhi::Shader> m_reflectionTemporalShader{};
+    std::unique_ptr<rhi::Shader> m_reflectionUpsampleShader{};
+    std::unique_ptr<rhi::Pipeline> m_rtReflectionPipeline{};
+    std::unique_ptr<rhi::Pipeline> m_reflectionTemporalPipeline{};
+    std::unique_ptr<rhi::Pipeline> m_reflectionUpsamplePipeline{};
     std::unique_ptr<rhi::Shader> m_rtShadowShader{};
     std::unique_ptr<rhi::DescriptorSetLayout> m_rtShadowSetLayout{};
     std::unique_ptr<rhi::Pipeline> m_rtShadowPipeline{};
@@ -434,7 +481,7 @@ private:
     std::vector<std::unique_ptr<rhi::AccelerationStructure>> m_tlas{};
     std::vector<std::unique_ptr<rhi::Buffer>> m_geometryDataBuffers{};
     std::vector<GpuGeometryData> m_geometryData{};
-    std::size_t m_tlasInstanceCount = 0;
+    std::vector<std::size_t> m_tlasInstanceCounts{};
     std::uint32_t m_nextBindlessBuffer = 0;
     bool m_blasDirty = false;
     std::unordered_map<std::string, std::size_t> m_modelCache{};

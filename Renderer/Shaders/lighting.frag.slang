@@ -7,7 +7,8 @@ struct SceneUniform
     float4 ambientColor;
     float4 clusterParams; // x: near, y: far, z: tile size in pixels, w: z slice count
     uint4 clusterGrid;    // x, y, z grid dimensions, w: light count
-    float4 screenSize;    // x: width, y: height
+    float4 screenSize;
+    float4 reflectionParams; // x: reflection intensity
 };
 
 struct GpuLight
@@ -50,6 +51,8 @@ struct GpuGiProbe
 [[vk::binding(12, 0)]] Texture2D gIndirect;
 [[vk::binding(13, 0)]] Texture2D<float> gRtSunShadow;
 [[vk::binding(14, 0)]] StructuredBuffer<GpuGiProbe> gGiProbes;
+[[vk::binding(15, 0)]] Texture2D gReflections;
+[[vk::binding(16, 0)]] Texture2D gSpecularF0;
 
 static const uint kMaxLightsPerCluster = 64;
 static const uint kLightTypeDirectional = 0;
@@ -102,6 +105,7 @@ float geometrySchlickGgx(float nDotX, float roughness)
 
 float3 evaluateBrdf(
     float3 albedo,
+    float3 f0,
     float metalness,
     float roughness,
     float3 normal,
@@ -115,7 +119,6 @@ float3 evaluateBrdf(
     const float nDotH = max(dot(normal, halfVector), 0.0);
     const float vDotH = max(dot(viewDirection, halfVector), 0.0);
 
-    const float3 f0 = lerp(float3(0.04, 0.04, 0.04), albedo, metalness);
     const float3 fresnel = fresnelSchlick(vDotH, f0);
     const float distribution = distributionGgx(nDotH, roughness);
     const float geometry = geometrySchlickGgx(nDotV, roughness) * geometrySchlickGgx(nDotL, roughness);
@@ -354,6 +357,8 @@ float4 fragmentMain(VertexOutput input) : SV_Target
     const float3 normal = normalize(normalRoughness.xyz * 2.0 - 1.0);
     const float roughness = clamp(normalRoughness.a, 0.04, 1.0);
     const float3 viewDirection = normalize(gScene.cameraPosition.xyz - worldPosition.xyz);
+    const float3 dielectricF0 = gSpecularF0.Load(int3(int2(input.position.xy), 0)).rgb;
+    const float3 f0 = lerp(dielectricF0, albedo, metalness);
 
     float3 color = gScene.ambientColor.rgb * albedo;
 
@@ -432,6 +437,7 @@ float4 fragmentMain(VertexOutput input) : SV_Target
         {
             color += evaluateBrdf(
                 albedo,
+                f0,
                 metalness,
                 roughness,
                 normal,
@@ -466,6 +472,13 @@ float4 fragmentMain(VertexOutput input) : SV_Target
         {
             color += albedo * indirect / weightSum;
         }
+    }
+
+    if (gScene.reflectionParams.x > 0.0)
+    {
+        // Ray traced glossy reflections (already fresnel weighted) at the GI trace resolution.
+        color += gReflections.Load(int3(int2(input.position.xy), 0)).rgb *
+                 gScene.reflectionParams.x;
     }
 
     return float4(acesTonemap(color), 1.0);

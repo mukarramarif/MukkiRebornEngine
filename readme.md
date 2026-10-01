@@ -248,6 +248,14 @@ clustered lights:
 - Fireflies are rejected against the accumulated moments (mean + 4 sigma) before the history
   clamp, the a-trous taps are clamped to the center variance, and the history accumulates up to 64
   frames (`Temporal alpha min`).
+- **Materials**: glTF `alphaMode = MASK` and `KHR_materials_specular` are supported, so the Khronos
+  `SpecularTest` grid shows the dielectric F0 variation in both the analytic specular and the ray
+  traced reflections (`--model <SpecularTest.gltf>`).
+- **Ray traced reflections**: surfaces below `Reflection max roughness` trace `Reflection samples`
+  GGX VNDF rays at the GI resolution, shade the hits with the shared path tracer, accumulate
+  temporally (with the same denoiser settings as GI), filter through the GI a-trous and bilaterally
+  upsample to full resolution. Controls: `Reflections`, `Reflection intensity`,
+  `Reflection max roughness`, `Reflection distance`, `Reflection samples`.
 - **GI probes**: world space probes added from the `Probes` section (independent of the glTF objects)
   feed the irradiance probe pass. `gi_probes.comp.slang`
   traces `Probe rays` uniform-sphere rays per probe with the same hit shading as the path tracer,

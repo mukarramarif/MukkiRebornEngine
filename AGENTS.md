@@ -36,6 +36,10 @@ must not expose backend types, and Vulkan types may only appear under `Renderer/
   through the bindless base color texture (the shadow pipeline binds the bindless set as set 1 and
   uses explicit vertex attribute offsets for position/uv). `BLEND` is not supported yet, and ray
   traced GI hit shading ignores alpha because the BLAS contains solid geometry.
+  `KHR_materials_specular` is supported: factor/color and the extension textures travel through the
+  extended `GpuObjectData` SSBO (read by the G-buffer fragment), and the dielectric F0 is baked into
+  the fifth G-buffer target (`GBuffer::GetSpecularF0`, 0.04 default); lighting and reflections use
+  `f0 = lerp(specularF0, albedo, metalness)`.
 - Debug gizmos: `Renderer/Debug/DebugLines.h` builds CPU line lists (`DebugLines`) for light and
   probe markers; `DeferredRenderer::RecordDebugLines` draws them at the end of the swapchain
   lighting scope with a `PrimitiveTopology::LineList` pipeline (push constant viewProjection, no
@@ -73,6 +77,15 @@ must not expose backend types, and Vulkan types may only appear under `Renderer/
   are visible on screen, falling back to jittered shadow rays otherwise. The pass binds the TLAS +
   G-buffer textures per frame after the G-buffer pass; the mask is bound as a fallback white texture
   when inactive. Spot/point shadows remain cascaded maps.
+- Ray traced reflections: optional (`ReflectionSettings`, requires ray tracing).
+  `rt_reflections.comp.slang` traces `samples` GGX VNDF rays per pixel at the GI trace resolution
+  (roughness cutoff `maxRoughness`, `maxDistance`), shades hits through the shared `gi_shading.slang`
+  (screen-space feedback disabled by binding the 1x1 black texture) and weights by Schlick fresnel.
+  `reflection_temporal.comp.slang` accumulates with moments and firefly rejection, the a-trous pass
+  reuses the GI atrous pipeline/descriptor sets, and `reflection_upsample.comp.slang` bilaterally
+  upsamples to full res (roughness-aware). The lighting pass adds binding 15 scaled by
+  `SceneUniform.reflectionParams.x`. `GiUniform.params6` carries the reflection parameters and
+  `params5.w` the history reset flag.
 - GI probes: world space `SceneDescription::probes` become irradiance probes. When probes are
   active (`GiSettings.useProbes`, requires ray tracing) `gi_probes.comp.slang` traces `probeRays`
   uniform-sphere rays per probe through the shared hit shading in `gi_shading.slang`, accumulates

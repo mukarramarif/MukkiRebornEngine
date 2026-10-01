@@ -13,7 +13,8 @@ struct GiUniform
     float4 params2; // x: temporalAlphaMin, y: phiDepth, z: phiNormal, w: phiLuminance
     float4 params3; // x: phiHitDistance, y: intensity, z: sunShadowRay, w: resetHistory
     float4 params4; // x: sunShadowSamples, y: sunAngularRadius (radians), z: traceSamples, w: rtSunMask
-    float4 params5; // x: probeRays, y: probeHysteresis, z: probeCount, w: unused
+    float4 params5; // x: probeRays, y: probeHysteresis, z: probeCount, w: reflectionResetHistory
+    float4 params6; // x: reflectionMaxDistance, y: reflectionMaxRoughness, z: reflectionSamples, w: reflectionIntensity
 };
 
 struct GpuGeometryData

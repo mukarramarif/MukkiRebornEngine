@@ -13,7 +13,8 @@ struct GiUniform
     float4 params2; // x: temporalAlphaMin, y: phiDepth, z: phiNormal, w: phiLuminance
     float4 params3; // x: phiHitDistance, y: intensity, z: sunShadowRay, w: resetHistory
     float4 params4; // x: sunShadowSamples, y: sunAngularRadius (radians), z: traceSamples, w: rtSunMask
-    float4 params5; // x: probeRays, y: probeHysteresis, z: probeCount, w: unused
+    float4 params5; // x: probeRays, y: probeHysteresis, z: probeCount, w: reflectionResetHistory
+    float4 params6; // x: reflectionMaxDistance, y: reflectionMaxRoughness, z: reflectionSamples, w: reflectionIntensity
 };
 
 struct GpuGeometryData
@@ -41,25 +42,6 @@ struct GpuGeometryData
 [[vk::binding(2, 1)]] ByteAddressBuffer gBuffers[];
 
 #include "gi_shading.slang"
-
-float3 SampleGgxDirection(float3 normal, float3 viewDirection, float roughness, uint2 pixel, uint frame)
-{
-    const float3 view = normalize(viewDirection);
-    const float3 tangent =
-        normalize(cross(abs(view.y) < 0.999 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0), view));
-    const float3 bitangent = cross(view, tangent);
-
-    const float a = max(roughness * roughness, 1e-4);
-    const float r1 = Hash01(pixel, frame, 3u);
-    const float r2 = Hash01(pixel, frame, 7u);
-    const float phi = 2.0 * kPi * r1;
-    const float cosTheta = sqrt((1.0 - r2) / (1.0 + (a * a - 1.0) * r2));
-    const float sinTheta = sqrt(max(1.0 - cosTheta * cosTheta, 0.0));
-
-    const float3 halfVector =
-        tangent * (sinTheta * cos(phi)) + bitangent * (sinTheta * sin(phi)) + view * cosTheta;
-    return reflect(-view, normalize(halfVector));
-}
 
 [numthreads(8, 8, 1)]
 [shader("compute")]

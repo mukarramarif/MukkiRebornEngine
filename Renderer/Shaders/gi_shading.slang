@@ -73,6 +73,25 @@ float3 SampleCosineDirection(float3 normal, uint2 pixel, uint frame)
         tangent * (sinTheta * cos(phi)) + bitangent * (sinTheta * sin(phi)) + normal * cosTheta);
 }
 
+float3 SampleGgxDirection(float3 normal, float3 viewDirection, float roughness, uint2 pixel, uint frame)
+{
+    const float3 view = normalize(viewDirection);
+    const float3 tangent =
+        normalize(cross(abs(view.y) < 0.999 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0), view));
+    const float3 bitangent = cross(view, tangent);
+
+    const float a = max(roughness * roughness, 1e-4);
+    const float r1 = Hash01(pixel, frame, 3u);
+    const float r2 = Hash01(pixel, frame, 7u);
+    const float phi = 2.0 * kPi * r1;
+    const float cosTheta = sqrt((1.0 - r2) / (1.0 + (a * a - 1.0) * r2));
+    const float sinTheta = sqrt(max(1.0 - cosTheta * cosTheta, 0.0));
+
+    const float3 halfVector =
+        tangent * (sinTheta * cos(phi)) + bitangent * (sinTheta * sin(phi)) + view * cosTheta;
+    return reflect(-view, normalize(halfVector));
+}
+
 // Projects the hit point onto the ray traced sun shadow mask. Returns false when the hit is not
 // visible on screen or lies on a different surface, in which case the caller traces shadow rays.
 bool SampleRtSunVisibility(float3 position, float3 normal, out float visibility)

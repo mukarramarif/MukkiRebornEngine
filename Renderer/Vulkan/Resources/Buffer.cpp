@@ -40,7 +40,16 @@ void VkBuffer::Write(const void* data, std::uint64_t size, std::uint64_t offset)
 {
     MRE_ASSERT(m_hostVisible, "VkBuffer::Write requires a host-visible buffer");
     MRE_ASSERT(data != nullptr, "VkBuffer::Write requires a data pointer");
-    MRE_ASSERT(offset + size <= m_size, "VkBuffer::Write exceeds the buffer size");
+    if (offset + size > m_size)
+    {
+        // Never corrupt neighbouring allocations, even when assertions are compiled out.
+        MRE_CRITICAL(
+            "VkBuffer::Write exceeds the buffer size (offset {}, size {}, capacity {})",
+            offset,
+            size,
+            m_size);
+        return;
+    }
 
     void* mapped = nullptr;
     const VkResult result = vmaMapMemory(m_allocator, m_allocation, &mapped);

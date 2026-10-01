@@ -135,6 +135,44 @@ protected:
         if (!m_requestedModel.empty())
         {
             m_pendingModelPath = m_requestedModel;
+
+            // Standalone models get a small default light rig and one probe so they are visible.
+            m_scene.lights.clear();
+            m_scene.probes.clear();
+
+            mukki::SceneLight key{};
+            key.name = "Key";
+            key.light.type = mukki::LightType::Directional;
+            key.light.direction = glm::vec3{-0.4f, -1.0f, -0.3f};
+            key.light.color = glm::vec3{1.0f, 0.98f, 0.95f};
+            key.light.intensity = 3.0f;
+            m_scene.lights.push_back(key);
+
+            mukki::SceneLight fill{};
+            fill.name = "Fill";
+            fill.light.type = mukki::LightType::Point;
+            fill.light.position = glm::vec3{1.5f, 1.5f, 1.5f};
+            fill.light.color = glm::vec3{0.6f, 0.8f, 1.0f};
+            fill.light.intensity = 3.0f;
+            fill.light.range = 8.0f;
+            m_scene.lights.push_back(fill);
+
+            mukki::SceneLight rim{};
+            rim.name = "Rim";
+            rim.light.type = mukki::LightType::Point;
+            rim.light.position = glm::vec3{-1.5f, 1.0f, -1.5f};
+            rim.light.color = glm::vec3{1.0f, 0.7f, 0.4f};
+            rim.light.intensity = 2.0f;
+            rim.light.range = 8.0f;
+            m_scene.lights.push_back(rim);
+
+            mukki::SceneProbe probe{};
+            probe.name = "Probe";
+            probe.position = glm::vec3{0.0f, 1.0f, 0.0f};
+            probe.radius = 0.4f;
+            m_scene.probes.push_back(probe);
+
+            ApplySceneLights();
         }
         else
         {
@@ -707,8 +745,52 @@ private:
 
         DrawShadowSettings();
         DrawGiSettings();
+        DrawReflectionSettings();
 
         ImGui::End();
+    }
+
+    void DrawReflectionSettings()
+    {
+        ImGui::SeparatorText("Ray traced reflections");
+
+        mukki::ReflectionSettings settings = m_renderer->GetReflectionSettings();
+        bool changed = ImGui::Checkbox("Reflections", &settings.enabled);
+        if (!m_device->IsRayTracingSupported())
+        {
+            ImGui::SameLine();
+            ImGui::TextDisabled("(ray tracing unavailable)");
+        }
+
+        changed |= ImGui::SliderFloat(
+            "Reflection intensity",
+            &settings.intensity,
+            0.0f,
+            4.0f,
+            "%.2f");
+        changed |= ImGui::SliderFloat(
+            "Reflection max roughness",
+            &settings.maxRoughness,
+            0.0f,
+            1.0f,
+            "%.2f");
+        changed |= ImGui::SliderFloat(
+            "Reflection distance",
+            &settings.maxDistance,
+            1.0f,
+            300.0f,
+            "%.0f");
+        int samples = static_cast<int>(settings.samples);
+        if (ImGui::SliderInt("Reflection samples", &samples, 1, 8))
+        {
+            settings.samples = static_cast<std::uint32_t>(samples);
+            changed = true;
+        }
+
+        if (changed)
+        {
+            m_renderer->SetReflectionSettings(settings);
+        }
     }
 
     void DrawProbeSection()

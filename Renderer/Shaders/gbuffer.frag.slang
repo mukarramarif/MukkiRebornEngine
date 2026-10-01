@@ -8,6 +8,7 @@ struct SceneUniform
     float4 clusterParams;
     uint4 clusterGrid;
     float4 screenSize;
+    float4 reflectionParams; // x: reflection intensity
 };
 
 struct ObjectPushConstants
@@ -20,8 +21,17 @@ struct ObjectPushConstants
     uint drawIndex;
 };
 
+struct GpuObjectData
+{
+    float4x4 previousModel;
+    float4 specular;               // x: specularFactor, yzw: specularColorFactor
+    uint4 specularTextureIndices;  // x: specularTexture, y: specularColorTexture
+    uint4 specularSamplerIndices;  // x: specular sampler, y: specular color sampler
+};
+
 [[vk::push_constant]] ConstantBuffer<ObjectPushConstants> gObject;
 [[vk::binding(0, 0)]] ConstantBuffer<SceneUniform> gScene;
+[[vk::binding(1, 0)]] StructuredBuffer<GpuObjectData> gObjects;
 [[vk::binding(0, 1)]] Texture2D gTextures[];
 [[vk::binding(1, 1)]] SamplerState gSamplers[16];
 
@@ -40,6 +50,7 @@ struct GBufferOutput
     [[vk::location(1)]] float4 normal : SV_Target1;
     [[vk::location(2)]] float4 position : SV_Target2;
     [[vk::location(3)]] float2 motion : SV_Target3;
+    [[vk::location(4)]] float4 specularF0 : SV_Target4;
 };
 
 [shader("fragment")]
@@ -75,5 +86,20 @@ GBufferOutput fragmentMain(VertexOutput input)
     output.normal = float4(normalize(input.normal) * 0.5 + 0.5, gObject.params.x * metalRoughness.g);
     output.position = float4(input.worldPosition, 1.0);
     output.motion = input.position.xy - previousPixel;
+
+    // KHR_materials_specular: store the dielectric F0 so the lighting and reflection passes do not
+    // need the material data. Missing textures fall back to white and produce the 0.04 default.
+    const GpuObjectData objectData = gObjects[gObject.drawIndex];
+    const float specularSample =
+        gTextures[NonUniformResourceIndex(objectData.specularTextureIndices.x)].Sample(
+            gSamplers[NonUniformResourceIndex(objectData.specularSamplerIndices.x)],
+            input.uv).r;
+    const float3 specularColorSample =
+        gTextures[NonUniformResourceIndex(objectData.specularTextureIndices.y)].Sample(
+            gSamplers[NonUniformResourceIndex(objectData.specularSamplerIndices.y)],
+            input.uv).rgb;
+    const float3 specularColor = objectData.specular.yzw * specularColorSample;
+    const float specularFactor = objectData.specular.x * specularSample;
+    output.specularF0 = float4(min(0.04 * specularColor, 1.0) * specularFactor, 1.0);
     return output;
 }

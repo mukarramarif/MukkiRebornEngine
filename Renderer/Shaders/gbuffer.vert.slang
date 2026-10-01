@@ -8,6 +8,7 @@ struct SceneUniform
     float4 clusterParams;
     uint4 clusterGrid;
     float4 screenSize;
+    float4 reflectionParams; // x: reflection intensity
 };
 
 struct ObjectPushConstants
@@ -23,6 +24,9 @@ struct ObjectPushConstants
 struct GpuObjectData
 {
     float4x4 previousModel;
+    float4 specular;               // x: specularFactor, yzw: specularColorFactor
+    uint4 specularTextureIndices;  // x: specularTexture, y: specularColorTexture
+    uint4 specularSamplerIndices;  // x: specular sampler, y: specular color sampler
 };
 
 [[vk::binding(0, 0)]] ConstantBuffer<SceneUniform> gScene;

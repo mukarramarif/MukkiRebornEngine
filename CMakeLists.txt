@@ -190,6 +190,9 @@ if(MRE_BUILD_SANDBOX)
         Renderer/Shaders/gi_atrous.comp.slang
         Renderer/Shaders/gi_upsample.comp.slang
         Renderer/Shaders/gi_probes.comp.slang
+        Renderer/Shaders/rt_reflections.comp.slang
+        Renderer/Shaders/reflection_temporal.comp.slang
+        Renderer/Shaders/reflection_upsample.comp.slang
         Renderer/Shaders/rt_shadows.comp.slang
         Renderer/Shaders/debug_line.vert.slang
         Renderer/Shaders/debug_line.frag.slang

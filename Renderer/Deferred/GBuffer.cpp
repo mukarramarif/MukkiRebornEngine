@@ -19,6 +19,7 @@ bool GBuffer::Init(rhi::Device& device, std::uint32_t width, std::uint32_t heigh
 
 void GBuffer::Shutdown()
 {
+    m_specularF0.reset();
     m_motion.reset();
     m_depth.reset();
     m_position.reset();
@@ -42,6 +43,7 @@ bool GBuffer::Resize(rhi::Device& device, std::uint32_t width, std::uint32_t hei
 
     MRE_INFO("Resizing the G-buffer to {}x{}", width, height);
 
+    m_specularF0.reset();
     m_motion.reset();
     m_depth.reset();
     m_position.reset();
@@ -80,15 +82,21 @@ bool GBuffer::CreateTextures(rhi::Device& device)
         m_height,
         rhi::Format::R16G16Sfloat,
         rhi::TextureUsage::ColorAttachment};
+    const rhi::TextureDesc specularF0Desc{
+        m_width,
+        m_height,
+        rhi::Format::R8G8B8A8Unorm,
+        rhi::TextureUsage::ColorAttachment};
 
     m_albedo = device.CreateTexture(albedoDesc);
     m_normal = device.CreateTexture(normalDesc);
     m_position = device.CreateTexture(positionDesc);
     m_depth = device.CreateTexture(depthDesc);
     m_motion = device.CreateTexture(motionDesc);
+    m_specularF0 = device.CreateTexture(specularF0Desc);
 
     if (m_albedo == nullptr || m_normal == nullptr || m_position == nullptr || m_depth == nullptr ||
-        m_motion == nullptr)
+        m_motion == nullptr || m_specularF0 == nullptr)
     {
         MRE_CRITICAL("Failed to create the G-buffer textures");
         Shutdown();

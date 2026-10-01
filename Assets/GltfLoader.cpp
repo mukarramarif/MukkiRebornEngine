@@ -473,6 +473,45 @@ bool LoadGltfModel(const std::filesystem::path& path, GltfModel& model)
         converted.alphaMask = material.alphaMode == "MASK";
         converted.alphaCutoff = static_cast<float>(material.alphaCutoff);
 
+        const auto specularExtension = material.extensions.find("KHR_materials_specular");
+        if (specularExtension != material.extensions.end())
+        {
+            const tinygltf::Value& specular = specularExtension->second;
+            if (specular.Has("specularFactor") && specular.Get("specularFactor").IsNumber())
+            {
+                converted.specularFactor =
+                    static_cast<float>(specular.Get("specularFactor").GetNumberAsDouble());
+            }
+
+            if (specular.Has("specularColorFactor"))
+            {
+                const tinygltf::Value& color = specular.Get("specularColorFactor");
+                if (color.IsArray() && color.ArrayLen() == 3)
+                {
+                    converted.specularColorFactor = glm::vec3{
+                        static_cast<float>(color.Get(0).GetNumberAsDouble()),
+                        static_cast<float>(color.Get(1).GetNumberAsDouble()),
+                        static_cast<float>(color.Get(2).GetNumberAsDouble())};
+                }
+            }
+
+            const auto readTextureIndex = [](const tinygltf::Value& value, const char* key) -> int {
+                if (!value.Has(key))
+                {
+                    return -1;
+                }
+                const tinygltf::Value& info = value.Get(key);
+                if (!info.IsObject() || !info.Has("index") || !info.Get("index").IsNumber())
+                {
+                    return -1;
+                }
+                return static_cast<int>(info.Get("index").GetNumberAsInt());
+            };
+
+            converted.specularTexture = readTextureIndex(specular, "specularTexture");
+            converted.specularColorTexture = readTextureIndex(specular, "specularColorTexture");
+        }
+
         const int baseColorTextureIndex = material.pbrMetallicRoughness.baseColorTexture.index;
         if (baseColorTextureIndex >= 0 && baseColorTextureIndex < static_cast<int>(gltf.textures.size()))
         {

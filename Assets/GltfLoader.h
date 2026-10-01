@@ -50,6 +50,11 @@ struct GltfMaterial
     bool doubleSided = false;
     bool alphaMask = false;
     float alphaCutoff = 0.5f;
+    // KHR_materials_specular.
+    float specularFactor = 1.0f;
+    glm::vec3 specularColorFactor{1.0f};
+    int specularTexture = -1;
+    int specularColorTexture = -1;
 };
 
 struct GltfImage

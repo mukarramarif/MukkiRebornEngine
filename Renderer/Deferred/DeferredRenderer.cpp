@@ -107,6 +107,22 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
         return false;
     }
 
+    const std::array<std::uint8_t, 4> blackPixel{0u, 0u, 0u, 0u};
+    const rhi::TextureDesc blackTextureDesc{
+        1,
+        1,
+        rhi::Format::R8G8B8A8Unorm,
+        rhi::TextureUsage::Sampled,
+        blackPixel.data(),
+        blackPixel.size()};
+    m_blackTexture = device.CreateTexture(blackTextureDesc);
+    if (m_blackTexture == nullptr)
+    {
+        MRE_CRITICAL("Failed to create the default black texture");
+        Shutdown();
+        return false;
+    }
+
     if (!LoadShaders(device, desc.shaderDirectory))
     {
         Shutdown();
@@ -175,6 +191,20 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
         const std::array<const rhi::Shader*, 1> giProbeStages{m_giProbeShader.get()};
         m_giProbeSetLayout =
             device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(giProbeStages, 0));
+
+        const std::array<const rhi::Shader*, 1> reflectionTraceStages{m_rtReflectionShader.get()};
+        m_reflectionTraceSetLayout =
+            device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(reflectionTraceStages, 0));
+
+        const std::array<const rhi::Shader*, 1> reflectionTemporalStages{
+            m_reflectionTemporalShader.get()};
+        m_reflectionTemporalSetLayout =
+            device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(reflectionTemporalStages, 0));
+
+        const std::array<const rhi::Shader*, 1> reflectionUpsampleStages{
+            m_reflectionUpsampleShader.get()};
+        m_reflectionUpsampleSetLayout =
+            device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(reflectionUpsampleStages, 0));
     }
 
     MRE_ASSERT(
@@ -188,6 +218,7 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
 
     const std::uint32_t framesInFlight = device.GetFramesInFlight();
     m_tlas.resize(framesInFlight);
+    m_tlasInstanceCounts.assign(framesInFlight, 0);
     m_geometryDataBuffers.resize(framesInFlight);
     m_objectDataBuffers.clear();
     m_uniformBuffers.reserve(framesInFlight);
@@ -293,7 +324,7 @@ void DeferredRenderer::Shutdown()
     m_objectDataBuffers.clear();
     m_previousModels.clear();
     m_planeBlas.reset();
-    m_tlasInstanceCount = 0;
+    m_tlasInstanceCounts.clear();
     m_blasDirty = false;
     m_gi.clear();
     m_giAtrousPipeline.reset();
@@ -331,6 +362,7 @@ void DeferredRenderer::Shutdown()
     m_sceneSetLayout.reset();
     m_bindlessSet.reset();
     m_whiteTexture.reset();
+    m_blackTexture.reset();
     m_bindlessSamplers.clear();
     m_samplerCache.clear();
     m_gbufferSampler.reset();
@@ -578,6 +610,10 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
             createTextureFromImage(textureImageIndex(source.baseColorTexture), rhi::Format::R8G8B8A8Srgb);
         material.metallicRoughnessTexture =
             createTextureFromImage(textureImageIndex(source.metallicRoughnessTexture), rhi::Format::R8G8B8A8Unorm);
+        material.specularTexture =
+            createTextureFromImage(textureImageIndex(source.specularTexture), rhi::Format::R8G8B8A8Unorm);
+        material.specularColorTexture =
+            createTextureFromImage(textureImageIndex(source.specularColorTexture), rhi::Format::R8G8B8A8Unorm);
 
         if (material.baseColorTexture != nullptr)
         {
@@ -589,6 +625,20 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
                 0,
                 *material.metallicRoughnessTexture,
                 material.metallicRoughnessTexture->GetBindlessIndex());
+        }
+        if (material.specularTexture != nullptr)
+        {
+            m_bindlessSet->BindTexture(
+                0,
+                *material.specularTexture,
+                material.specularTexture->GetBindlessIndex());
+        }
+        if (material.specularColorTexture != nullptr)
+        {
+            m_bindlessSet->BindTexture(
+                0,
+                *material.specularColorTexture,
+                material.specularColorTexture->GetBindlessIndex());
         }
 
         resources->materials.push_back(std::move(material));
@@ -658,7 +708,13 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
             item.indexBufferIndex = resources->indexBufferIndices[primitiveIndex];
 
             const std::uint32_t whiteIndex = m_whiteTexture->GetBindlessIndex();
+            const std::uint32_t defaultSamplerIndex =
+                GetSamplerIndex(rhi::AddressMode::Repeat, rhi::AddressMode::Repeat);
             item.pushConstants.textureIndices = glm::uvec2{whiteIndex, whiteIndex};
+            item.specular = glm::vec4{1.0f, 1.0f, 1.0f, 1.0f};
+            item.specularTextureIndices = glm::uvec4{whiteIndex, whiteIndex, 0u, 0u};
+            item.specularSamplerIndices =
+                glm::uvec4{defaultSamplerIndex, defaultSamplerIndex, 0u, 0u};
 
             if (primitive.materialIndex >= 0 &&
                 primitive.materialIndex < static_cast<int>(resources->materials.size()))
@@ -670,6 +726,11 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
                     material.metallicFactor,
                     material.alphaMask ? 1.0f : 0.0f,
                     material.alphaCutoff};
+                item.specular = glm::vec4{
+                    material.specularFactor,
+                    material.specularColorFactor.r,
+                    material.specularColorFactor.g,
+                    material.specularColorFactor.b};
 
                 const Material& gpuMaterial = resources->materials[static_cast<std::size_t>(primitive.materialIndex)];
                 if (gpuMaterial.baseColorTexture != nullptr)
@@ -696,6 +757,31 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
                     item.pushConstants.samplerIndices.y =
                         GetSamplerIndex(ToRhiAddressMode(texture.wrapS), ToRhiAddressMode(texture.wrapT));
                 }
+
+                if (gpuMaterial.specularTexture != nullptr)
+                {
+                    item.specularTextureIndices.x = gpuMaterial.specularTexture->GetBindlessIndex();
+                }
+                if (gpuMaterial.specularColorTexture != nullptr)
+                {
+                    item.specularTextureIndices.y = gpuMaterial.specularColorTexture->GetBindlessIndex();
+                }
+                if (material.specularTexture >= 0 &&
+                    material.specularTexture < static_cast<int>(model.textures.size()))
+                {
+                    const GltfTexture& texture =
+                        model.textures[static_cast<std::size_t>(material.specularTexture)];
+                    item.specularSamplerIndices.x =
+                        GetSamplerIndex(ToRhiAddressMode(texture.wrapS), ToRhiAddressMode(texture.wrapT));
+                }
+                if (material.specularColorTexture >= 0 &&
+                    material.specularColorTexture < static_cast<int>(model.textures.size()))
+                {
+                    const GltfTexture& texture =
+                        model.textures[static_cast<std::size_t>(material.specularColorTexture)];
+                    item.specularSamplerIndices.y =
+                        GetSamplerIndex(ToRhiAddressMode(texture.wrapS), ToRhiAddressMode(texture.wrapT));
+                }
             }
             else
             {
@@ -715,6 +801,14 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
             ++textureCount;
         }
         if (material.metallicRoughnessTexture != nullptr)
+        {
+            ++textureCount;
+        }
+        if (material.specularTexture != nullptr)
+        {
+            ++textureCount;
+        }
+        if (material.specularColorTexture != nullptr)
         {
             ++textureCount;
         }
@@ -881,6 +975,9 @@ void DeferredRenderer::UpdateObjectData(std::uint32_t frameIndex)
     std::size_t index = 0;
     const auto updateItem = [this, &objectData, &index](DrawItem& item) {
         objectData[index].previousModel = m_previousModels[index];
+        objectData[index].specular = item.specular;
+        objectData[index].specularTextureIndices = item.specularTextureIndices;
+        objectData[index].specularSamplerIndices = item.specularSamplerIndices;
         item.pushConstants.drawIndex = static_cast<std::uint32_t>(index);
         m_previousModels[index] = item.pushConstants.model;
         ++index;
@@ -985,13 +1082,17 @@ void DeferredRenderer::BuildAccelerationStructures(rhi::CommandList& commandList
         return;
     }
 
-    if (m_tlas[frameIndex] == nullptr || m_tlasInstanceCount != instances.size())
+    if (m_tlasInstanceCounts.size() <= frameIndex)
+    {
+        m_tlasInstanceCounts.resize(m_device->GetFramesInFlight());
+    }
+    if (m_tlas[frameIndex] == nullptr || m_tlasInstanceCounts[frameIndex] != instances.size())
     {
         const rhi::TopLevelAccelerationStructureDesc tlasDesc{
             std::span<const rhi::AccelerationStructureInstance>{instances},
             true};
         m_tlas[frameIndex] = m_device->CreateTopLevelAccelerationStructure(tlasDesc);
-        m_tlasInstanceCount = instances.size();
+        m_tlasInstanceCounts[frameIndex] = instances.size();
         if (m_tlas[frameIndex] == nullptr)
         {
             MRE_ERROR("Failed to create the top level acceleration structure");
@@ -1091,8 +1192,70 @@ bool DeferredRenderer::CreateGiResources(rhi::Device& device)
         }
     }
 
+    if (!CreateReflectionResources(device))
+    {
+        return false;
+    }
+
     m_lightingSetsDirty = true;
     MRE_INFO("Global illumination resources created ({}x{} half resolution)", halfWidth, halfHeight);
+    return true;
+}
+
+bool DeferredRenderer::CreateReflectionResources(rhi::Device& device)
+{
+    if (!device.IsRayTracingSupported() || m_reflectionTraceSetLayout == nullptr ||
+        m_reflectionTemporalSetLayout == nullptr || m_reflectionUpsampleSetLayout == nullptr ||
+        m_gi.empty())
+    {
+        return true;
+    }
+
+    const std::uint32_t fullWidth = m_gbuffer.GetWidth();
+    const std::uint32_t fullHeight = m_gbuffer.GetHeight();
+    const std::uint32_t halfWidth = m_gi.front().diffuseNoisy->GetWidth();
+    const std::uint32_t halfHeight = m_gi.front().diffuseNoisy->GetHeight();
+
+    const auto createStorage = [&device](std::uint32_t width, std::uint32_t height, rhi::Format format) {
+        return device.CreateTexture(rhi::TextureDesc{width, height, format, rhi::TextureUsage::Storage});
+    };
+
+    for (GiFrameResources& gi : m_gi)
+    {
+        gi.reflectionNoisy = createStorage(halfWidth, halfHeight, rhi::Format::R16G16B16A16Sfloat);
+        gi.reflectionHitDistance = createStorage(halfWidth, halfHeight, rhi::Format::R16Sfloat);
+        for (std::uint32_t parity = 0; parity < 2; ++parity)
+        {
+            gi.reflectionHistory[parity] =
+                createStorage(halfWidth, halfHeight, rhi::Format::R16G16B16A16Sfloat);
+            gi.reflectionMoments[parity] =
+                createStorage(halfWidth, halfHeight, rhi::Format::R16G16B16A16Sfloat);
+        }
+        gi.reflectionFiltered = createStorage(halfWidth, halfHeight, rhi::Format::R16G16B16A16Sfloat);
+        gi.reflections = createStorage(fullWidth, fullHeight, rhi::Format::R16G16B16A16Sfloat);
+
+        if (gi.reflectionNoisy == nullptr || gi.reflectionHitDistance == nullptr ||
+            gi.reflectionHistory[0] == nullptr || gi.reflectionHistory[1] == nullptr ||
+            gi.reflectionMoments[0] == nullptr || gi.reflectionMoments[1] == nullptr ||
+            gi.reflectionFiltered == nullptr || gi.reflections == nullptr)
+        {
+            MRE_CRITICAL("Failed to create the ray traced reflection textures");
+            return false;
+        }
+
+        gi.reflectionTraceSet = device.CreateDescriptorSet(*m_reflectionTraceSetLayout);
+        gi.reflectionTemporalSet = device.CreateDescriptorSet(*m_reflectionTemporalSetLayout);
+        gi.reflectionUpsampleSet = device.CreateDescriptorSet(*m_reflectionUpsampleSetLayout);
+        for (std::unique_ptr<rhi::DescriptorSet>& atrousSet : gi.reflectionAtrousSets)
+        {
+            atrousSet = device.CreateDescriptorSet(*m_giAtrousSetLayout);
+        }
+
+        gi.reflectionParity = 0;
+        gi.reflectionValid = false;
+    }
+
+    MRE_INFO("Ray traced reflection resources created ({}x{})", halfWidth, halfHeight);
     return true;
 }
 
@@ -1115,6 +1278,25 @@ void DeferredRenderer::SetGiSettings(const GiSettings& settings)
 bool DeferredRenderer::IsGiActive() const
 {
     return m_giSettings.enabled && m_device != nullptr && m_device->IsRayTracingSupported();
+}
+
+void DeferredRenderer::SetReflectionSettings(const ReflectionSettings& settings)
+{
+    m_reflectionSettings = settings;
+
+    // Reset the temporal history so the new cutoff/intensity converges immediately.
+    for (GiFrameResources& gi : m_gi)
+    {
+        gi.reflectionValid = false;
+    }
+}
+
+bool DeferredRenderer::IsReflectionActive() const
+{
+    return m_reflectionSettings.enabled && m_device != nullptr &&
+           m_device->IsRayTracingSupported() && m_rtReflectionPipeline != nullptr &&
+           m_reflectionTemporalPipeline != nullptr && m_reflectionUpsamplePipeline != nullptr &&
+           !m_gi.empty();
 }
 
 void DeferredRenderer::UpdateGiUniform(std::uint32_t frameIndex, const FrameView& view)
@@ -1184,7 +1366,12 @@ void DeferredRenderer::UpdateGiUniform(std::uint32_t frameIndex, const FrameView
         static_cast<float>(std::clamp(m_giSettings.probeRays, 1u, 256u)),
         std::clamp(m_giSettings.probeHysteresis, 0.0f, 0.98f),
         IsProbeGiActive() ? static_cast<float>(m_giProbeData.size()) : 0.0f,
-        0.0f};
+        m_gi[frameIndex].reflectionValid ? 0.0f : 1.0f};
+    m_giUniform.params6 = glm::vec4{
+        std::max(m_reflectionSettings.maxDistance, 0.1f),
+        std::clamp(m_reflectionSettings.maxRoughness, 0.0f, 1.0f),
+        static_cast<float>(std::clamp(m_reflectionSettings.samples, 1u, 8u)),
+        std::max(m_reflectionSettings.intensity, 0.0f)};
 
     m_gi[frameIndex].uniformBuffer->Write(&m_giUniform, sizeof(GiUniform));
 
@@ -1386,6 +1573,10 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
         rhi::ColorAttachment{&m_gbuffer.GetNormal(), rhi::ClearColor{0.5f, 0.5f, 1.0f, 1.0f}, true},
         rhi::ColorAttachment{&m_gbuffer.GetPosition(), rhi::ClearColor{0.0f, 0.0f, 0.0f, 0.0f}, true},
         rhi::ColorAttachment{&m_gbuffer.GetMotion(), rhi::ClearColor{0.0f, 0.0f, 0.0f, 0.0f}, true},
+        rhi::ColorAttachment{
+            &m_gbuffer.GetSpecularF0(),
+            rhi::ClearColor{0.04f, 0.04f, 0.04f, 1.0f},
+            true},
     };
     gbufferDesc.depthAttachment = rhi::DepthAttachment{&m_gbuffer.GetDepth(), 1.0f, true};
 
@@ -1554,6 +1745,7 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
     }
 
     RecordGiPasses(commandList, frameIndex);
+    RecordReflectionPasses(commandList, frameIndex);
 
     commandList.BeginGpuZone("Lighting");
     commandList.BeginSwapchainRendering(rhi::ClearColor{0.0f, 0.0f, 0.0f, 1.0f}, true);
@@ -1699,19 +1891,16 @@ std::uint32_t DeferredRenderer::RecordGBufferSecondaries(
         batchCount <= m_gbufferSecondaries[frameIndex].size(),
         "Not enough secondary command lists were allocated");
 
-    const std::size_t itemsPerBatch = (items.size() + batchCount - 1) / batchCount;
-
     std::vector<std::future<void>> futures{};
     futures.reserve(batchCount);
 
     for (std::uint32_t batch = 0; batch < batchCount; ++batch)
     {
-        const std::size_t begin = static_cast<std::size_t>(batch) * itemsPerBatch;
-        const std::size_t end = std::min(begin + itemsPerBatch, items.size());
-        if (begin >= end)
-        {
-            break;
-        }
+        // Even split: with items.size() >= batchCount every batch owns at least one item.
+        const std::size_t begin = static_cast<std::size_t>(batch) * items.size() / batchCount;
+        const std::size_t end =
+            static_cast<std::size_t>(batch + 1) * items.size() / batchCount;
+        MRE_ASSERT(begin < end, "RecordGBufferSecondaries produced an empty batch");
 
         rhi::CommandList* secondary = m_gbufferSecondaries[frameIndex][batch].get();
         futures.push_back(m_jobSystem->Submit([this, frameIndex, secondary, &desc, &items, begin, end]() {
@@ -1992,6 +2181,15 @@ bool DeferredRenderer::LoadShaders(rhi::Device& device, const std::filesystem::p
     m_giProbeShader = device.CreateShader(
         rhi::ShaderStage::Compute,
         shaderDirectory / "gi_probes.comp.spv");
+    m_rtReflectionShader = device.CreateShader(
+        rhi::ShaderStage::Compute,
+        shaderDirectory / "rt_reflections.comp.spv");
+    m_reflectionTemporalShader = device.CreateShader(
+        rhi::ShaderStage::Compute,
+        shaderDirectory / "reflection_temporal.comp.spv");
+    m_reflectionUpsampleShader = device.CreateShader(
+        rhi::ShaderStage::Compute,
+        shaderDirectory / "reflection_upsample.comp.spv");
     m_debugLineVertexShader = device.CreateShader(
         rhi::ShaderStage::Vertex,
         shaderDirectory / "debug_line.vert.spv");
@@ -2005,7 +2203,8 @@ bool DeferredRenderer::LoadShaders(rhi::Device& device, const std::filesystem::p
         m_shadowFragmentShader == nullptr || m_giTraceShader == nullptr ||
         m_giTemporalShader == nullptr || m_giAtrousShader == nullptr ||
         m_giUpsampleShader == nullptr || m_rtShadowShader == nullptr ||
-        m_giProbeShader == nullptr ||
+        m_giProbeShader == nullptr || m_rtReflectionShader == nullptr ||
+        m_reflectionTemporalShader == nullptr || m_reflectionUpsampleShader == nullptr ||
         m_debugLineVertexShader == nullptr || m_debugLineFragmentShader == nullptr)
     {
         MRE_CRITICAL("Failed to load the deferred shaders from '{}'", PathToUtf8(shaderDirectory));
@@ -2033,7 +2232,8 @@ bool DeferredRenderer::CreatePipelines(rhi::Device& device)
         rhi::Format::R8G8B8A8Unorm,
         rhi::Format::R8G8B8A8Unorm,
         rhi::Format::R16G16B16A16Sfloat,
-        rhi::Format::R16G16Sfloat};
+        rhi::Format::R16G16Sfloat,
+        rhi::Format::R8G8B8A8Unorm};
     gbufferPipelineDesc.depthFormat = rhi::Format::D32Sfloat;
     m_gbufferPipeline = device.CreatePipeline(gbufferPipelineDesc);
 
@@ -2110,6 +2310,19 @@ bool DeferredRenderer::CreatePipelines(rhi::Device& device)
             createGiPipeline(*m_giProbeShader, *m_giProbeSetLayout, 0, m_bindlessSetLayout.get());
     }
 
+    if (m_reflectionTraceSetLayout != nullptr)
+    {
+        m_rtReflectionPipeline = createGiPipeline(
+            *m_rtReflectionShader,
+            *m_reflectionTraceSetLayout,
+            0,
+            m_bindlessSetLayout.get());
+        m_reflectionTemporalPipeline =
+            createGiPipeline(*m_reflectionTemporalShader, *m_reflectionTemporalSetLayout, 0);
+        m_reflectionUpsamplePipeline =
+            createGiPipeline(*m_reflectionUpsampleShader, *m_reflectionUpsampleSetLayout, 0);
+    }
+
     const std::array<const rhi::Shader*, 2> debugLineStages{
         m_debugLineVertexShader.get(),
         m_debugLineFragmentShader.get()};
@@ -2131,7 +2344,10 @@ bool DeferredRenderer::CreatePipelines(rhi::Device& device)
            m_giAtrousPipeline != nullptr && m_giUpsamplePipeline != nullptr &&
            m_debugLinePipeline != nullptr &&
            (m_rtShadowSetLayout == nullptr || m_rtShadowPipeline != nullptr) &&
-           (m_giProbeSetLayout == nullptr || m_giProbePipeline != nullptr);
+           (m_giProbeSetLayout == nullptr || m_giProbePipeline != nullptr) &&
+           (m_reflectionTraceSetLayout == nullptr ||
+            (m_rtReflectionPipeline != nullptr && m_reflectionTemporalPipeline != nullptr &&
+             m_reflectionUpsamplePipeline != nullptr));
 }
 
 bool DeferredRenderer::CreateScene()
@@ -2209,6 +2425,13 @@ void DeferredRenderer::CreateLightingSets(rhi::Device& device)
         lightingSet->BindStorageBuffer(
             14,
             m_giProbeBuffer != nullptr ? *m_giProbeBuffer : *m_giProbeDummyBuffer);
+        lightingSet->BindTexture(
+            15,
+            frame < m_gi.size() && m_gi[frame].reflections != nullptr
+                ? *m_gi[frame].reflections
+                : *m_whiteTexture,
+            0u);
+        lightingSet->BindTexture(16, m_gbuffer.GetSpecularF0(), 0u);
         m_lightingSets.push_back(std::move(lightingSet));
     }
 }
@@ -2472,6 +2695,8 @@ void DeferredRenderer::UpdateUniforms(std::uint32_t frameIndex, const FrameView&
     // ambientColor.w carries the active GI probe count to the lighting pass (0 disables them).
     m_sceneUniform.ambientColor.w =
         IsProbeGiActive() ? static_cast<float>(m_giProbeData.size()) : 0.0f;
+    m_sceneUniform.reflectionParams.x =
+        IsReflectionActive() ? m_reflectionSettings.intensity : 0.0f;
     m_uniformBuffers[frameIndex]->Write(&m_sceneUniform, sizeof(SceneUniform));
 
     m_clusterUniform.inverseView = glm::inverse(view.view);
@@ -2779,6 +3004,140 @@ void DeferredRenderer::RecordGiProbes(rhi::CommandList& commandList, std::uint32
     commandList.BindDescriptorSet(1, *m_bindlessSet);
     commandList.Dispatch((probeCount + 63) / 64, 1, 1);
     commandList.ShaderMemoryBarrier(rhi::ShaderStageMask::Compute, rhi::ShaderStageMask::Fragment);
+    commandList.EndGpuZone();
+}
+
+void DeferredRenderer::BindReflectionDescriptors(std::uint32_t frameIndex)
+{
+    GiFrameResources& gi = m_gi[frameIndex];
+    const std::uint32_t parity = gi.reflectionParity;
+
+    // Trace.
+    gi.reflectionTraceSet->BindBuffer(0, *gi.uniformBuffer);
+    if (m_tlas[frameIndex] != nullptr)
+    {
+        gi.reflectionTraceSet->BindAccelerationStructure(1, *m_tlas[frameIndex]);
+    }
+    if (m_geometryDataBuffers[frameIndex] != nullptr)
+    {
+        gi.reflectionTraceSet->BindStorageBuffer(2, *m_geometryDataBuffers[frameIndex]);
+    }
+    gi.reflectionTraceSet->BindTexture(3, m_gbuffer.GetDepth(), 0u);
+    gi.reflectionTraceSet->BindTexture(4, m_gbuffer.GetNormal(), 0u);
+    gi.reflectionTraceSet->BindTexture(5, *m_blackTexture, 0u);
+    gi.reflectionTraceSet->BindStorageImage(6, *gi.reflectionNoisy);
+    gi.reflectionTraceSet->BindStorageImage(7, *gi.reflectionHitDistance);
+    gi.reflectionTraceSet->BindTexture(8, m_gbuffer.GetAlbedo(), 0u);
+    gi.reflectionTraceSet->BindTexture(
+        9,
+        m_rtSunShadowMask != nullptr ? *m_rtSunShadowMask : *m_whiteTexture,
+        0u);
+    gi.reflectionTraceSet->BindTexture(10, m_gbuffer.GetSpecularF0(), 0u);
+
+    // Temporal: reads history[parity], writes history[parity ^ 1].
+    gi.reflectionTemporalSet->BindBuffer(0, *gi.uniformBuffer);
+    gi.reflectionTemporalSet->BindTexture(1, m_gbuffer.GetDepth(), 0u);
+    gi.reflectionTemporalSet->BindTexture(2, m_gbuffer.GetNormal(), 0u);
+    gi.reflectionTemporalSet->BindTexture(3, m_gbuffer.GetMotion(), 0u);
+    gi.reflectionTemporalSet->BindTexture(4, *gi.reflectionNoisy, 0u);
+    gi.reflectionTemporalSet->BindTexture(5, *gi.reflectionHistory[parity], 0u);
+    gi.reflectionTemporalSet->BindTexture(6, *gi.reflectionMoments[parity], 0u);
+    gi.reflectionTemporalSet->BindStorageImage(7, *gi.reflectionHistory[parity ^ 1]);
+    gi.reflectionTemporalSet->BindStorageImage(8, *gi.reflectionMoments[parity ^ 1]);
+
+    // A-trous: one set per iteration, ping-ponging between the temporal output and the filtered
+    // texture; the schedule always ends on the filtered texture.
+    const std::vector<GiAtrousStep> steps =
+        BuildGiAtrousSchedule(m_giSettings.atrousIterations, kMaxAtrousIterations);
+    for (std::uint32_t stepIndex = 0; stepIndex < steps.size(); ++stepIndex)
+    {
+        const auto textureFor = [&gi, parity](GiAtrousTexture which) -> rhi::Texture* {
+            if (which == GiAtrousTexture::History)
+            {
+                return gi.reflectionHistory[parity ^ 1].get();
+            }
+            if (which == GiAtrousTexture::Noisy)
+            {
+                return gi.reflectionNoisy.get();
+            }
+            return gi.reflectionFiltered.get();
+        };
+
+        rhi::DescriptorSet& set = *gi.reflectionAtrousSets[stepIndex];
+        set.BindBuffer(0, *gi.uniformBuffer);
+        set.BindTexture(1, m_gbuffer.GetDepth(), 0u);
+        set.BindTexture(2, m_gbuffer.GetNormal(), 0u);
+        set.BindTexture(3, *gi.reflectionHitDistance, 0u);
+        set.BindTexture(4, *textureFor(steps[stepIndex].input), 0u);
+        set.BindTexture(5, *gi.reflectionMoments[parity ^ 1], 0u);
+        set.BindStorageImage(6, *textureFor(steps[stepIndex].output));
+    }
+
+    // Upsample.
+    gi.reflectionUpsampleSet->BindBuffer(0, *gi.uniformBuffer);
+    gi.reflectionUpsampleSet->BindTexture(1, *gi.reflectionFiltered, 0u);
+    gi.reflectionUpsampleSet->BindTexture(2, m_gbuffer.GetDepth(), 0u);
+    gi.reflectionUpsampleSet->BindTexture(3, m_gbuffer.GetNormal(), 0u);
+    gi.reflectionUpsampleSet->BindStorageImage(4, *gi.reflections);
+}
+
+void DeferredRenderer::RecordReflectionPasses(rhi::CommandList& commandList, std::uint32_t frameIndex)
+{
+    if (!IsReflectionActive() || m_gi.size() <= frameIndex)
+    {
+        return;
+    }
+
+    GiFrameResources& gi = m_gi[frameIndex];
+    if (gi.reflectionNoisy == nullptr || m_tlas[frameIndex] == nullptr ||
+        m_geometryDataBuffers[frameIndex] == nullptr)
+    {
+        return;
+    }
+
+    const std::uint32_t halfWidth = gi.reflectionNoisy->GetWidth();
+    const std::uint32_t halfHeight = gi.reflectionNoisy->GetHeight();
+    const std::uint32_t groupsX = (halfWidth + 7) / 8;
+    const std::uint32_t groupsY = (halfHeight + 7) / 8;
+    const std::uint32_t iterations =
+        std::clamp(m_giSettings.atrousIterations, 1u, kMaxAtrousIterations);
+
+    BindReflectionDescriptors(frameIndex);
+
+    commandList.BeginGpuZone("Reflections");
+
+    commandList.BindPipeline(*m_rtReflectionPipeline);
+    commandList.BindDescriptorSet(0, *gi.reflectionTraceSet);
+    commandList.BindDescriptorSet(1, *m_bindlessSet);
+    commandList.Dispatch(groupsX, groupsY, 1);
+    commandList.ShaderMemoryBarrier(rhi::ShaderStageMask::Compute, rhi::ShaderStageMask::Compute);
+
+    commandList.BindPipeline(*m_reflectionTemporalPipeline);
+    commandList.BindDescriptorSet(0, *gi.reflectionTemporalSet);
+    commandList.Dispatch(groupsX, groupsY, 1);
+    commandList.ShaderMemoryBarrier(rhi::ShaderStageMask::Compute, rhi::ShaderStageMask::Compute);
+
+    commandList.BindPipeline(*m_giAtrousPipeline);
+    for (std::uint32_t iteration = 0; iteration < iterations; ++iteration)
+    {
+        commandList.BindDescriptorSet(0, *gi.reflectionAtrousSets[iteration]);
+        const GiAtrousPushConstants pushConstants{1, iteration};
+        commandList.SetPushConstants(&pushConstants, sizeof(pushConstants), rhi::ShaderStageMask::Compute);
+        commandList.Dispatch(groupsX, groupsY, 1);
+        commandList.ShaderMemoryBarrier(rhi::ShaderStageMask::Compute, rhi::ShaderStageMask::Compute);
+    }
+
+    commandList.BindPipeline(*m_reflectionUpsamplePipeline);
+    commandList.BindDescriptorSet(0, *gi.reflectionUpsampleSet);
+    commandList.Dispatch(
+        (m_gbuffer.GetWidth() + 7) / 8,
+        (m_gbuffer.GetHeight() + 7) / 8,
+        1);
+    commandList.ShaderMemoryBarrier(rhi::ShaderStageMask::Compute, rhi::ShaderStageMask::Fragment);
+
+    gi.reflectionParity ^= 1;
+    gi.reflectionValid = true;
+
     commandList.EndGpuZone();
 }
 
