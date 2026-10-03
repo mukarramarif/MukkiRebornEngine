@@ -110,6 +110,79 @@ The sandbox has a scene browser window listing the JSON scenes in `Sandbox/Scene
 with the light editor, a G-buffer debug window, and an ImGui demo window. glTF objects loaded from a
 scene are auto-fitted to the ground plane.
 
+## Rendering pipeline
+
+One command list per frame; the shadow and G-buffer draw calls are recorded into secondary command
+buffers on worker threads and replayed from the primary list. Clustered lighting and ray traced GI
+converge in the fullscreen `lighting.frag` pass:
+
+```mermaid
+flowchart TB
+    CPU["Scene / camera / UI edits"] --> UPLOAD["Per-frame uploads<br/>GpuLight SSBO · object SSBO · motion vectors · uniforms"]
+    UPLOAD --> AS["Acceleration structures<br/>BLAS per primitive (rebuild when dirty)<br/>+ per-frame TLAS + geometry SSBO"]
+
+    AS --> SHADOW["Shadow pass<br/>CSM · spot · point<br/>(secondary command buffers)"]
+    SHADOW --> GBUFFER["G-buffer pass<br/>albedo · normal+roughness · position · motion<br/>specularF0 · transmission · attenuation · sheen · depth"]
+    GBUFFER --> RTSHADOW["RT sun shadow mask<br/>jittered rays, full-res R16F (optional)"]
+    AS --> RTSHADOW
+
+    subgraph CLUSTERS ["Clustered lights"]
+        direction TB
+        CULL["cluster_culling.comp<br/>32x32 tiles x 24 exponential Z slices"]
+        LISTS["per-cluster light index lists + counts<br/>up to 64 lights per cluster, 256 total"]
+        CULL --> LISTS
+    end
+    UPLOAD --> CULL
+
+    subgraph GI ["Ray traced GI — half resolution, per-pixel mode"]
+        direction TB
+        TRACE["gi_trace.comp<br/>cosine diffuse + GGX VNDF specular rays<br/>sun visibility from the RT mask or jittered rays"]
+        TEMPORAL["gi_temporal.comp<br/>SVGF moments + firefly rejection"]
+        ATROUS["gi_atrous.comp<br/>variance-clamped ping-pong"]
+        UPSAMPLE["gi_upsample.comp<br/>joint bilateral to full res"]
+        TRACE --> TEMPORAL --> ATROUS --> UPSAMPLE
+    end
+    GBUFFER --> TRACE
+    AS --> TRACE
+    RTSHADOW --> TRACE
+
+    subgraph PROBES ["GI probes — alternative mode"]
+        PROBEPASS["gi_probes.comp<br/>uniform-sphere rays to SH L1 per probe"]
+    end
+    AS --> PROBEPASS
+
+    subgraph REFL ["Ray traced reflections — 0.25x-1x trace scale"]
+        direction TB
+        RTRACE["rt_reflections.comp<br/>Heitz GGX VNDF rays, shared hit shading"]
+        RTEMPORAL["reflection_temporal.comp<br/>SVGF moments + firefly rejection"]
+        RATROUS["gi_atrous.comp (signal 2)<br/>roughness / hit-distance aware"]
+        RUP["reflection_upsample.comp<br/>roughness-aware bilateral"]
+        RTRACE --> RTEMPORAL --> RATROUS --> RUP
+    end
+    GBUFFER --> RTRACE
+    AS --> RTRACE
+    RTSHADOW --> RTRACE
+
+    LIGHTING["lighting.frag (fullscreen)<br/>clustered Cook-Torrance + sheen<br/>+ indirect GI / probes + reflections<br/>ACES tonemap"]
+    LISTS --> LIGHTING
+    UPSAMPLE --> LIGHTING
+    PROBEPASS --> LIGHTING
+    RUP --> LIGHTING
+    LIGHTING --> TRANSPARENT["transparent forward pass<br/>sorted BLEND, depth tested"]
+    TRANSPARENT --> OVERLAY["debug gizmos + ImGui"]
+```
+
+- **Clustered lights**: every light is uploaded once per frame; the culling compute shader bins them
+  into a `32x32` tile by 24 exponential-depth-slice grid, and the lighting pass only iterates the
+  index list of the cluster a fragment falls into.
+- **GI**: the per-pixel trace shoots `Trace samples` diffuse+specular path pairs at half resolution,
+  then the SVGF chain denoises it. When probes are enabled the per-pixel trace is skipped and the
+  probe SH irradiance is blended instead, so indirect light is never counted twice.
+- **Reflections**: a separate trace/denoise chain at the configurable trace scale; it shares the
+  a-trous kernel with GI and fades into the GI specular signal at the roughness cutoff.
+- **Lighting** composites direct clustered lights, indirect GI (or probes) and reflections in one
+  pass, applies ACES tonemapping, and transparent `BLEND` geometry is drawn over the result.
+
 ## Scenes
 
 Scenes are authored as JSON and compiled into compact little-endian bytecode (magic `MRES`) that the
