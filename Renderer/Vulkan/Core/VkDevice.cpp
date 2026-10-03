@@ -7,7 +7,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <limits>
+#include <vector>
 
 namespace mukki::vulkan
 {
@@ -169,6 +171,11 @@ bool VkDevice::BeginFrame()
         m_swapchainDirty = true;
         return false;
     }
+    catch (const vk::DeviceLostError&)
+    {
+        LogDeviceFault();
+        throw;
+    }
 
     commandList.SetSwapchainTarget(
         m_swapchain->GetImage(m_currentImageIndex),
@@ -216,7 +223,15 @@ void VkDevice::EndFrame()
     submitInfo.signalSemaphoreInfoCount = static_cast<std::uint32_t>(signalInfos.size());
     submitInfo.pSignalSemaphoreInfos = signalInfos.data();
 
-    m_graphicsQueue.submit2(submitInfo);
+    try
+    {
+        m_graphicsQueue.submit2(submitInfo);
+    }
+    catch (const vk::DeviceLostError&)
+    {
+        LogDeviceFault();
+        throw;
+    }
     m_frameSync.SetFrameValue(m_frameIndex, signalValue);
 
     if (commandList.WasSwapchainRendered())
@@ -599,6 +614,42 @@ bool VkDevice::CreateLogicalDevice()
         extensions.push_back(vk::KHRRayQueryExtensionName);
     }
 
+    // VK_EXT_device_fault reports the faulting address when the device is lost, which is the only
+    // runtime diagnostic available for shader memory faults.
+    vk::PhysicalDeviceFaultFeaturesEXT faultFeatures{};
+    {
+        const std::vector<vk::ExtensionProperties> availableExtensions =
+            m_physicalDevice.enumerateDeviceExtensionProperties();
+        m_deviceFaultSupported = std::any_of(
+            availableExtensions.begin(),
+            availableExtensions.end(),
+            [](const vk::ExtensionProperties& extension) {
+                return std::strcmp(extension.extensionName, vk::EXTDeviceFaultExtensionName) == 0;
+            });
+        if (m_deviceFaultSupported)
+        {
+            const vk::StructureChain<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceFaultFeaturesEXT>
+                queriedFeatures = m_physicalDevice.getFeatures2<
+                    vk::PhysicalDeviceFeatures2,
+                    vk::PhysicalDeviceFaultFeaturesEXT>();
+            m_deviceFaultSupported =
+                queriedFeatures.get<vk::PhysicalDeviceFaultFeaturesEXT>().deviceFault == vk::True;
+        }
+        if (m_deviceFaultSupported)
+        {
+            faultFeatures.deviceFault = true;
+            extensions.push_back(vk::EXTDeviceFaultExtensionName);
+            if (m_rayTracingSupported)
+            {
+                rayQueryFeatures.pNext = &faultFeatures;
+            }
+            else
+            {
+                features13.pNext = &faultFeatures;
+            }
+        }
+    }
+
     vk::DeviceCreateInfo createInfo{};
     createInfo.pNext = &features2;
     createInfo.queueCreateInfoCount = 1;
@@ -617,6 +668,13 @@ bool VkDevice::CreateLogicalDevice()
     }
 
     m_graphicsQueue = m_device.getQueue(m_graphicsQueueFamily, 0);
+    const vk::PhysicalDeviceLimits limits = m_physicalDevice.getProperties().limits;
+    MRE_INFO(
+        "Device limits: maxColorAttachments {}, maxFragmentCombinedOutputResources {}, "
+        "maxPerStageDescriptorStorageBuffers {}",
+        limits.maxColorAttachments,
+        limits.maxFragmentCombinedOutputResources,
+        limits.maxPerStageDescriptorStorageBuffers);
     MRE_INFO("Logical device created (graphics queue family {})", m_graphicsQueueFamily);
     return true;
 }
@@ -749,6 +807,63 @@ void VkDevice::WaitForFrame(std::uint32_t frame)
     if (result != vk::Result::eSuccess)
     {
         MRE_ERROR("Failed to wait for frame {} ({})", frame, vk::to_string(result));
+    }
+}
+
+void VkDevice::LogDeviceFault()
+{
+    if (!m_deviceFaultSupported || m_device == nullptr)
+    {
+        return;
+    }
+
+    const auto getFaultInfo = reinterpret_cast<PFN_vkGetDeviceFaultInfoEXT>(
+        m_device.getProcAddr("vkGetDeviceFaultInfoEXT"));
+    if (getFaultInfo == nullptr)
+    {
+        return;
+    }
+
+    VkDeviceFaultCountsEXT counts{};
+    counts.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT;
+    if (getFaultInfo(*m_device, &counts, nullptr) != VK_SUCCESS)
+    {
+        return;
+    }
+
+    std::vector<VkDeviceFaultAddressInfoEXT> addressInfos(counts.addressInfoCount);
+    std::vector<VkDeviceFaultVendorInfoEXT> vendorInfos(counts.vendorInfoCount);
+    std::vector<std::byte> vendorBinary(counts.vendorBinarySize);
+
+    VkDeviceFaultInfoEXT info{};
+    info.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT;
+    info.pAddressInfos = addressInfos.empty() ? nullptr : addressInfos.data();
+    info.pVendorInfos = vendorInfos.empty() ? nullptr : vendorInfos.data();
+    info.pVendorBinaryData = vendorBinary.empty() ? nullptr : vendorBinary.data();
+
+    if (getFaultInfo(*m_device, &counts, &info) != VK_SUCCESS)
+    {
+        return;
+    }
+
+    MRE_CRITICAL(
+        "Device fault: '{}'",
+        info.description[0] != '\0' ? info.description : "no description");
+    for (const VkDeviceFaultAddressInfoEXT& address : addressInfos)
+    {
+        MRE_CRITICAL(
+            "  address type {} reported 0x{:x} precision 0x{:x}",
+            static_cast<int>(address.addressType),
+            static_cast<unsigned long long>(address.reportedAddress),
+            static_cast<unsigned long long>(address.addressPrecision));
+    }
+    for (const VkDeviceFaultVendorInfoEXT& vendor : vendorInfos)
+    {
+        MRE_CRITICAL(
+            "  vendor fault '{}' code {} data {}",
+            vendor.description,
+            static_cast<unsigned long long>(vendor.vendorFaultCode),
+            static_cast<unsigned long long>(vendor.vendorFaultData));
     }
 }
 

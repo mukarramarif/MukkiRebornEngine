@@ -1,0 +1,37 @@
+[
+  {
+    "label": "Build Debug",
+    "command": "cmake",
+    "args": ["--build", "build/windows-debug", "--config", "Debug"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "reveal": "always",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false
+  },
+  {
+    "label": "Build Release",
+    "command": "cmake",
+    "args": ["--build", "build/windows-release", "--config", "Release"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "reveal": "always",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false
+  },
+  {
+    "label": "Run Sandbox (Debug, 120 frames)",
+    "command": "build/windows-debug/Debug/mukki_sandbox.exe",
+    "args": ["--frames", "120"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "reveal": "always",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false
+  },
+  {
+    "label": "Run Tests (Debug)",
+    "command": "build/windows-debug/Tests/Debug/mukki_tests.exe",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "reveal": "always",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false
+  }
+]

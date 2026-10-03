@@ -40,6 +40,15 @@ must not expose backend types, and Vulkan types may only appear under `Renderer/
   extended `GpuObjectData` SSBO (read by the G-buffer fragment), and the dielectric F0 is baked into
   the fifth G-buffer target (`GBuffer::GetSpecularF0`, 0.04 default); lighting and reflections use
   `f0 = lerp(specularF0, albedo, metalness)`.
+  Transparency: `alphaMode = BLEND` surfaces skip the G-buffer and are drawn by a sorted
+  back-to-front forward pass after lighting (`BeginSwapchainRendering` depth overload, depth test
+  against the G-buffer depth, no depth write); shadow maps still include them. `KHR_materials_ior`,
+  `transmission`, `volume` and `dispersion` are packed into G-buffer targets 5/6
+  (`GBuffer::GetTransmission/GetAttenuation`); `rt_reflections` splits the microfacet lobe into
+  reflection/refraction by fresnel and `ShadeHit` (`gi_shading.slang`) follows up to `params7.x`
+  dielectric bounces with Beer-Lambert absorption and optional 3-channel dispersion. The lighting
+  pass scales the surface terms by `(1 - transmission)` and composites the traced dielectric signal,
+  so glass is reflected/refracted consistently in reflections, GI and probes.
 - Debug gizmos: `Renderer/Debug/DebugLines.h` builds CPU line lists (`DebugLines`) for light and
   probe markers; `DeferredRenderer::RecordDebugLines` draws them at the end of the swapchain
   lighting scope with a `PrimitiveTopology::LineList` pipeline (push constant viewProjection, no

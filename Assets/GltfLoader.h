@@ -50,11 +50,29 @@ struct GltfMaterial
     bool doubleSided = false;
     bool alphaMask = false;
     float alphaCutoff = 0.5f;
+    bool alphaBlend = false;
     // KHR_materials_specular.
     float specularFactor = 1.0f;
     glm::vec3 specularColorFactor{1.0f};
     int specularTexture = -1;
     int specularColorTexture = -1;
+    // KHR_materials_ior.
+    float ior = 1.5f;
+    // KHR_materials_transmission.
+    float transmissionFactor = 0.0f;
+    int transmissionTexture = -1;
+    // KHR_materials_volume. attenuationDistance == 0 means no absorption (glTF default).
+    float thicknessFactor = 0.0f;
+    int thicknessTexture = -1;
+    glm::vec3 attenuationColor{1.0f};
+    float attenuationDistance = 0.0f;
+    // KHR_materials_dispersion.
+    float dispersion = 0.0f;
+    // KHR_materials_sheen.
+    glm::vec3 sheenColorFactor{0.0f};
+    float sheenRoughnessFactor = 0.0f;
+    int sheenColorTexture = -1;
+    int sheenRoughnessTexture = -1;
 };
 
 struct GltfImage

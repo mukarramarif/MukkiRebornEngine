@@ -2,8 +2,7 @@
 // declare GiUniform, GpuGeometryData and the bindings for gGi, gTlas, gGeometry, gDepth,
 // gTextures, gSamplers, gBuffers and gRtSunShadow before including this file.
 
-static const float kPi = 3.14159265359;
-static const float kMaxGiRadiance = 20.0;
+#include "sheen_brdf.slang"
 
 float LoadFloat(ByteAddressBuffer buffer, uint byteOffset)
 {
@@ -73,7 +72,7 @@ float3 SampleCosineDirection(float3 normal, uint2 pixel, uint frame)
         tangent * (sinTheta * cos(phi)) + bitangent * (sinTheta * sin(phi)) + normal * cosTheta);
 }
 
-float3 SampleGgxDirection(float3 normal, float3 viewDirection, float roughness, uint2 pixel, uint frame)
+float3 SampleGgxHalfVector(float3 viewDirection, float roughness, uint2 pixel, uint frame)
 {
     const float3 view = normalize(viewDirection);
     const float3 tangent =
@@ -87,9 +86,14 @@ float3 SampleGgxDirection(float3 normal, float3 viewDirection, float roughness, 
     const float cosTheta = sqrt((1.0 - r2) / (1.0 + (a * a - 1.0) * r2));
     const float sinTheta = sqrt(max(1.0 - cosTheta * cosTheta, 0.0));
 
-    const float3 halfVector =
-        tangent * (sinTheta * cos(phi)) + bitangent * (sinTheta * sin(phi)) + view * cosTheta;
-    return reflect(-view, normalize(halfVector));
+    return normalize(
+        tangent * (sinTheta * cos(phi)) + bitangent * (sinTheta * sin(phi)) + view * cosTheta);
+}
+
+float3 SampleGgxDirection(float3 normal, float3 viewDirection, float roughness, uint2 pixel, uint frame)
+{
+    const float3 halfVector = SampleGgxHalfVector(viewDirection, roughness, pixel, frame);
+    return reflect(-normalize(viewDirection), halfVector);
 }
 
 // Projects the hit point onto the ray traced sun shadow mask. Returns false when the hit is not
@@ -130,19 +134,34 @@ bool SampleRtSunVisibility(float3 position, float3 normal, out float visibility)
     return true;
 }
 
-// Outgoing radiance leaving the hit surface: albedo times (sun visibility plus sky) plus the
-// multi-bounce feedback from the previous frame. `feedbackTexture` holds the previous indirect
-// result; probe rays pass the white texture because they do not use screen-space feedback.
-float3 ShadeHit(
-    Texture2D feedbackTexture,
+struct SurfaceSample
+{
+    float3 position;
+    float3 normal;          // flipped toward the incoming ray
+    float3 geometricNormal; // original winding
+    float3 viewDirection;   // from the surface toward the ray origin
+    float3 baseColor;
+    float alpha;
+    float roughness;
+    float metalness;
+    bool alphaBlend;
+    float transmission;
+    float ior;
+    float thickness;
+    float dispersion;
+    float3 attenuationColor;
+    float attenuationDistance;
+    float3 sheenColor;
+    float sheenRoughness;
+};
+
+SurfaceSample LoadSurface(
     uint geometryIndex,
     uint primitiveIndex,
     float2 barycentrics,
     float3 rayOrigin,
     float3 rayDirection,
-    float hitDistance,
-    uint2 pixel,
-    uint frame)
+    float hitDistance)
 {
     const GpuGeometryData geometry = gGeometry[geometryIndex];
     const ByteAddressBuffer vertexBuffer = gBuffers[NonUniformResourceIndex(geometry.bufferIndices.x)];
@@ -158,87 +177,178 @@ float3 ShadeHit(
     const float3 n0 = LoadFloat3(vertexBuffer, i0 * stride + 12u);
     const float3 n1 = LoadFloat3(vertexBuffer, i1 * stride + 12u);
     const float3 n2 = LoadFloat3(vertexBuffer, i2 * stride + 12u);
-    float3 normal = normalize(n0 * w0 + n1 * barycentrics.x + n2 * barycentrics.y);
-    if (dot(normal, rayDirection) > 0.0)
-    {
-        normal = -normal;
-    }
+    const float3 geometricNormal = normalize(n0 * w0 + n1 * barycentrics.x + n2 * barycentrics.y);
 
     const float2 uv0 = LoadFloat2(vertexBuffer, i0 * stride + 24u);
     const float2 uv1 = LoadFloat2(vertexBuffer, i1 * stride + 24u);
     const float2 uv2 = LoadFloat2(vertexBuffer, i2 * stride + 24u);
     const float2 uv = uv0 * w0 + uv1 * barycentrics.x + uv2 * barycentrics.y;
 
-    const float3 baseColor =
+    const float4 baseColorSample =
         gTextures[NonUniformResourceIndex(geometry.textureIndices.x)].SampleLevel(
             gSamplers[NonUniformResourceIndex(geometry.samplerIndices.x)],
             uv,
-            0.0).rgb *
-        geometry.baseColorFactor.rgb;
+            0.0);
+    const float transmissionSample =
+        gTextures[NonUniformResourceIndex(geometry.volumeTextureIndices.x)].SampleLevel(
+            gSamplers[NonUniformResourceIndex(geometry.volumeSamplerIndices.x)],
+            uv,
+            0.0).r;
+    const float thicknessSample =
+        gTextures[NonUniformResourceIndex(geometry.volumeTextureIndices.y)].SampleLevel(
+            gSamplers[NonUniformResourceIndex(geometry.volumeSamplerIndices.y)],
+            uv,
+            0.0).g;
+    const float3 sheenColorSample =
+        gTextures[NonUniformResourceIndex(geometry.sheenTextureIndices.x)].SampleLevel(
+            gSamplers[NonUniformResourceIndex(geometry.sheenSamplerIndices.x)],
+            uv,
+            0.0).rgb;
+    const float sheenRoughnessSample =
+        gTextures[NonUniformResourceIndex(geometry.sheenTextureIndices.y)].SampleLevel(
+            gSamplers[NonUniformResourceIndex(geometry.sheenSamplerIndices.y)],
+            uv,
+            0.0).a;
 
-    const float3 hitPosition = rayOrigin + rayDirection * hitDistance;
+    SurfaceSample surface;
+    surface.position = rayOrigin + rayDirection * hitDistance;
+    surface.geometricNormal = geometricNormal;
+    surface.viewDirection = -rayDirection;
+    surface.normal = dot(geometricNormal, rayDirection) > 0.0 ? -geometricNormal : geometricNormal;
+    surface.baseColor = baseColorSample.rgb * geometry.baseColorFactor.rgb;
+    surface.alpha = baseColorSample.a * geometry.baseColorFactor.a;
+    surface.roughness = clamp(geometry.params.x, 0.0, 1.0);
+    surface.metalness = clamp(geometry.params.y, 0.0, 1.0);
+    surface.alphaBlend = geometry.params.z > 0.5;
+    surface.transmission = saturate(geometry.volume.x * transmissionSample);
+    surface.ior = max(geometry.volume.y, 1.0);
+    surface.thickness = max(geometry.volume.z * thicknessSample, 0.0);
+    surface.dispersion = max(geometry.volume.w, 0.0);
+    surface.attenuationColor = geometry.attenuation.rgb;
+    surface.attenuationDistance = geometry.attenuation.a;
+    surface.sheenColor = geometry.sheen.rgb * sheenColorSample;
+    surface.sheenRoughness = saturate(geometry.sheen.a * sheenRoughnessSample);
+    return surface;
+}
 
-    float3 incident = gGi.skyColor.rgb * gGi.skyColor.w;
-    if (gGi.params3.z > 0.5 && gGi.sunDirectionIntensity.w > 0.0)
+bool TraceSceneRay(
+    float3 origin,
+    float3 direction,
+    float maxDistance,
+    out uint geometryIndex,
+    out uint primitiveIndex,
+    out float2 barycentrics,
+    out float hitDistance)
+{
+    RayQuery<RAY_FLAG_NONE> query;
+    RayDesc ray;
+    ray.Origin = origin;
+    ray.Direction = direction;
+    ray.TMin = 0.0;
+    ray.TMax = maxDistance;
+    query.TraceRayInline(gTlas, RAY_FLAG_NONE, 0xFF, ray);
+    query.Proceed();
+    if (query.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
     {
-        const float3 sunDirection = gGi.sunDirectionIntensity.xyz;
-        const float nDotL = max(dot(normal, sunDirection), 0.0);
-        if (nDotL > 0.0)
+        return false;
+    }
+
+    geometryIndex = query.CommittedInstanceID();
+    primitiveIndex = query.CommittedPrimitiveIndex();
+    barycentrics = query.CommittedTriangleBarycentrics();
+    hitDistance = query.CommittedRayT();
+    return true;
+}
+
+// Outgoing radiance of an opaque hit: albedo times (sun visibility plus sky) plus the multi-bounce
+// feedback from the previous frame.
+float3 ShadeOpaqueSurface(
+    const SurfaceSample surface,
+    Texture2D feedbackTexture,
+    uint2 pixel,
+    uint frame)
+{
+    const float3 hitPosition = surface.position;
+    const float3 normal = surface.normal;
+    const float3 sunDirection = gGi.sunDirectionIntensity.xyz;
+    const float sunNdotL = max(dot(normal, sunDirection), 0.0);
+    const bool sunActive =
+        gGi.params3.z > 0.5 && gGi.sunDirectionIntensity.w > 0.0 && sunNdotL > 0.0;
+
+    float visibility = 0.0;
+    if (sunActive)
+    {
+        // Prefer the ray traced sun mask: it is already smoothed by the lighting resolve and
+        // removes the binary visibility noise from the indirect signal.
+        if (gGi.params4.w <= 0.5 || !SampleRtSunVisibility(hitPosition, normal, visibility))
         {
-            float visibility = 0.0;
-            // Prefer the ray traced sun mask: it is already smoothed by the lighting resolve and
-            // removes the binary visibility noise from the indirect signal.
-            if (gGi.params4.w <= 0.5 || !SampleRtSunVisibility(hitPosition, normal, visibility))
+            const uint sampleCount = uint(clamp(gGi.params4.x, 1.0, 16.0));
+            const float angularRadius = max(gGi.params4.y, 0.0);
+            const float3 coneTangent = normalize(
+                cross(abs(sunDirection.y) < 0.999 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0),
+                      sunDirection));
+            const float3 coneBitangent = cross(sunDirection, coneTangent);
+            const float3 shadowOrigin = hitPosition + normal * 0.02;
+
+            for (uint sampleIndex = 0; sampleIndex < sampleCount; ++sampleIndex)
             {
-                const uint sampleCount = uint(clamp(gGi.params4.x, 1.0, 16.0));
-                const float angularRadius = max(gGi.params4.y, 0.0);
-                const float3 coneTangent = normalize(
-                    cross(abs(sunDirection.y) < 0.999 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0),
-                          sunDirection));
-                const float3 coneBitangent = cross(sunDirection, coneTangent);
-                const float3 shadowOrigin = hitPosition + normal * max(0.02, hitDistance * 0.005);
-
-                for (uint sampleIndex = 0; sampleIndex < sampleCount; ++sampleIndex)
+                float3 direction = sunDirection;
+                if (angularRadius > 0.0)
                 {
-                    float3 direction = sunDirection;
-                    if (angularRadius > 0.0)
-                    {
-                        const float radius =
-                            angularRadius * sqrt(Hash01(pixel, frame, 101u + sampleIndex));
-                        const float phi = 2.0 * kPi * Hash01(pixel, frame, 137u + sampleIndex);
-                        direction = normalize(
-                            sunDirection +
-                            (coneTangent * cos(phi) + coneBitangent * sin(phi)) * radius);
-                    }
-
-                    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> shadowQuery;
-                    RayDesc shadowRay;
-                    shadowRay.Origin = shadowOrigin;
-                    shadowRay.Direction = direction;
-                    shadowRay.TMin = 0.0;
-                    // The sun is effectively at infinity: the occlusion test must not be limited
-                    // by the indirect ray budget.
-                    shadowRay.TMax = 10000.0;
-                    shadowQuery.TraceRayInline(
-                        gTlas,
-                        RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH,
-                        0xFF,
-                        shadowRay);
-                    shadowQuery.Proceed();
-                    if (shadowQuery.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
-                    {
-                        visibility += 1.0;
-                    }
+                    const float radius =
+                        angularRadius * sqrt(Hash01(pixel, frame, 101u + sampleIndex));
+                    const float phi = 2.0 * kPi * Hash01(pixel, frame, 137u + sampleIndex);
+                    direction = normalize(
+                        sunDirection +
+                        (coneTangent * cos(phi) + coneBitangent * sin(phi)) * radius);
                 }
 
-                visibility /= float(sampleCount);
+                RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> shadowQuery;
+                RayDesc shadowRay;
+                shadowRay.Origin = shadowOrigin;
+                shadowRay.Direction = direction;
+                shadowRay.TMin = 0.0;
+                // The sun is effectively at infinity: the occlusion test must not be limited
+                // by the indirect ray budget.
+                shadowRay.TMax = 10000.0;
+                shadowQuery.TraceRayInline(
+                    gTlas,
+                    RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH,
+                    0xFF,
+                    shadowRay);
+                shadowQuery.Proceed();
+                if (shadowQuery.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
+                {
+                    visibility += 1.0;
+                }
             }
 
-            incident += gGi.sunColor.rgb * gGi.sunDirectionIntensity.w * nDotL * visibility;
+            visibility /= float(sampleCount);
         }
     }
 
-    float3 radiance = baseColor * incident;
+    float3 incident = gGi.skyColor.rgb * gGi.skyColor.w;
+    if (sunActive)
+    {
+        incident += gGi.sunColor.rgb * gGi.sunDirectionIntensity.w * sunNdotL * visibility;
+    }
+
+    float3 radiance = surface.baseColor * incident;
+
+    // Sheen sees the direct sun; the sky term is ambient and contributes no sheen.
+    if (any(surface.sheenColor > 1e-5) && sunActive)
+    {
+        const float3 sunRadiance =
+            gGi.sunColor.rgb * gGi.sunDirectionIntensity.w * visibility;
+        radiance += EvaluateSheenBRDF(
+            surface.sheenColor,
+            surface.sheenRoughness,
+            normal,
+            surface.viewDirection,
+            sunDirection,
+            sunRadiance,
+            sunNdotL);
+    }
 
     const float4 previousClip = mul(gGi.previousViewProjection, float4(hitPosition, 1.0));
     if (previousClip.w > 0.0)
@@ -256,4 +366,166 @@ float3 ShadeHit(
         }
     }
     return clamp(radiance, 0.0, kMaxGiRadiance);
+}
+
+// Traces the scene starting from the provided first hit, following alpha coverage and dielectric
+// transmission (reflection/refraction, volume absorption). `iorScale` shifts the index of
+// refraction for chromatic dispersion.
+float3 TraceHitPath(
+    Texture2D feedbackTexture,
+    uint geometryIndex,
+    uint primitiveIndex,
+    float2 barycentrics,
+    float3 rayOrigin,
+    float3 rayDirection,
+    float hitDistance,
+    uint2 pixel,
+    uint frame,
+    float iorScale)
+{
+    float3 throughput = 1.0;
+    float3 radiance = 0.0;
+
+    uint currentGeometry = geometryIndex;
+    uint currentPrimitive = primitiveIndex;
+    float2 currentBarycentrics = barycentrics;
+    float currentHitDistance = hitDistance;
+    float3 origin = rayOrigin;
+    float3 direction = rayDirection;
+    const uint maxBounces = uint(clamp(gGi.params7.x, 1.0, 8.0));
+    bool hasHit = true;
+
+    for (uint bounce = 0; bounce <= maxBounces; ++bounce)
+    {
+        if (!hasHit)
+        {
+            radiance += throughput * (gGi.skyColor.rgb * gGi.skyColor.w);
+            break;
+        }
+
+        const SurfaceSample surface = LoadSurface(
+            currentGeometry,
+            currentPrimitive,
+            currentBarycentrics,
+            origin,
+            direction,
+            currentHitDistance);
+
+        if (surface.alphaBlend && surface.alpha < 0.999 &&
+            Hash01(pixel, frame, 211u + bounce) > surface.alpha)
+        {
+            origin = surface.position + direction * 0.001;
+            hasHit = TraceSceneRay(
+                origin,
+                direction,
+                gGi.params.x,
+                currentGeometry,
+                currentPrimitive,
+                currentBarycentrics,
+                currentHitDistance);
+            continue;
+        }
+
+        if (surface.transmission > 0.001)
+        {
+            const bool frontFace = dot(surface.geometricNormal, direction) < 0.0;
+            const float3 normal = frontFace ? surface.geometricNormal : -surface.geometricNormal;
+            const float ior = max(surface.ior * iorScale, 1.0);
+            const float eta = frontFace ? (1.0 / ior) : ior;
+            const float cosI = saturate(-dot(direction, normal));
+            const float f0 = pow((ior - 1.0) / (ior + 1.0), 2.0);
+            const float fresnel = f0 + (1.0 - f0) * pow(1.0 - cosI, 5.0);
+            const float k = 1.0 - eta * eta * (1.0 - cosI * cosI);
+
+            const float pick = Hash01(pixel, frame, 227u + bounce);
+            if (k < 0.0 || pick < fresnel)
+            {
+                direction = reflect(direction, normal);
+                origin = surface.position + normal * 0.001;
+            }
+            else
+            {
+                const float3 refracted = eta * direction + (eta * cosI - sqrt(max(k, 0.0))) * normal;
+                const float refractedLengthSquared = dot(refracted, refracted);
+                // Degenerate refraction would produce a NaN direction and fault the ray query;
+                // fall back to a reflection instead.
+                direction = refractedLengthSquared > 1e-8
+                                ? refracted * rsqrt(refractedLengthSquared)
+                                : reflect(direction, normal);
+                origin = surface.position - normal * 0.001;
+                if (surface.attenuationDistance > 0.0 && surface.thickness > 0.0)
+                {
+                    const float3 sigma =
+                        -log(max(surface.attenuationColor, float3(1e-3, 1e-3, 1e-3))) /
+                        surface.attenuationDistance;
+                    throughput *= exp(-sigma * surface.thickness * max(gGi.params7.z, 0.0));
+                }
+            }
+
+            hasHit = TraceSceneRay(
+                origin,
+                direction,
+                gGi.params.x,
+                currentGeometry,
+                currentPrimitive,
+                currentBarycentrics,
+                currentHitDistance);
+            continue;
+        }
+
+        radiance += throughput * ShadeOpaqueSurface(surface, feedbackTexture, pixel, frame);
+        break;
+    }
+
+    return clamp(radiance, 0.0, kMaxGiRadiance);
+}
+
+float3 ShadeHit(
+    Texture2D feedbackTexture,
+    uint geometryIndex,
+    uint primitiveIndex,
+    float2 barycentrics,
+    float3 rayOrigin,
+    float3 rayDirection,
+    float hitDistance,
+    uint2 pixel,
+    uint frame)
+{
+    const SurfaceSample first =
+        LoadSurface(geometryIndex, primitiveIndex, barycentrics, rayOrigin, rayDirection, hitDistance);
+
+    // Chromatic dispersion: trace one path per color channel with a shifted index of refraction.
+    if (first.transmission > 0.001 && first.dispersion > 0.0 && gGi.params7.y > 0.5)
+    {
+        float3 dispersed = 0.0;
+        for (int channel = 0; channel < 3; ++channel)
+        {
+            const float offset = (float(channel) - 1.0) * first.dispersion * 0.25;
+            const float3 path = TraceHitPath(
+                feedbackTexture,
+                geometryIndex,
+                primitiveIndex,
+                barycentrics,
+                rayOrigin,
+                rayDirection,
+                hitDistance,
+                pixel,
+                frame + uint(channel) * 5821u,
+                1.0 + offset);
+            dispersed[channel] = path[channel];
+        }
+        return dispersed;
+    }
+
+    return TraceHitPath(
+        feedbackTexture,
+        geometryIndex,
+        primitiveIndex,
+        barycentrics,
+        rayOrigin,
+        rayDirection,
+        hitDistance,
+        pixel,
+        frame,
+        1.0);
 }

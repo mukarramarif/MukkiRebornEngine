@@ -53,6 +53,12 @@ public:
     virtual void End() = 0;
 
     virtual void BeginSwapchainRendering(const ClearColor& clearColor, bool clear = true) = 0;
+    // Same as above with a depth attachment for depth testing (write mask is pipeline state). The
+    // depth texture is transitioned to a depth attachment and back to shader read on scope end.
+    virtual void BeginSwapchainRendering(
+        const ClearColor& clearColor,
+        const DepthAttachment& depthAttachment,
+        bool clear = true) = 0;
     virtual void EndSwapchainRendering() = 0;
     virtual void BeginRendering(const RenderingDesc& desc) = 0;
     virtual void EndRendering() = 0;

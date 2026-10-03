@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <cstddef>
 #include <future>
 #include <iterator>
@@ -76,6 +77,26 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
 
     m_device = &device;
     m_jobSystem = desc.jobSystem;
+
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4996)
+#endif
+    if (std::getenv("MRE_GI_OFF") != nullptr)
+    {
+        m_giSettings.enabled = false;
+    }
+    if (std::getenv("MRE_REFL_OFF") != nullptr)
+    {
+        m_reflectionSettings.enabled = false;
+    }
+    if (std::getenv("MRE_PROBES_OFF") != nullptr)
+    {
+        m_giSettings.useProbes = false;
+    }
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
     if (m_jobSystem != nullptr)
     {
         m_asyncLoader.SetJobSystem(*m_jobSystem);
@@ -214,6 +235,9 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
 
     m_bindlessSet = device.CreateDescriptorSet(*m_bindlessSetLayout);
     m_bindlessSet->BindTexture(0, *m_whiteTexture, m_whiteTexture->GetBindlessIndex());
+    // Slot 0 doubles as the default for zero-initialized texture indices; unwritten descriptor
+    // array slots are undefined and sampling them can fault the GPU.
+    m_bindlessSet->BindTexture(0, *m_whiteTexture, 0u);
     static_cast<void>(GetSamplerIndex(rhi::AddressMode::ClampToEdge, rhi::AddressMode::ClampToEdge));
 
     const std::uint32_t framesInFlight = device.GetFramesInFlight();
@@ -614,6 +638,14 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
             createTextureFromImage(textureImageIndex(source.specularTexture), rhi::Format::R8G8B8A8Unorm);
         material.specularColorTexture =
             createTextureFromImage(textureImageIndex(source.specularColorTexture), rhi::Format::R8G8B8A8Unorm);
+        material.transmissionTexture =
+            createTextureFromImage(textureImageIndex(source.transmissionTexture), rhi::Format::R8G8B8A8Unorm);
+        material.thicknessTexture =
+            createTextureFromImage(textureImageIndex(source.thicknessTexture), rhi::Format::R8G8B8A8Unorm);
+        material.sheenColorTexture =
+            createTextureFromImage(textureImageIndex(source.sheenColorTexture), rhi::Format::R8G8B8A8Srgb);
+        material.sheenRoughnessTexture =
+            createTextureFromImage(textureImageIndex(source.sheenRoughnessTexture), rhi::Format::R8G8B8A8Unorm);
 
         if (material.baseColorTexture != nullptr)
         {
@@ -639,6 +671,34 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
                 0,
                 *material.specularColorTexture,
                 material.specularColorTexture->GetBindlessIndex());
+        }
+        if (material.transmissionTexture != nullptr)
+        {
+            m_bindlessSet->BindTexture(
+                0,
+                *material.transmissionTexture,
+                material.transmissionTexture->GetBindlessIndex());
+        }
+        if (material.thicknessTexture != nullptr)
+        {
+            m_bindlessSet->BindTexture(
+                0,
+                *material.thicknessTexture,
+                material.thicknessTexture->GetBindlessIndex());
+        }
+        if (material.sheenColorTexture != nullptr)
+        {
+            m_bindlessSet->BindTexture(
+                0,
+                *material.sheenColorTexture,
+                material.sheenColorTexture->GetBindlessIndex());
+        }
+        if (material.sheenRoughnessTexture != nullptr)
+        {
+            m_bindlessSet->BindTexture(
+                0,
+                *material.sheenRoughnessTexture,
+                material.sheenRoughnessTexture->GetBindlessIndex());
         }
 
         resources->materials.push_back(std::move(material));
@@ -715,6 +775,14 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
             item.specularTextureIndices = glm::uvec4{whiteIndex, whiteIndex, 0u, 0u};
             item.specularSamplerIndices =
                 glm::uvec4{defaultSamplerIndex, defaultSamplerIndex, 0u, 0u};
+            item.volume = glm::vec4{0.0f, 1.5f, 0.0f, 0.0f};
+            item.attenuation = glm::vec4{1.0f, 1.0f, 1.0f, 0.0f};
+            item.volumeTextureIndices = glm::uvec4{whiteIndex, whiteIndex, 0u, 0u};
+            item.volumeSamplerIndices = glm::uvec4{defaultSamplerIndex, defaultSamplerIndex, 0u, 0u};
+            item.alpha = glm::vec4{0.0f, 0.5f, 0.0f, 0.0f};
+            item.sheen = glm::vec4{0.0f, 0.0f, 0.0f, 0.0f};
+            item.sheenTextureIndices = glm::uvec4{whiteIndex, whiteIndex, 0u, 0u};
+            item.sheenSamplerIndices = glm::uvec4{defaultSamplerIndex, defaultSamplerIndex, 0u, 0u};
 
             if (primitive.materialIndex >= 0 &&
                 primitive.materialIndex < static_cast<int>(resources->materials.size()))
@@ -731,6 +799,27 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
                     material.specularColorFactor.r,
                     material.specularColorFactor.g,
                     material.specularColorFactor.b};
+                item.volume = glm::vec4{
+                    material.transmissionFactor,
+                    material.ior,
+                    material.thicknessFactor,
+                    material.dispersion};
+                item.attenuation = glm::vec4{
+                    material.attenuationColor.r,
+                    material.attenuationColor.g,
+                    material.attenuationColor.b,
+                    material.attenuationDistance};
+                item.alpha = glm::vec4{
+                    material.alphaBlend ? 1.0f : 0.0f,
+                    material.alphaCutoff,
+                    0.0f,
+                    0.0f};
+                item.alphaBlend = material.alphaBlend;
+                item.sheen = glm::vec4{
+                    material.sheenColorFactor.r,
+                    material.sheenColorFactor.g,
+                    material.sheenColorFactor.b,
+                    material.sheenRoughnessFactor};
 
                 const Material& gpuMaterial = resources->materials[static_cast<std::size_t>(primitive.materialIndex)];
                 if (gpuMaterial.baseColorTexture != nullptr)
@@ -780,6 +869,56 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
                     const GltfTexture& texture =
                         model.textures[static_cast<std::size_t>(material.specularColorTexture)];
                     item.specularSamplerIndices.y =
+                        GetSamplerIndex(ToRhiAddressMode(texture.wrapS), ToRhiAddressMode(texture.wrapT));
+                }
+
+                if (gpuMaterial.transmissionTexture != nullptr)
+                {
+                    item.volumeTextureIndices.x = gpuMaterial.transmissionTexture->GetBindlessIndex();
+                }
+                if (gpuMaterial.thicknessTexture != nullptr)
+                {
+                    item.volumeTextureIndices.y = gpuMaterial.thicknessTexture->GetBindlessIndex();
+                }
+                if (material.transmissionTexture >= 0 &&
+                    material.transmissionTexture < static_cast<int>(model.textures.size()))
+                {
+                    const GltfTexture& texture =
+                        model.textures[static_cast<std::size_t>(material.transmissionTexture)];
+                    item.volumeSamplerIndices.x =
+                        GetSamplerIndex(ToRhiAddressMode(texture.wrapS), ToRhiAddressMode(texture.wrapT));
+                }
+                if (material.thicknessTexture >= 0 &&
+                    material.thicknessTexture < static_cast<int>(model.textures.size()))
+                {
+                    const GltfTexture& texture =
+                        model.textures[static_cast<std::size_t>(material.thicknessTexture)];
+                    item.volumeSamplerIndices.y =
+                        GetSamplerIndex(ToRhiAddressMode(texture.wrapS), ToRhiAddressMode(texture.wrapT));
+                }
+
+                if (gpuMaterial.sheenColorTexture != nullptr)
+                {
+                    item.sheenTextureIndices.x = gpuMaterial.sheenColorTexture->GetBindlessIndex();
+                }
+                if (gpuMaterial.sheenRoughnessTexture != nullptr)
+                {
+                    item.sheenTextureIndices.y = gpuMaterial.sheenRoughnessTexture->GetBindlessIndex();
+                }
+                if (material.sheenColorTexture >= 0 &&
+                    material.sheenColorTexture < static_cast<int>(model.textures.size()))
+                {
+                    const GltfTexture& texture =
+                        model.textures[static_cast<std::size_t>(material.sheenColorTexture)];
+                    item.sheenSamplerIndices.x =
+                        GetSamplerIndex(ToRhiAddressMode(texture.wrapS), ToRhiAddressMode(texture.wrapT));
+                }
+                if (material.sheenRoughnessTexture >= 0 &&
+                    material.sheenRoughnessTexture < static_cast<int>(model.textures.size()))
+                {
+                    const GltfTexture& texture =
+                        model.textures[static_cast<std::size_t>(material.sheenRoughnessTexture)];
+                    item.sheenSamplerIndices.y =
                         GetSamplerIndex(ToRhiAddressMode(texture.wrapS), ToRhiAddressMode(texture.wrapT));
                 }
             }
@@ -978,6 +1117,14 @@ void DeferredRenderer::UpdateObjectData(std::uint32_t frameIndex)
         objectData[index].specular = item.specular;
         objectData[index].specularTextureIndices = item.specularTextureIndices;
         objectData[index].specularSamplerIndices = item.specularSamplerIndices;
+        objectData[index].volume = item.volume;
+        objectData[index].attenuation = item.attenuation;
+        objectData[index].volumeTextureIndices = item.volumeTextureIndices;
+        objectData[index].volumeSamplerIndices = item.volumeSamplerIndices;
+        objectData[index].alpha = item.alpha;
+        objectData[index].sheen = item.sheen;
+        objectData[index].sheenTextureIndices = item.sheenTextureIndices;
+        objectData[index].sheenSamplerIndices = item.sheenSamplerIndices;
         item.pushConstants.drawIndex = static_cast<std::uint32_t>(index);
         m_previousModels[index] = item.pushConstants.model;
         ++index;
@@ -1064,7 +1211,18 @@ void DeferredRenderer::BuildAccelerationStructures(rhi::CommandList& commandList
             0u};
         geometry.textureIndices = glm::uvec4{item.pushConstants.textureIndices, 0u, 0u};
         geometry.samplerIndices = glm::uvec4{item.pushConstants.samplerIndices, 0u, 0u};
-        geometry.params = glm::vec4{item.pushConstants.params.x, item.pushConstants.params.y, 0.0f, 0.0f};
+        geometry.params = glm::vec4{
+            item.pushConstants.params.x,
+            item.pushConstants.params.y,
+            item.alpha.x,
+            item.alpha.y};
+        geometry.volume = item.volume;
+        geometry.attenuation = item.attenuation;
+        geometry.volumeTextureIndices = item.volumeTextureIndices;
+        geometry.volumeSamplerIndices = item.volumeSamplerIndices;
+        geometry.sheen = item.sheen;
+        geometry.sheenTextureIndices = item.sheenTextureIndices;
+        geometry.sheenSamplerIndices = item.sheenSamplerIndices;
         m_geometryData.push_back(geometry);
     };
 
@@ -1372,6 +1530,11 @@ void DeferredRenderer::UpdateGiUniform(std::uint32_t frameIndex, const FrameView
         std::clamp(m_reflectionSettings.maxRoughness, 0.0f, 1.0f),
         static_cast<float>(std::clamp(m_reflectionSettings.samples, 1u, 8u)),
         std::max(m_reflectionSettings.intensity, 0.0f)};
+    m_giUniform.params7 = glm::vec4{
+        static_cast<float>(std::clamp(m_reflectionSettings.refractionBounces, 1u, 8u)),
+        m_reflectionSettings.dispersion ? 1.0f : 0.0f,
+        std::max(m_reflectionSettings.volumeAbsorptionScale, 0.0f),
+        0.0f};
 
     m_gi[frameIndex].uniformBuffer->Write(&m_giUniform, sizeof(GiUniform));
 
@@ -1509,31 +1672,53 @@ void DeferredRenderer::RecordGiPasses(rhi::CommandList& commandList, std::uint32
     commandList.Dispatch(groupsX, groupsY, 1);
     commandList.ShaderMemoryBarrier(rhi::ShaderStageMask::Compute, rhi::ShaderStageMask::Compute);
 
-    commandList.BindPipeline(*m_giTemporalPipeline);
-    commandList.BindDescriptorSet(0, *gi.temporalSet);
-    commandList.Dispatch(groupsX, groupsY, 1);
-    commandList.ShaderMemoryBarrier(rhi::ShaderStageMask::Compute, rhi::ShaderStageMask::Compute);
+    const bool skipTemporal = std::getenv("MRE_NOTEMPORAL") != nullptr;
+    const bool skipAtrous = std::getenv("MRE_NOATROUS") != nullptr;
+    const bool skipUpsample = std::getenv("MRE_NOUPSAMPLE") != nullptr;
 
-    commandList.BindPipeline(*m_giAtrousPipeline);
-    for (std::uint32_t signal = 0; signal < 2; ++signal)
+    if (!skipTemporal)
     {
-        for (std::uint32_t iteration = 0; iteration < iterations; ++iteration)
+        commandList.BindPipeline(*m_giTemporalPipeline);
+        commandList.BindDescriptorSet(0, *gi.temporalSet);
+        commandList.Dispatch(groupsX, groupsY, 1);
+        commandList.ShaderMemoryBarrier(rhi::ShaderStageMask::Compute, rhi::ShaderStageMask::Compute);
+    }
+
+    if (!skipAtrous)
+    {
+        commandList.BindPipeline(*m_giAtrousPipeline);
+        for (std::uint32_t signal = 0; signal < 2; ++signal)
         {
-            commandList.BindDescriptorSet(0, *gi.atrousSets[signal * kMaxAtrousIterations + iteration]);
-            const GiAtrousPushConstants pushConstants{signal, iteration};
-            commandList.SetPushConstants(&pushConstants, sizeof(pushConstants), rhi::ShaderStageMask::Compute);
-            commandList.Dispatch(groupsX, groupsY, 1);
-            commandList.ShaderMemoryBarrier(rhi::ShaderStageMask::Compute, rhi::ShaderStageMask::Compute);
+            for (std::uint32_t iteration = 0; iteration < iterations; ++iteration)
+            {
+                commandList.BindDescriptorSet(
+                    0,
+                    *gi.atrousSets[signal * kMaxAtrousIterations + iteration]);
+                const GiAtrousPushConstants pushConstants{signal, iteration};
+                commandList.SetPushConstants(
+                    &pushConstants,
+                    sizeof(pushConstants),
+                    rhi::ShaderStageMask::Compute);
+                commandList.Dispatch(groupsX, groupsY, 1);
+                commandList.ShaderMemoryBarrier(
+                    rhi::ShaderStageMask::Compute,
+                    rhi::ShaderStageMask::Compute);
+            }
         }
     }
 
-    commandList.BindPipeline(*m_giUpsamplePipeline);
-    commandList.BindDescriptorSet(0, *gi.upsampleSet);
-    commandList.Dispatch(
-        (m_gbuffer.GetWidth() + 7) / 8,
-        (m_gbuffer.GetHeight() + 7) / 8,
-        1);
-    commandList.ShaderMemoryBarrier(rhi::ShaderStageMask::Compute, rhi::ShaderStageMask::Fragment);
+    if (!skipUpsample)
+    {
+        commandList.BindPipeline(*m_giUpsamplePipeline);
+        commandList.BindDescriptorSet(0, *gi.upsampleSet);
+        commandList.Dispatch(
+            (m_gbuffer.GetWidth() + 7) / 8,
+            (m_gbuffer.GetHeight() + 7) / 8,
+            1);
+        commandList.ShaderMemoryBarrier(
+            rhi::ShaderStageMask::Compute,
+            rhi::ShaderStageMask::Fragment);
+    }
 
     gi.historyParity ^= 1;
     gi.historyValid = true;
@@ -1577,18 +1762,61 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
             &m_gbuffer.GetSpecularF0(),
             rhi::ClearColor{0.04f, 0.04f, 0.04f, 1.0f},
             true},
+        rhi::ColorAttachment{
+            &m_gbuffer.GetTransmission(),
+            rhi::ClearColor{0.0f, 1.5f, 0.0f, 0.0f},
+            true},
+        rhi::ColorAttachment{
+            &m_gbuffer.GetAttenuation(),
+            rhi::ClearColor{1.0f, 1.0f, 1.0f, 0.0f},
+            true},
+        rhi::ColorAttachment{
+            &m_gbuffer.GetSheen(),
+            rhi::ClearColor{0.0f, 0.0f, 0.0f, 0.0f},
+            true},
     };
     gbufferDesc.depthAttachment = rhi::DepthAttachment{&m_gbuffer.GetDepth(), 1.0f, true};
 
+    // Alpha blended materials skip the opaque G-buffer and are drawn back-to-front after lighting.
     std::vector<const DrawItem*> gbufferItems{};
+    std::vector<const DrawItem*> transparentItems{};
     gbufferItems.reserve(m_sceneDrawItems.size() + m_modelDrawItems.size());
+    transparentItems.reserve(m_modelDrawItems.size());
+    const auto classifyItem = [&gbufferItems, &transparentItems](const DrawItem& item) {
+        if (item.alphaBlend)
+        {
+            transparentItems.push_back(&item);
+        }
+        else
+        {
+            gbufferItems.push_back(&item);
+        }
+    };
     for (const DrawItem& item : m_sceneDrawItems)
     {
-        gbufferItems.push_back(&item);
+        classifyItem(item);
     }
     for (const DrawItem& item : m_modelDrawItems)
     {
-        gbufferItems.push_back(&item);
+        classifyItem(item);
+    }
+
+    if (!transparentItems.empty())
+    {
+        const glm::vec3 cameraForward =
+            -glm::vec3{view.view[0][2], view.view[1][2], view.view[2][2]};
+        std::sort(
+            transparentItems.begin(),
+            transparentItems.end(),
+            [&view, &cameraForward](const DrawItem* left, const DrawItem* right) {
+                const float leftDepth = glm::dot(
+                    glm::vec3{left->pushConstants.model[3]} - view.position,
+                    cameraForward);
+                const float rightDepth = glm::dot(
+                    glm::vec3{right->pushConstants.model[3]} - view.position,
+                    cameraForward);
+                return leftDepth > rightDepth;
+            });
     }
 
     BuildShadowCullItems();
@@ -1748,10 +1976,33 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
     RecordReflectionPasses(commandList, frameIndex);
 
     commandList.BeginGpuZone("Lighting");
-    commandList.BeginSwapchainRendering(rhi::ClearColor{0.0f, 0.0f, 0.0f, 1.0f}, true);
+    commandList.BeginSwapchainRendering(
+        rhi::ClearColor{0.0f, 0.0f, 0.0f, 1.0f},
+        rhi::DepthAttachment{&m_gbuffer.GetDepth(), 1.0f, false},
+        true);
     commandList.BindPipeline(*m_lightingPipeline);
     commandList.BindDescriptorSet(0, *m_lightingSets[frameIndex]);
     commandList.Draw(3);
+
+    if (!transparentItems.empty())
+    {
+        commandList.BeginGpuZone("Transparent");
+        commandList.BindPipeline(*m_transparentPipeline);
+        commandList.BindDescriptorSet(0, *m_sceneSets[frameIndex]);
+        commandList.BindDescriptorSet(1, *m_bindlessSet);
+        for (const DrawItem* item : transparentItems)
+        {
+            commandList.BindVertexBuffer(*item->vertexBuffer);
+            commandList.BindIndexBuffer(*item->indexBuffer);
+            commandList.SetPushConstants(
+                &item->pushConstants,
+                sizeof(ObjectPushConstants),
+                rhi::ShaderStageMask::VertexFragment);
+            commandList.DrawIndexed(item->indexCount, item->firstIndex);
+        }
+        commandList.EndGpuZone();
+    }
+
     RecordDebugLines(commandList, view);
     commandList.EndSwapchainRendering();
     commandList.EndGpuZone();
@@ -2148,6 +2399,9 @@ bool DeferredRenderer::LoadShaders(rhi::Device& device, const std::filesystem::p
     m_gbufferFragmentShader = device.CreateShader(
         rhi::ShaderStage::Fragment,
         shaderDirectory / "gbuffer.frag.spv");
+    m_transparentFragmentShader = device.CreateShader(
+        rhi::ShaderStage::Fragment,
+        shaderDirectory / "transparent.frag.spv");
     m_lightingVertexShader = device.CreateShader(
         rhi::ShaderStage::Vertex,
         shaderDirectory / "lighting.vert.spv");
@@ -2198,6 +2452,7 @@ bool DeferredRenderer::LoadShaders(rhi::Device& device, const std::filesystem::p
         shaderDirectory / "debug_line.frag.spv");
 
     if (m_gbufferVertexShader == nullptr || m_gbufferFragmentShader == nullptr ||
+        m_transparentFragmentShader == nullptr ||
         m_lightingVertexShader == nullptr || m_lightingFragmentShader == nullptr ||
         m_clusterCullingShader == nullptr || m_shadowVertexShader == nullptr ||
         m_shadowFragmentShader == nullptr || m_giTraceShader == nullptr ||
@@ -2233,9 +2488,30 @@ bool DeferredRenderer::CreatePipelines(rhi::Device& device)
         rhi::Format::R8G8B8A8Unorm,
         rhi::Format::R16G16B16A16Sfloat,
         rhi::Format::R16G16Sfloat,
+        rhi::Format::R8G8B8A8Unorm,
+        rhi::Format::R16G16B16A16Sfloat,
+        rhi::Format::R8G8B8A8Unorm,
         rhi::Format::R8G8B8A8Unorm};
     gbufferPipelineDesc.depthFormat = rhi::Format::D32Sfloat;
     m_gbufferPipeline = device.CreatePipeline(gbufferPipelineDesc);
+
+    // Forward pass for alpha blended materials: shares the G-buffer vertex shader, blends over the
+    // lit image and tests against the opaque depth without writing it.
+    const std::array<const rhi::Shader*, 2> transparentStages{
+        m_gbufferVertexShader.get(),
+        m_transparentFragmentShader.get()};
+    rhi::PipelineDesc transparentPipelineDesc{};
+    transparentPipelineDesc.vertexShader = m_gbufferVertexShader.get();
+    transparentPipelineDesc.fragmentShader = m_transparentFragmentShader.get();
+    rhi::ApplyShaderReflection(transparentPipelineDesc, transparentStages);
+    transparentPipelineDesc.depthTest = true;
+    transparentPipelineDesc.depthWrite = false;
+    transparentPipelineDesc.blend = true;
+    transparentPipelineDesc.cullMode = rhi::CullMode::None;
+    transparentPipelineDesc.descriptorSetLayouts = {m_sceneSetLayout.get(), m_bindlessSetLayout.get()};
+    transparentPipelineDesc.colorFormats = {device.GetSwapchainInfo().format};
+    transparentPipelineDesc.depthFormat = rhi::Format::D32Sfloat;
+    m_transparentPipeline = device.CreatePipeline(transparentPipelineDesc);
 
     rhi::PipelineDesc lightingPipelineDesc{};
     lightingPipelineDesc.vertexShader = m_lightingVertexShader.get();
@@ -2246,6 +2522,9 @@ bool DeferredRenderer::CreatePipelines(rhi::Device& device)
     lightingPipelineDesc.cullMode = rhi::CullMode::None;
     lightingPipelineDesc.descriptorSetLayouts = {m_lightingSetLayout.get()};
     lightingPipelineDesc.colorFormats = {device.GetSwapchainInfo().format};
+    // The swapchain scope attaches the G-buffer depth for the transparent pass; pipelines drawn in
+    // that scope must declare the matching depth format even when depth testing is disabled.
+    lightingPipelineDesc.depthFormat = rhi::Format::D32Sfloat;
     m_lightingPipeline = device.CreatePipeline(lightingPipelineDesc);
 
     rhi::PipelineDesc clusterPipelineDesc{};
@@ -2336,9 +2615,11 @@ bool DeferredRenderer::CreatePipelines(rhi::Device& device)
     debugLinePipelineDesc.blend = true;
     debugLinePipelineDesc.cullMode = rhi::CullMode::None;
     debugLinePipelineDesc.colorFormats = {device.GetSwapchainInfo().format};
+    debugLinePipelineDesc.depthFormat = rhi::Format::D32Sfloat;
     m_debugLinePipeline = device.CreatePipeline(debugLinePipelineDesc);
 
-    return m_gbufferPipeline != nullptr && m_lightingPipeline != nullptr &&
+    return m_gbufferPipeline != nullptr && m_transparentPipeline != nullptr &&
+           m_lightingPipeline != nullptr &&
            m_clusterCullingPipeline != nullptr && m_shadowPipeline != nullptr &&
            m_giTracePipeline != nullptr && m_giTemporalPipeline != nullptr &&
            m_giAtrousPipeline != nullptr && m_giUpsamplePipeline != nullptr &&
@@ -2366,7 +2647,21 @@ bool DeferredRenderer::CreateScene()
     ground.pushConstants.baseColorFactor = glm::vec4{0.35f, 0.35f, 0.38f, 1.0f};
     ground.pushConstants.params = glm::vec4{0.9f, 0.0f, 0.0f, 0.0f};
     const std::uint32_t whiteIndex = m_whiteTexture->GetBindlessIndex();
+    const std::uint32_t defaultSamplerIndex =
+        GetSamplerIndex(rhi::AddressMode::Repeat, rhi::AddressMode::Repeat);
     ground.pushConstants.textureIndices = glm::uvec2{whiteIndex, whiteIndex};
+    // Material defaults: every texture index must reference a bound bindless slot.
+    ground.specular = glm::vec4{1.0f, 1.0f, 1.0f, 1.0f};
+    ground.specularTextureIndices = glm::uvec4{whiteIndex, whiteIndex, 0u, 0u};
+    ground.specularSamplerIndices = glm::uvec4{defaultSamplerIndex, defaultSamplerIndex, 0u, 0u};
+    ground.volume = glm::vec4{0.0f, 1.5f, 0.0f, 0.0f};
+    ground.attenuation = glm::vec4{1.0f, 1.0f, 1.0f, 0.0f};
+    ground.volumeTextureIndices = glm::uvec4{whiteIndex, whiteIndex, 0u, 0u};
+    ground.volumeSamplerIndices = glm::uvec4{defaultSamplerIndex, defaultSamplerIndex, 0u, 0u};
+    ground.alpha = glm::vec4{0.0f, 0.5f, 0.0f, 0.0f};
+    ground.sheen = glm::vec4{0.0f};
+    ground.sheenTextureIndices = glm::uvec4{whiteIndex, whiteIndex, 0u, 0u};
+    ground.sheenSamplerIndices = glm::uvec4{defaultSamplerIndex, defaultSamplerIndex, 0u, 0u};
     ground.vertexBufferIndex = m_nextBindlessBuffer++;
     ground.indexBufferIndex = m_nextBindlessBuffer++;
     m_bindlessSet->BindStorageBuffer(2, *m_planeVertexBuffer, ground.vertexBufferIndex);
@@ -2432,6 +2727,8 @@ void DeferredRenderer::CreateLightingSets(rhi::Device& device)
                 : *m_whiteTexture,
             0u);
         lightingSet->BindTexture(16, m_gbuffer.GetSpecularF0(), 0u);
+        lightingSet->BindTexture(17, m_gbuffer.GetTransmission(), 0u);
+        lightingSet->BindTexture(18, m_gbuffer.GetSheen(), 0u);
         m_lightingSets.push_back(std::move(lightingSet));
     }
 }
@@ -2697,6 +2994,33 @@ void DeferredRenderer::UpdateUniforms(std::uint32_t frameIndex, const FrameView&
         IsProbeGiActive() ? static_cast<float>(m_giProbeData.size()) : 0.0f;
     m_sceneUniform.reflectionParams.x =
         IsReflectionActive() ? m_reflectionSettings.intensity : 0.0f;
+
+    // Primary directional light, used by the transparent forward pass.
+    const Light* sunLight = FindShadowLight();
+    if (sunLight == nullptr)
+    {
+        for (const Light& light : m_lights)
+        {
+            if (light.type == LightType::Directional)
+            {
+                sunLight = &light;
+                break;
+            }
+        }
+    }
+    if (sunLight != nullptr)
+    {
+        const float length = glm::length(sunLight->direction);
+        const glm::vec3 toSun =
+            length > 1e-4f ? -sunLight->direction / length : glm::vec3{0.0f, -1.0f, 0.0f};
+        m_sceneUniform.sunDirection = glm::vec4{toSun, 0.0f};
+        m_sceneUniform.sunColor = glm::vec4{sunLight->color * sunLight->intensity, 1.0f};
+    }
+    else
+    {
+        m_sceneUniform.sunDirection = glm::vec4{0.0f, -1.0f, 0.0f, 0.0f};
+        m_sceneUniform.sunColor = glm::vec4{0.0f, 0.0f, 0.0f, 1.0f};
+    }
     m_uniformBuffers[frameIndex]->Write(&m_sceneUniform, sizeof(SceneUniform));
 
     m_clusterUniform.inverseView = glm::inverse(view.view);
@@ -3033,6 +3357,8 @@ void DeferredRenderer::BindReflectionDescriptors(std::uint32_t frameIndex)
         m_rtSunShadowMask != nullptr ? *m_rtSunShadowMask : *m_whiteTexture,
         0u);
     gi.reflectionTraceSet->BindTexture(10, m_gbuffer.GetSpecularF0(), 0u);
+    gi.reflectionTraceSet->BindTexture(11, m_gbuffer.GetTransmission(), 0u);
+    gi.reflectionTraceSet->BindTexture(12, m_gbuffer.GetAttenuation(), 0u);
 
     // Temporal: reads history[parity], writes history[parity ^ 1].
     gi.reflectionTemporalSet->BindBuffer(0, *gi.uniformBuffer);

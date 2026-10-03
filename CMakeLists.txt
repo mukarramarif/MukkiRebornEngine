@@ -53,6 +53,17 @@ function(mre_add_slang_shaders target)
     set(output_dir "${CMAKE_CURRENT_BINARY_DIR}/shaders")
     set(spirv_outputs "")
 
+    # Slang include dependencies are not tracked by the compiler invocation, so every shader
+    # depends on all shaders in the directory. Without this, editing a shared include such as
+    # gi_structs.slang leaves other shaders compiled against a stale struct layout, which reads
+    # garbage indices and faults the GPU.
+    if(ARGN)
+        list(GET ARGN 0 mre_first_shader)
+        get_filename_component(mre_shader_directory
+            "${CMAKE_CURRENT_SOURCE_DIR}/${mre_first_shader}" DIRECTORY)
+        file(GLOB shader_sources "${mre_shader_directory}/*.slang")
+    endif()
+
     foreach(shader IN LISTS ARGN)
         get_filename_component(shader_file_name "${shader}" NAME)
         string(REGEX REPLACE "\\.slang$" "" shader_name "${shader_file_name}")
@@ -65,7 +76,7 @@ function(mre_add_slang_shaders target)
                 -matrix-layout-column-major
                 -fvk-use-entrypoint-name
                 -o "${spirv}"
-            DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${shader}"
+            DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${shader}" ${shader_sources}
             COMMENT "Compiling Slang shader ${shader}"
             VERBATIM
         )
@@ -180,6 +191,7 @@ if(MRE_BUILD_SANDBOX)
     mre_add_slang_shaders(mukki_sandbox
         Renderer/Shaders/gbuffer.vert.slang
         Renderer/Shaders/gbuffer.frag.slang
+        Renderer/Shaders/transparent.frag.slang
         Renderer/Shaders/lighting.vert.slang
         Renderer/Shaders/lighting.frag.slang
         Renderer/Shaders/cluster_culling.comp.slang

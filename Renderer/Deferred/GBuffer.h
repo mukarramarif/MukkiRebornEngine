@@ -37,6 +37,12 @@ public:
     [[nodiscard]] rhi::Texture& GetMotion() { return *m_motion; }
     // Dielectric F0 from KHR_materials_specular (0.04 for plain metallic-roughness materials).
     [[nodiscard]] rhi::Texture& GetSpecularF0() { return *m_specularF0; }
+    // Glass: x/y/z/w = transmission, ior, thickness, dispersion.
+    [[nodiscard]] rhi::Texture& GetTransmission() { return *m_transmission; }
+    // Glass: rgb = attenuation color, a = attenuation distance (0 = no absorption).
+    [[nodiscard]] rhi::Texture& GetAttenuation() { return *m_attenuation; }
+    // KHR_materials_sheen: rgb = sheen color, a = sheen roughness.
+    [[nodiscard]] rhi::Texture& GetSheen() { return *m_sheen; }
 
 private:
     bool CreateTextures(rhi::Device& device);
@@ -47,6 +53,9 @@ private:
     std::unique_ptr<rhi::Texture> m_depth{};
     std::unique_ptr<rhi::Texture> m_motion{};
     std::unique_ptr<rhi::Texture> m_specularF0{};
+    std::unique_ptr<rhi::Texture> m_transmission{};
+    std::unique_ptr<rhi::Texture> m_attenuation{};
+    std::unique_ptr<rhi::Texture> m_sheen{};
     std::uint32_t m_width = 0;
     std::uint32_t m_height = 0;
 };

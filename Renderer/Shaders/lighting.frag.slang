@@ -9,6 +9,8 @@ struct SceneUniform
     uint4 clusterGrid;    // x, y, z grid dimensions, w: light count
     float4 screenSize;
     float4 reflectionParams; // x: reflection intensity
+    float4 sunDirection;     // xyz: direction toward the sun
+    float4 sunColor;         // rgb: color * intensity
 };
 
 struct GpuLight
@@ -53,10 +55,14 @@ struct GpuGiProbe
 [[vk::binding(14, 0)]] StructuredBuffer<GpuGiProbe> gGiProbes;
 [[vk::binding(15, 0)]] Texture2D gReflections;
 [[vk::binding(16, 0)]] Texture2D gSpecularF0;
+[[vk::binding(17, 0)]] Texture2D gTransmissionMaterial; // x: transmission, y: ior, z: thickness, w: attenuationDistance
+[[vk::binding(18, 0)]] Texture2D gSheenMaterial;        // rgb: sheen color, a: sheen roughness
 
 static const uint kMaxLightsPerCluster = 64;
 static const uint kLightTypeDirectional = 0;
 static const uint kLightTypePoint = 1;
+#include "sheen_brdf.slang"
+
 static const float kPi = 3.14159265359;
 static const float kShadowMapSize = 1024.0;
 static const float kShadowCompareBiasScale = 0.0002;
@@ -359,8 +365,15 @@ float4 fragmentMain(VertexOutput input) : SV_Target
     const float3 viewDirection = normalize(gScene.cameraPosition.xyz - worldPosition.xyz);
     const float3 dielectricF0 = gSpecularF0.Load(int3(int2(input.position.xy), 0)).rgb;
     const float3 f0 = lerp(dielectricF0, albedo, metalness);
+    // Transmissive surfaces keep only the (1 - transmission) part of the surface response; the
+    // traced specular signal carries the reflection + refraction lobes.
+    const float transmission = saturate(gTransmissionMaterial.Load(int3(int2(input.position.xy), 0)).x);
+    const float surfaceWeight = 1.0 - transmission;
+    const float4 sheenMaterial = gSheenMaterial.Load(int3(int2(input.position.xy), 0));
+    const float3 sheenColor = sheenMaterial.rgb;
+    const float sheenRoughness = sheenMaterial.a;
 
-    float3 color = gScene.ambientColor.rgb * albedo;
+    float3 color = gScene.ambientColor.rgb * albedo * surfaceWeight;
 
     const float shadowFactor = sampleShadowFactor(worldPosition.xyz, normal, int2(input.position.xy));
 
@@ -436,21 +449,31 @@ float4 fragmentMain(VertexOutput input) : SV_Target
         if (nDotL > 0.0)
         {
             color += evaluateBrdf(
-                albedo,
-                f0,
-                metalness,
-                roughness,
-                normal,
-                viewDirection,
-                lightDirection,
-                radiance,
-                nDotL);
+                         albedo,
+                         f0,
+                         metalness,
+                         roughness,
+                         normal,
+                         viewDirection,
+                         lightDirection,
+                         radiance,
+                         nDotL) *
+                     surfaceWeight;
+            color += EvaluateSheenBRDF(
+                         sheenColor,
+                         sheenRoughness,
+                         normal,
+                         viewDirection,
+                         lightDirection,
+                         radiance,
+                         nDotL) *
+                     surfaceWeight;
         }
     }
 
     if (gScene.screenSize.w > 0.5)
     {
-        color += gIndirect.Load(int3(int2(input.position.xy), 0)).rgb;
+        color += gIndirect.Load(int3(int2(input.position.xy), 0)).rgb * surfaceWeight;
     }
     else if (gScene.ambientColor.w > 0.5)
     {
@@ -470,7 +493,7 @@ float4 fragmentMain(VertexOutput input) : SV_Target
         }
         if (weightSum > 0.0)
         {
-            color += albedo * indirect / weightSum;
+            color += albedo * indirect / weightSum * surfaceWeight;
         }
     }
 

@@ -787,6 +787,21 @@ private:
             changed = true;
         }
 
+        ImGui::SeparatorText("Glass");
+        changed |= ImGui::Checkbox("Dispersion", &settings.dispersion);
+        int bounces = static_cast<int>(settings.refractionBounces);
+        if (ImGui::SliderInt("Refraction bounces", &bounces, 1, 8))
+        {
+            settings.refractionBounces = static_cast<std::uint32_t>(bounces);
+            changed = true;
+        }
+        changed |= ImGui::SliderFloat(
+            "Volume absorption",
+            &settings.volumeAbsorptionScale,
+            0.0f,
+            3.0f,
+            "%.2f");
+
         if (changed)
         {
             m_renderer->SetReflectionSettings(settings);

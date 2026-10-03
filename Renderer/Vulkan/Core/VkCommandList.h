@@ -38,6 +38,10 @@ public:
     void Begin() override;
     void End() override;
     void BeginSwapchainRendering(const rhi::ClearColor& clearColor, bool clear) override;
+    void BeginSwapchainRendering(
+        const rhi::ClearColor& clearColor,
+        const rhi::DepthAttachment& depthAttachment,
+        bool clear) override;
     void EndSwapchainRendering() override;
     void BeginRendering(const rhi::RenderingDesc& desc) override;
     void EndRendering() override;

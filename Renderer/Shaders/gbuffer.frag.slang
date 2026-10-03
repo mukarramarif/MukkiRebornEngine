@@ -9,6 +9,8 @@ struct SceneUniform
     uint4 clusterGrid;
     float4 screenSize;
     float4 reflectionParams; // x: reflection intensity
+    float4 sunDirection;     // xyz: direction toward the sun
+    float4 sunColor;         // rgb: color * intensity
 };
 
 struct ObjectPushConstants
@@ -27,6 +29,14 @@ struct GpuObjectData
     float4 specular;               // x: specularFactor, yzw: specularColorFactor
     uint4 specularTextureIndices;  // x: specularTexture, y: specularColorTexture
     uint4 specularSamplerIndices;  // x: specular sampler, y: specular color sampler
+    float4 volume;                 // x: transmission, y: ior, z: thickness, w: dispersion
+    float4 attenuation;            // rgb: attenuation color, a: attenuation distance (0 = none)
+    uint4 volumeTextureIndices;    // x: transmission texture, y: thickness texture
+    uint4 volumeSamplerIndices;    // x: transmission sampler, y: thickness sampler
+    float4 alpha;                  // x: blend, y: cutoff, z/w: unused
+    float4 sheen;                  // rgb: sheenColorFactor, a: sheenRoughnessFactor
+    uint4 sheenTextureIndices;     // x: sheenColorTexture, y: sheenRoughnessTexture
+    uint4 sheenSamplerIndices;
 };
 
 [[vk::push_constant]] ConstantBuffer<ObjectPushConstants> gObject;
@@ -51,6 +61,9 @@ struct GBufferOutput
     [[vk::location(2)]] float4 position : SV_Target2;
     [[vk::location(3)]] float2 motion : SV_Target3;
     [[vk::location(4)]] float4 specularF0 : SV_Target4;
+    [[vk::location(5)]] float4 transmission : SV_Target5;
+    [[vk::location(6)]] float4 attenuation : SV_Target6;
+    [[vk::location(7)]] float4 sheen : SV_Target7;
 };
 
 [shader("fragment")]
@@ -100,6 +113,38 @@ GBufferOutput fragmentMain(VertexOutput input)
             input.uv).rgb;
     const float3 specularColor = objectData.specular.yzw * specularColorSample;
     const float specularFactor = objectData.specular.x * specularSample;
-    output.specularF0 = float4(min(0.04 * specularColor, 1.0) * specularFactor, 1.0);
+    const float ior = max(objectData.volume.y, 1.0);
+    const float dielectricF0 = pow((ior - 1.0) / (ior + 1.0), 2.0);
+    output.specularF0 = float4(min(dielectricF0 * specularColor, 1.0) * specularFactor, 1.0);
+
+    // KHR_materials_transmission + KHR_materials_volume: pack the dielectric volume data for the
+    // ray traced specular pass.
+    const float transmissionSample =
+        gTextures[NonUniformResourceIndex(objectData.volumeTextureIndices.x)].Sample(
+            gSamplers[NonUniformResourceIndex(objectData.volumeSamplerIndices.x)],
+            input.uv).r;
+    const float thicknessSample =
+        gTextures[NonUniformResourceIndex(objectData.volumeTextureIndices.y)].Sample(
+            gSamplers[NonUniformResourceIndex(objectData.volumeSamplerIndices.y)],
+            input.uv).g;
+    const float transmission = saturate(objectData.volume.x * transmissionSample);
+    const float thickness = max(objectData.volume.z * thicknessSample, 0.0);
+    // transmission target: (transmission, ior, thickness, attenuationDistance)
+    // attenuation target: (attenuationColor.rgb, dispersion)
+    output.transmission = float4(transmission, ior, thickness, objectData.attenuation.a);
+    output.attenuation = float4(objectData.attenuation.rgb, max(objectData.volume.w, 0.0));
+
+    // KHR_materials_sheen: rgb = sheen color, a = sheen roughness.
+    const float3 sheenColorSample =
+        gTextures[NonUniformResourceIndex(objectData.sheenTextureIndices.x)].Sample(
+            gSamplers[NonUniformResourceIndex(objectData.sheenSamplerIndices.x)],
+            input.uv).rgb;
+    const float sheenRoughnessSample =
+        gTextures[NonUniformResourceIndex(objectData.sheenTextureIndices.y)].Sample(
+            gSamplers[NonUniformResourceIndex(objectData.sheenSamplerIndices.y)],
+            input.uv).a;
+    output.sheen = float4(
+        objectData.sheen.rgb * sheenColorSample,
+        saturate(objectData.sheen.a * sheenRoughnessSample));
     return output;
 }

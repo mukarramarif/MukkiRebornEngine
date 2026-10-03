@@ -9,6 +9,8 @@ struct SceneUniform
     uint4 clusterGrid;
     float4 screenSize;
     float4 reflectionParams; // x: reflection intensity
+    float4 sunDirection;     // xyz: direction toward the sun
+    float4 sunColor;         // rgb: color * intensity
 };
 
 struct ObjectPushConstants

@@ -1,21 +1,4 @@
-struct GiUniform
-{
-    float4x4 inverseViewProjection;
-    float4x4 previousViewProjection;
-    float4x4 viewProjection;
-    float4 screenSize;
-    float4 halfSize;
-    float4 cameraPosition;
-    float4 skyColor;
-    float4 sunDirectionIntensity;
-    float4 sunColor;
-    float4 params;  // x: maxDistance, y: frameCounter, z: specularMinRoughness, w: feedbackIntensity
-    float4 params2; // x: temporalAlphaMin, y: phiDepth, z: phiNormal, w: phiLuminance
-    float4 params3; // x: phiHitDistance, y: intensity, z: sunShadowRay, w: resetHistory
-    float4 params4; // x: sunShadowSamples, y: sunAngularRadius (radians), z: traceSamples, w: rtSunMask
-    float4 params5; // x: probeRays, y: probeHysteresis, z: probeCount, w: reflectionResetHistory
-    float4 params6; // x: reflectionMaxDistance, y: reflectionMaxRoughness, z: reflectionSamples, w: reflectionIntensity
-};
+#include "gi_structs.slang"
 
 struct AtrousPushConstants
 {
@@ -32,7 +15,6 @@ struct AtrousPushConstants
 [[vk::binding(6, 0)]] RWTexture2D<float4> gColorOut;
 [[vk::push_constant]] ConstantBuffer<AtrousPushConstants> gPush;
 
-static const float kMaxGiRadiance = 20.0;
 
 float Luminance(float3 color)
 {

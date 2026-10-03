@@ -251,6 +251,11 @@ clustered lights:
 - **Materials**: glTF `alphaMode = MASK` and `KHR_materials_specular` are supported, so the Khronos
   `SpecularTest` grid shows the dielectric F0 variation in both the analytic specular and the ray
   traced reflections (`--model <SpecularTest.gltf>`).
+- **Glass**: `alphaMode = BLEND` materials render in a sorted forward pass over the lit image.
+  Physically based glass (`KHR_materials_ior`, `transmission`, `volume`, `dispersion`) keeps its
+  surface in the G-buffer and resolves reflection/refraction through the ray traced specular pass
+  with up to `Refraction bounces` dielectric bounces, Beer-Lambert `Volume absorption` and optional
+  `Dispersion`; glass seen in reflections, GI and probes refracts consistently.
 - **Ray traced reflections**: surfaces below `Reflection max roughness` trace `Reflection samples`
   GGX VNDF rays at the GI resolution, shade the hits with the shared path tracer, accumulate
   temporally (with the same denoiser settings as GI), filter through the GI a-trous and bilaterally

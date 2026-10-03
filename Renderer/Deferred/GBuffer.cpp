@@ -19,6 +19,9 @@ bool GBuffer::Init(rhi::Device& device, std::uint32_t width, std::uint32_t heigh
 
 void GBuffer::Shutdown()
 {
+    m_sheen.reset();
+    m_attenuation.reset();
+    m_transmission.reset();
     m_specularF0.reset();
     m_motion.reset();
     m_depth.reset();
@@ -43,6 +46,9 @@ bool GBuffer::Resize(rhi::Device& device, std::uint32_t width, std::uint32_t hei
 
     MRE_INFO("Resizing the G-buffer to {}x{}", width, height);
 
+    m_sheen.reset();
+    m_attenuation.reset();
+    m_transmission.reset();
     m_specularF0.reset();
     m_motion.reset();
     m_depth.reset();
@@ -87,6 +93,21 @@ bool GBuffer::CreateTextures(rhi::Device& device)
         m_height,
         rhi::Format::R8G8B8A8Unorm,
         rhi::TextureUsage::ColorAttachment};
+    const rhi::TextureDesc transmissionDesc{
+        m_width,
+        m_height,
+        rhi::Format::R16G16B16A16Sfloat,
+        rhi::TextureUsage::ColorAttachment};
+    const rhi::TextureDesc attenuationDesc{
+        m_width,
+        m_height,
+        rhi::Format::R8G8B8A8Unorm,
+        rhi::TextureUsage::ColorAttachment};
+    const rhi::TextureDesc sheenDesc{
+        m_width,
+        m_height,
+        rhi::Format::R8G8B8A8Unorm,
+        rhi::TextureUsage::ColorAttachment};
 
     m_albedo = device.CreateTexture(albedoDesc);
     m_normal = device.CreateTexture(normalDesc);
@@ -94,9 +115,13 @@ bool GBuffer::CreateTextures(rhi::Device& device)
     m_depth = device.CreateTexture(depthDesc);
     m_motion = device.CreateTexture(motionDesc);
     m_specularF0 = device.CreateTexture(specularF0Desc);
+    m_transmission = device.CreateTexture(transmissionDesc);
+    m_attenuation = device.CreateTexture(attenuationDesc);
+    m_sheen = device.CreateTexture(sheenDesc);
 
     if (m_albedo == nullptr || m_normal == nullptr || m_position == nullptr || m_depth == nullptr ||
-        m_motion == nullptr || m_specularF0 == nullptr)
+        m_motion == nullptr || m_specularF0 == nullptr || m_transmission == nullptr ||
+        m_attenuation == nullptr || m_sheen == nullptr)
     {
         MRE_CRITICAL("Failed to create the G-buffer textures");
         Shutdown();

@@ -1,39 +1,4 @@
-struct GiUniform
-{
-    float4x4 inverseViewProjection;
-    float4x4 previousViewProjection;
-    float4x4 viewProjection;
-    float4 screenSize;
-    float4 halfSize;
-    float4 cameraPosition;
-    float4 skyColor;              // rgb: color, w: intensity
-    float4 sunDirectionIntensity; // xyz: direction toward the light, w: intensity
-    float4 sunColor;
-    float4 params;  // x: maxDistance, y: frameCounter, z: specularMinRoughness, w: feedbackIntensity
-    float4 params2; // x: temporalAlphaMin, y: phiDepth, z: phiNormal, w: phiLuminance
-    float4 params3; // x: phiHitDistance, y: intensity, z: sunShadowRay, w: resetHistory
-    float4 params4; // x: sunShadowSamples, y: sunAngularRadius (radians), z: traceSamples, w: rtSunMask
-    float4 params5; // x: probeRays, y: probeHysteresis, z: probeCount, w: reflectionResetHistory
-    float4 params6; // x: reflectionMaxDistance, y: reflectionMaxRoughness, z: reflectionSamples, w: reflectionIntensity
-};
-
-struct GpuGeometryData
-{
-    float4 baseColorFactor;
-    uint4 bufferIndices;  // x: vertex buffer, y: index buffer, z: vertex stride
-    uint4 textureIndices; // x: base color, y: metallic-roughness
-    uint4 samplerIndices; // x: base color sampler, y: metallic-roughness sampler
-    float4 params;        // x: roughness, y: metalness
-};
-
-struct GpuGiProbe
-{
-    float4 position; // xyz: world position
-    float4 sh0;      // L0 rgb
-    float4 shX;
-    float4 shY;
-    float4 shZ;
-};
+#include "gi_structs.slang"
 
 [[vk::binding(0, 0)]] ConstantBuffer<GiUniform> gGi;
 [[vk::binding(1, 0)]] RaytracingAccelerationStructure gTlas;

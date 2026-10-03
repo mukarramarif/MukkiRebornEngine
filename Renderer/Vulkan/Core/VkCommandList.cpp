@@ -149,6 +149,14 @@ void VkCommandList::End()
 
 void VkCommandList::BeginSwapchainRendering(const rhi::ClearColor& clearColor, bool clear)
 {
+    BeginSwapchainRendering(clearColor, rhi::DepthAttachment{}, clear);
+}
+
+void VkCommandList::BeginSwapchainRendering(
+    const rhi::ClearColor& clearColor,
+    const rhi::DepthAttachment& depthAttachment,
+    bool clear)
+{
     MRE_ASSERT(m_recording, "VkCommandList::BeginSwapchainRendering called outside of a recording scope");
     MRE_ASSERT(!m_rendering, "VkCommandList::BeginSwapchainRendering called while a rendering scope is open");
     MRE_ASSERT(m_swapchainImage != nullptr, "No swapchain target has been set for this command list");
@@ -181,10 +189,53 @@ void VkCommandList::BeginSwapchainRendering(const rhi::ClearColor& clearColor, b
                                                                 clearColor.b,
                                                                 clearColor.a}});
 
-    const vk::RenderingInfo renderingInfo = vk::RenderingInfo{}
-                                                .setRenderArea(vk::Rect2D{vk::Offset2D{0, 0}, m_swapchainExtent})
-                                                .setLayerCount(1)
-                                                .setColorAttachments(colorAttachment);
+    vk::RenderingAttachmentInfo depthAttachmentInfo{};
+    const bool hasDepth = depthAttachment.texture != nullptr;
+    if (hasDepth)
+    {
+        const auto* depthTexture = static_cast<const VkTexture*>(depthAttachment.texture);
+        MRE_ASSERT(depthTexture->IsDepth(), "The depth attachment texture must be a depth texture");
+
+        if (depthTexture->GetLayout() != vk::ImageLayout::eDepthAttachmentOptimal)
+        {
+            const bool wasInitialized = depthTexture->GetLayout() != vk::ImageLayout::eUndefined;
+            const vk::ImageMemoryBarrier2 barrier = MakeImageBarrier(
+                depthTexture->GetImage(),
+                depthTexture->GetLayout(),
+                vk::ImageLayout::eDepthAttachmentOptimal,
+                vk::ImageAspectFlagBits::eDepth,
+                wasInitialized ? vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+                                     vk::PipelineStageFlagBits2::eLateFragmentTests
+                               : vk::PipelineStageFlagBits2::eNone,
+                wasInitialized ? vk::AccessFlagBits2::eDepthStencilAttachmentWrite
+                               : vk::AccessFlagBits2::eNone,
+                vk::PipelineStageFlagBits2::eEarlyFragmentTests | vk::PipelineStageFlagBits2::eLateFragmentTests,
+                vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+                depthTexture->GetArrayLayers());
+            m_commandBuffer.pipelineBarrier2(vk::DependencyInfo{}.setImageMemoryBarriers(barrier));
+            depthTexture->SetLayout(vk::ImageLayout::eDepthAttachmentOptimal);
+        }
+
+        depthAttachmentInfo = vk::RenderingAttachmentInfo{}
+                                  .setImageView(depthTexture->GetLayerView(depthAttachment.layer))
+                                  .setImageLayout(vk::ImageLayout::eDepthAttachmentOptimal)
+                                  .setLoadOp(depthAttachment.clear ? vk::AttachmentLoadOp::eClear
+                                                                   : vk::AttachmentLoadOp::eLoad)
+                                  .setStoreOp(vk::AttachmentStoreOp::eStore)
+                                  .setClearValue(vk::ClearValue{vk::ClearDepthStencilValue{
+                                      depthAttachment.clearDepth,
+                                      0}});
+        m_renderingDepthTexture = depthTexture;
+    }
+
+    vk::RenderingInfo renderingInfo = vk::RenderingInfo{}
+                                          .setRenderArea(vk::Rect2D{vk::Offset2D{0, 0}, m_swapchainExtent})
+                                          .setLayerCount(1)
+                                          .setColorAttachments(colorAttachment);
+    if (hasDepth)
+    {
+        renderingInfo.pDepthAttachment = &depthAttachmentInfo;
+    }
 
     m_commandBuffer.beginRendering(renderingInfo);
     SetViewportAndScissor(0, 0, m_swapchainExtent.width, m_swapchainExtent.height);
@@ -210,6 +261,23 @@ void VkCommandList::EndSwapchainRendering()
         vk::AccessFlagBits2::eNone);
     m_commandBuffer.pipelineBarrier2(vk::DependencyInfo{}.setImageMemoryBarriers(barrier));
     m_swapchainImageLayout = vk::ImageLayout::ePresentSrcKHR;
+
+    if (m_renderingDepthTexture != nullptr)
+    {
+        const vk::ImageMemoryBarrier2 depthBarrier = MakeImageBarrier(
+            m_renderingDepthTexture->GetImage(),
+            vk::ImageLayout::eDepthAttachmentOptimal,
+            vk::ImageLayout::eShaderReadOnlyOptimal,
+            vk::ImageAspectFlagBits::eDepth,
+            vk::PipelineStageFlagBits2::eEarlyFragmentTests | vk::PipelineStageFlagBits2::eLateFragmentTests,
+            vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+            vk::PipelineStageFlagBits2::eFragmentShader,
+            vk::AccessFlagBits2::eShaderSampledRead,
+            m_renderingDepthTexture->GetArrayLayers());
+        m_commandBuffer.pipelineBarrier2(vk::DependencyInfo{}.setImageMemoryBarriers(depthBarrier));
+        m_renderingDepthTexture->SetLayout(vk::ImageLayout::eShaderReadOnlyOptimal);
+        m_renderingDepthTexture = nullptr;
+    }
 
     m_rendering = false;
     m_renderingSwapchain = false;

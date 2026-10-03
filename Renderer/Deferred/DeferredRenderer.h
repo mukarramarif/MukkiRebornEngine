@@ -44,6 +44,8 @@ struct SceneUniform
     glm::uvec4 clusterGrid{0u};    // x, y, z grid dimensions, w: light count
     glm::vec4 screenSize{0.0f};    // x: width, y: height
     glm::vec4 reflectionParams{0.0f}; // x: ray traced reflection intensity (0 disables)
+    glm::vec4 sunDirection{0.0f, -1.0f, 0.0f, 0.0f}; // xyz: direction toward the sun
+    glm::vec4 sunColor{0.0f};      // rgb: color * intensity, used by the transparent pass
 };
 
 struct ClusterUniform
@@ -72,6 +74,14 @@ struct GpuObjectData
     glm::vec4 specular{0.0f};           // x: specularFactor, yzw: specularColorFactor
     glm::uvec4 specularTextureIndices{0u}; // x: specularTexture, y: specularColorTexture
     glm::uvec4 specularSamplerIndices{0u}; // x: specular sampler, y: specular color sampler
+    glm::vec4 volume{0.0f};             // x: transmission, y: ior, z: thickness, w: dispersion
+    glm::vec4 attenuation{0.0f};        // rgb: attenuation color, a: attenuation distance (0 = none)
+    glm::uvec4 volumeTextureIndices{0u}; // x: transmission texture, y: thickness texture
+    glm::uvec4 volumeSamplerIndices{0u}; // x: transmission sampler, y: thickness sampler
+    glm::vec4 alpha{0.0f};              // x: blend, y: cutoff, z/w: unused
+    glm::vec4 sheen{0.0f};              // rgb: sheenColorFactor, a: sheenRoughnessFactor
+    glm::uvec4 sheenTextureIndices{0u}; // x: sheenColorTexture, y: sheenRoughnessTexture
+    glm::uvec4 sheenSamplerIndices{0u}; // x: sheen color sampler, y: sheen roughness sampler
 };
 
 class DeferredRenderer
@@ -178,6 +188,16 @@ private:
         glm::vec4 specular{0.0f};
         glm::uvec4 specularTextureIndices{0u};
         glm::uvec4 specularSamplerIndices{0u};
+        // Glass / transparency material data (see GpuObjectData).
+        glm::vec4 volume{0.0f};
+        glm::vec4 attenuation{0.0f};
+        glm::uvec4 volumeTextureIndices{0u};
+        glm::uvec4 volumeSamplerIndices{0u};
+        glm::vec4 alpha{0.0f};
+        bool alphaBlend = false;
+        glm::vec4 sheen{0.0f};
+        glm::uvec4 sheenTextureIndices{0u};
+        glm::uvec4 sheenSamplerIndices{0u};
     };
 
     // Per draw item data read by ray traced effects (global illumination color bleeding).
@@ -187,7 +207,14 @@ private:
         glm::uvec4 bufferIndices{0u};    // x: vertex buffer, y: index buffer, z: vertex stride
         glm::uvec4 textureIndices{0u};   // x: base color texture, y: metallic-roughness texture
         glm::uvec4 samplerIndices{0u};   // x: base color sampler, y: metallic-roughness sampler
-        glm::vec4 params{0.0f};          // x: roughness, y: metalness
+        glm::vec4 params{0.0f};          // x: roughness, y: metalness, z: alpha blend, w: alpha cutoff
+        glm::vec4 volume{0.0f};          // x: transmission, y: ior, z: thickness, w: dispersion
+        glm::vec4 attenuation{0.0f};     // rgb: attenuation color, a: attenuation distance (0 = none)
+        glm::uvec4 volumeTextureIndices{0u}; // x: transmission texture, y: thickness texture
+        glm::uvec4 volumeSamplerIndices{0u}; // x: transmission sampler, y: thickness sampler
+        glm::vec4 sheen{0.0f};               // rgb: sheenColorFactor, a: sheenRoughnessFactor
+        glm::uvec4 sheenTextureIndices{0u};  // x: sheenColorTexture, y: sheenRoughnessTexture
+        glm::uvec4 sheenSamplerIndices{0u};
     };
 
     inline static constexpr std::uint32_t kMaxObjectData = 2048;
@@ -198,6 +225,10 @@ private:
         std::unique_ptr<rhi::Texture> metallicRoughnessTexture{};
         std::unique_ptr<rhi::Texture> specularTexture{};
         std::unique_ptr<rhi::Texture> specularColorTexture{};
+        std::unique_ptr<rhi::Texture> transmissionTexture{};
+        std::unique_ptr<rhi::Texture> thicknessTexture{};
+        std::unique_ptr<rhi::Texture> sheenColorTexture{};
+        std::unique_ptr<rhi::Texture> sheenRoughnessTexture{};
     };
 
     struct SceneObjectBounds
@@ -408,12 +439,14 @@ private:
     std::vector<std::unique_ptr<rhi::DescriptorSet>> m_clusterSets{};
     std::unique_ptr<rhi::Shader> m_gbufferVertexShader{};
     std::unique_ptr<rhi::Shader> m_gbufferFragmentShader{};
+    std::unique_ptr<rhi::Shader> m_transparentFragmentShader{};
     std::unique_ptr<rhi::Shader> m_lightingVertexShader{};
     std::unique_ptr<rhi::Shader> m_lightingFragmentShader{};
     std::unique_ptr<rhi::Shader> m_clusterCullingShader{};
     std::unique_ptr<rhi::Shader> m_shadowVertexShader{};
     std::unique_ptr<rhi::Shader> m_shadowFragmentShader{};
     std::unique_ptr<rhi::Pipeline> m_gbufferPipeline{};
+    std::unique_ptr<rhi::Pipeline> m_transparentPipeline{};
     std::unique_ptr<rhi::Pipeline> m_lightingPipeline{};
     std::unique_ptr<rhi::Pipeline> m_clusterCullingPipeline{};
     std::unique_ptr<rhi::Pipeline> m_shadowPipeline{};

@@ -103,6 +103,7 @@ private:
     bool CreateFrameResources();
     void RecreateSwapchain();
     void WaitForFrame(std::uint32_t frame);
+    void LogDeviceFault();
 
     VkInstance m_instance{};
     vk::raii::PhysicalDevice m_physicalDevice{nullptr};
@@ -134,6 +135,7 @@ private:
     bool m_rayTracingSupported = false;
     bool m_swapchainDirty = false;
     bool m_initialized = false;
+    bool m_deviceFaultSupported = false;
 };
 
 [[nodiscard]] std::unique_ptr<rhi::Device> CreateVulkanDevice(const rhi::DeviceDesc& desc);
