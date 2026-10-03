@@ -96,6 +96,64 @@ float3 SampleGgxDirection(float3 normal, float3 viewDirection, float roughness, 
     return reflect(-normalize(viewDirection), halfVector);
 }
 
+// Heitz 2018, "Sampling the GGX Distribution of Visible Normals" (isotropic). Returns the sampled
+// microfacet normal in world space; `alpha` is the squared perceptual roughness. Unlike NDF
+// sampling this accounts for the view direction, so grazing-angle lobes stay correct.
+float3 SampleGgxVndf(float3 normal, float3 viewDirection, float2 u, float alpha)
+{
+    const float3 up = abs(normal.y) < 0.999 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
+    const float3 tangent = normalize(cross(up, normal));
+    const float3 bitangent = cross(normal, tangent);
+    const float3 view = float3(
+        dot(viewDirection, tangent),
+        dot(viewDirection, bitangent),
+        dot(viewDirection, normal));
+
+    const float3 stretched = normalize(float3(alpha * view.x, alpha * view.y, view.z));
+    const float lengthSquared = stretched.x * stretched.x + stretched.y * stretched.y;
+    const float3 axis1 = lengthSquared > 0.0
+                             ? float3(-stretched.y, stretched.x, 0.0) * rsqrt(lengthSquared)
+                             : float3(1.0, 0.0, 0.0);
+    const float3 axis2 = cross(stretched, axis1);
+
+    const float radius = sqrt(u.x);
+    const float phi = 2.0 * kPi * u.y;
+    const float p1 = radius * cos(phi);
+    float p2 = radius * sin(phi);
+    const float s = 0.5 * (1.0 + stretched.z);
+    p2 = (1.0 - s) * sqrt(max(0.0, 1.0 - p1 * p1)) + s * p2;
+
+    const float3 localHalf = p1 * axis1 + p2 * axis2 +
+                             sqrt(max(0.0, 1.0 - p1 * p1 - p2 * p2)) * stretched;
+    const float3 microfacet = float3(alpha * localHalf.x, alpha * localHalf.y, max(0.0, localHalf.z));
+    return normalize(tangent * microfacet.x + bitangent * microfacet.y + normal * microfacet.z);
+}
+
+// Height-correlated Smith masking term for one direction (nDotX = saturate(dot(n, x))).
+float SmithGgxG1(float nDotX, float alpha)
+{
+    const float alphaSquared = alpha * alpha;
+    const float cosSquared = nDotX * nDotX;
+    return (2.0 * nDotX) /
+           max(nDotX + sqrt(alphaSquared + (1.0 - alphaSquared) * cosSquared), 1e-6);
+}
+
+// Height-correlated Smith joint masking. For a VNDF-sampled reflection the estimator weight is
+// F * G2 / G1 (the cosine and PDF terms cancel), which keeps grazing angles energy correct.
+float SmithGgxG2(float nDotV, float nDotL, float alpha)
+{
+    const float alphaSquared = alpha * alpha;
+    const float lambdaV = nDotL * sqrt(nDotV * nDotV * (1.0 - alphaSquared) + alphaSquared);
+    const float lambdaL = nDotV * sqrt(nDotL * nDotL * (1.0 - alphaSquared) + alphaSquared);
+    return (2.0 * nDotV * nDotL) / max(lambdaV + lambdaL, 1e-6);
+}
+
+// VNDF reflection estimator weight (Fresnel already applied by the caller when needed).
+float SpecularVndfWeight(float nDotV, float nDotL, float alpha)
+{
+    return SmithGgxG2(nDotV, nDotL, alpha) / max(SmithGgxG1(nDotV, alpha), 1e-4);
+}
+
 // Projects the hit point onto the ray traced sun shadow mask. Returns false when the hit is not
 // visible on screen or lies on a different surface, in which case the caller traces shadow rays.
 bool SampleRtSunVisibility(float3 position, float3 normal, out float visibility)
@@ -144,6 +202,8 @@ struct SurfaceSample
     float alpha;
     float roughness;
     float metalness;
+    bool alphaMask;
+    float alphaCutoff;
     bool alphaBlend;
     float transmission;
     float ior;
@@ -219,7 +279,10 @@ SurfaceSample LoadSurface(
     surface.alpha = baseColorSample.a * geometry.baseColorFactor.a;
     surface.roughness = clamp(geometry.params.x, 0.0, 1.0);
     surface.metalness = clamp(geometry.params.y, 0.0, 1.0);
-    surface.alphaBlend = geometry.params.z > 0.5;
+    // params.z encodes the alpha mode: 0 opaque, 1 MASK, 2 BLEND (see GpuGeometryData).
+    surface.alphaMask = abs(geometry.params.z - 1.0) < 0.5;
+    surface.alphaCutoff = geometry.params.w;
+    surface.alphaBlend = geometry.params.z > 1.5;
     surface.transmission = saturate(geometry.volume.x * transmissionSample);
     surface.ior = max(geometry.volume.y, 1.0);
     surface.thickness = max(geometry.volume.z * thicknessSample, 0.0);
@@ -411,8 +474,11 @@ float3 TraceHitPath(
             direction,
             currentHitDistance);
 
-        if (surface.alphaBlend && surface.alpha < 0.999 &&
-            Hash01(pixel, frame, 211u + bounce) > surface.alpha)
+        const bool alphaRejected =
+            (surface.alphaMask && surface.alpha < surface.alphaCutoff) ||
+            (surface.alphaBlend && surface.alpha < 0.999 &&
+             Hash01(pixel, frame, 211u + bounce) > surface.alpha);
+        if (alphaRejected)
         {
             origin = surface.position + direction * 0.001;
             hasHit = TraceSceneRay(

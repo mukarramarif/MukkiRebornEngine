@@ -257,10 +257,13 @@ clustered lights:
   with up to `Refraction bounces` dielectric bounces, Beer-Lambert `Volume absorption` and optional
   `Dispersion`; glass seen in reflections, GI and probes refracts consistently.
 - **Ray traced reflections**: surfaces below `Reflection max roughness` trace `Reflection samples`
-  GGX VNDF rays at the GI resolution, shade the hits with the shared path tracer, accumulate
+  Heitz GGX VNDF rays (height-correlated Smith weighting) at `Reflection trace scale` of the
+  swapchain (default full resolution), shade the hits with the shared path tracer, accumulate
   temporally (with the same denoiser settings as GI), filter through the GI a-trous and bilaterally
-  upsample to full resolution. Controls: `Reflections`, `Reflection intensity`,
-  `Reflection max roughness`, `Reflection distance`, `Reflection samples`.
+  upsample to full resolution. The GI specular signal fades out where the reflection pass takes
+  over, so the specular integral stays energy consistent. Controls: `Reflections`,
+  `Reflection intensity`, `Reflection max roughness`, `Reflection distance`, `Reflection samples`,
+  `Reflection trace scale`.
 - **GI probes**: world space probes added from the `Probes` section (independent of the glTF objects)
   feed the irradiance probe pass. `gi_probes.comp.slang`
   traces `Probe rays` uniform-sphere rays per probe with the same hit shading as the path tracer,
@@ -287,9 +290,10 @@ In the sandbox, the `Scenes` window browses and loads the JSON scenes found in `
 
 - Selecting an object lets you edit its position, rotation (degrees, YXZ) and scale; the change is
   applied to the renderer immediately. The `Probes` section below the objects manages the
-  world-space GI probes (`Add probe` places one in front of the camera, `Add grid` drops a 3x2x3
-  grid, and the selected probe has position/radius/enabled controls); they are persisted in the
-  scene JSON and bytecode.
+world-space GI probes (`Add probe` places one in front of the camera, `Add grid` drops a 3x2x3
+grid, `Fill scene`/`Maximize probes` distribute probes across the loaded scene bounds up to the
+GPU limit of `kMaxGiProbes`, and the selected probe has position/radius/enabled controls); they
+are persisted in the scene JSON and bytecode.
 - Selecting a light opens a `Type` dropdown (directional/point/spot) plus position, direction,
   color, `Strength`, range and cone controls.
 - `Show light gizmos` draws wireframe markers for the lights in the viewport: range spheres for

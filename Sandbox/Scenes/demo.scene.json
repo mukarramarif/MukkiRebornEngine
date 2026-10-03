@@ -31,11 +31,11 @@
       "scale": [0.8, 0.8, 0.8]
     },
     {
-      "name": "Corset",
-      "model": "Corset/glTF/Corset.gltf",
-      "position": [2.5, 2.0, 2.5],
-      "rotation": [0.0, -135.0, 0.0],
-      "scale": [0.8, 0.8, 0.8]
+      "name":"SheenChair",
+      "model":"SheenChair/glTF/SheenChair.gltf",
+      "position":[-3.0, 2.0, 1.5],
+      "rotation":[0.0, 45.0, 0.0],
+      "scale":[0.8, 0.8, 0.8]
     },
     {
       "name": "Lantern",

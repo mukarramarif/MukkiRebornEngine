@@ -53,6 +53,14 @@ void computeMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     const float3 origin = worldPosition + normal * 0.01;
     const float3 f0 = float3(0.04, 0.04, 0.04);
 
+    // Smooth surfaces below the reflection cutoff are covered by the ray traced reflection pass;
+    // blend the GI specular signal over the same band so the specular integral is not counted twice.
+    const float reflectionCutoff = gGi.params6.y;
+    const float specularCoverage =
+        gGi.params6.w > 0.0
+            ? smoothstep(reflectionCutoff * 0.75, reflectionCutoff, roughness)
+            : 1.0;
+
     float3 diffuseAccum = 0.0;
     float3 specularAccum = 0.0;
     float hitDistanceAccum = 0.0;
@@ -89,38 +97,50 @@ void computeMain(uint3 dispatchThreadId : SV_DispatchThreadID)
                 sampleSeed);
         }
 
-        const float3 specularDirection =
-            SampleGgxDirection(normal, viewDirection, roughness, dispatchThreadId.xy, sampleSeed + 7919u);
-        RayQuery<RAY_FLAG_NONE> specularQuery;
-        RayDesc specularRay;
-        specularRay.Origin = origin;
-        specularRay.Direction = specularDirection;
-        specularRay.TMin = 0.0;
-        specularRay.TMax = gGi.params.x;
-        specularQuery.TraceRayInline(gTlas, RAY_FLAG_NONE, 0xFF, specularRay);
-        specularQuery.Proceed();
-
-        float3 specularRadiance = gGi.skyColor.rgb * gGi.skyColor.w;
-        if (specularQuery.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
-        {
-            specularRadiance = ShadeHit(
-                gIndirect,
-                specularQuery.CommittedInstanceID(),
-                specularQuery.CommittedPrimitiveIndex(),
-                specularQuery.CommittedTriangleBarycentrics(),
-                origin,
-                specularDirection,
-                specularQuery.CommittedRayT(),
-                dispatchThreadId.xy,
-                sampleSeed);
-        }
-
-        const float nDotL = max(dot(normal, specularDirection), 0.0);
-        const float vDotH = max(dot(viewDirection, normalize(viewDirection + specularDirection)), 0.0);
-        const float3 fresnel = f0 + (1.0 - f0) * pow(saturate(1.0 - vDotH), 5.0);
+        const float alpha = max(roughness * roughness, 1e-4);
+        const float2 specularUv = float2(
+            Hash01(dispatchThreadId.xy, sampleSeed, 317u),
+            Hash01(dispatchThreadId.xy, sampleSeed, 331u));
+        const float3 halfVector = SampleGgxVndf(normal, viewDirection, specularUv, alpha);
+        const float3 specularDirection = reflect(-viewDirection, halfVector);
 
         diffuseAccum += diffuseRadiance;
-        specularAccum += specularRadiance * fresnel * nDotL;
+
+        const float nDotL = dot(normal, specularDirection);
+        if (nDotL > 0.0)
+        {
+            RayQuery<RAY_FLAG_NONE> specularQuery;
+            RayDesc specularRay;
+            specularRay.Origin = origin;
+            specularRay.Direction = specularDirection;
+            specularRay.TMin = 0.0;
+            specularRay.TMax = gGi.params.x;
+            specularQuery.TraceRayInline(gTlas, RAY_FLAG_NONE, 0xFF, specularRay);
+            specularQuery.Proceed();
+
+            float3 specularRadiance = gGi.skyColor.rgb * gGi.skyColor.w;
+            if (specularQuery.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
+            {
+                specularRadiance = ShadeHit(
+                    gIndirect,
+                    specularQuery.CommittedInstanceID(),
+                    specularQuery.CommittedPrimitiveIndex(),
+                    specularQuery.CommittedTriangleBarycentrics(),
+                    origin,
+                    specularDirection,
+                    specularQuery.CommittedRayT(),
+                    dispatchThreadId.xy,
+                    sampleSeed);
+            }
+
+            const float nDotV = saturate(dot(normal, viewDirection));
+            const float vDotH = saturate(dot(viewDirection, halfVector));
+            const float3 fresnel = f0 + (1.0 - f0) * pow(1.0 - vDotH, 5.0);
+            specularAccum +=
+                specularRadiance * fresnel * SpecularVndfWeight(nDotV, nDotL, alpha) *
+                specularCoverage;
+        }
+
         hitDistanceAccum += diffuseHitDistance;
     }
 

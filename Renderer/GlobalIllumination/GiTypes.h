@@ -45,6 +45,8 @@ struct ReflectionSettings
     float maxRoughness = 0.45f;    // surfaces above this roughness do not trace reflections
     float maxDistance = 60.0f;
     std::uint32_t samples = 2;     // GGX VNDF rays per pixel (reuses the GI temporal alpha)
+    // Trace resolution relative to the swapchain. 1.0 keeps mirror reflections sharp.
+    float resolutionScale = 1.0f;
     // Glass: refraction bounces, chromatic dispersion and a volume absorption multiplier.
     std::uint32_t refractionBounces = 3;
     bool dispersion = true;
@@ -70,6 +72,7 @@ struct GiUniform
     glm::vec4 params5{0.0f}; // x: probeRays, y: probeHysteresis, z: probeCount, w: reflectionResetHistory
     glm::vec4 params6{0.0f}; // x: reflectionMaxDistance, y: reflectionMaxRoughness, z: reflectionSamples, w: reflectionIntensity
     glm::vec4 params7{0.0f}; // x: glassRefractionBounces, y: dispersionEnabled, z: volumeAbsorptionScale, w: unused
+    glm::vec4 reflectionSize{0.0f}; // x/y: reflection trace resolution
 };
 
 // CPU-side world space GI probe. The radius only controls the debug marker size.

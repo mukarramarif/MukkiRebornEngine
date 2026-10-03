@@ -15,6 +15,8 @@ struct GiUniform
     float4 params4;
     float4 params5;
     float4 params6;
+    float4 params7;
+    float4 reflectionSize; // x/y: reflection trace resolution
 };
 
 [[vk::binding(0, 0)]] ConstantBuffer<GiUniform> gGi;
@@ -45,10 +47,12 @@ void computeMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     const float4 centerNormalRough = gNormal.Load(int3(fullPixel, 0));
     const float3 centerNormal = normalize(centerNormalRough.xyz * 2.0 - 1.0);
 
-    const float2 halfPosition = (float2(fullPixel) + 0.5) * (gGi.halfSize.xy / gGi.screenSize.xy) - 0.5;
+    const float2 halfPosition =
+        (float2(fullPixel) + 0.5) * (gGi.reflectionSize.xy / gGi.screenSize.xy) - 0.5;
     const int2 halfBase = int2(floor(halfPosition));
-    const int2 halfMax = int2(gGi.halfSize.xy) - 1;
+    const int2 halfMax = int2(gGi.reflectionSize.xy) - 1;
     const int2 fullMax = int2(gGi.screenSize.xy) - 1;
+    const float2 fullScale = gGi.screenSize.xy / gGi.reflectionSize.xy;
 
     float3 sum = 0.0;
     float weightSum = 0.0;
@@ -60,7 +64,8 @@ void computeMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         for (int x = 0; x <= 1; ++x)
         {
             const int2 halfPixel = clamp(halfBase + int2(x, y), int2(0, 0), halfMax);
-            const int2 tapFull = clamp(halfPixel * 2, int2(0, 0), fullMax);
+            const int2 tapFull =
+                clamp(int2(floor((float2(halfPixel) + 0.5) * fullScale)), int2(0, 0), fullMax);
             const float tapDepth = gDepth.Load(int3(tapFull, 0)).r;
             if (tapDepth <= 0.0 || tapDepth >= 1.0)
             {

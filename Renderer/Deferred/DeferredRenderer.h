@@ -119,6 +119,9 @@ public:
     void UpdateSceneObjectTransform(std::size_t objectIndex, const glm::mat4& transform);
     [[nodiscard]] std::size_t GetSceneObjectCount() const { return m_objectInstances.size(); }
 
+    // World space bounds of the instantiated scene objects. Returns false when no object is loaded.
+    [[nodiscard]] bool GetSceneBounds(glm::vec3& outMin, glm::vec3& outMax) const;
+
     // Replaces the lit image with a heatmap of the clustered light counts for debugging.
     void SetClusterDebugView(bool enabled) { m_clusterDebugView = enabled; }
     [[nodiscard]] bool IsClusterDebugViewEnabled() const { return m_clusterDebugView; }
@@ -207,7 +210,7 @@ private:
         glm::uvec4 bufferIndices{0u};    // x: vertex buffer, y: index buffer, z: vertex stride
         glm::uvec4 textureIndices{0u};   // x: base color texture, y: metallic-roughness texture
         glm::uvec4 samplerIndices{0u};   // x: base color sampler, y: metallic-roughness sampler
-        glm::vec4 params{0.0f};          // x: roughness, y: metalness, z: alpha blend, w: alpha cutoff
+        glm::vec4 params{0.0f};          // x: roughness, y: metalness, z: alpha mode (0/1/2), w: alpha cutoff
         glm::vec4 volume{0.0f};          // x: transmission, y: ior, z: thickness, w: dispersion
         glm::vec4 attenuation{0.0f};     // rgb: attenuation color, a: attenuation distance (0 = none)
         glm::uvec4 volumeTextureIndices{0u}; // x: transmission texture, y: thickness texture

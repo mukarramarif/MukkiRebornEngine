@@ -34,8 +34,9 @@ must not expose backend types, and Vulkan types may only appear under `Renderer/
   `ObjectPushConstants.params.z/.w` (set by `DeferredRenderer` from `GltfMaterial`), the G-buffer
   discards `baseColor.a * baseColorFactor.a < cutoff`, and the shadow fragment stage alpha-tests
   through the bindless base color texture (the shadow pipeline binds the bindless set as set 1 and
-  uses explicit vertex attribute offsets for position/uv). `BLEND` is not supported yet, and ray
-  traced GI hit shading ignores alpha because the BLAS contains solid geometry.
+  uses explicit vertex attribute offsets for position/uv). Ray traced hit shading also honours
+  coverage: MASK hits below the cutoff are skipped and BLEND hits are stochastically accepted
+  (`GpuGeometryData.params.z` = alpha mode 0/1/2, `.w` = cutoff).
   `KHR_materials_specular` is supported: factor/color and the extension textures travel through the
   extended `GpuObjectData` SSBO (read by the G-buffer fragment), and the dielectric F0 is baked into
   the fifth G-buffer target (`GBuffer::GetSpecularF0`, 0.04 default); lighting and reflections use
@@ -54,6 +55,8 @@ must not expose backend types, and Vulkan types may only appear under `Renderer/
   lighting scope with a `PrimitiveTopology::LineList` pipeline (push constant viewProjection, no
   depth). World space GI probes are authored as `SceneDescription::probes` (JSON + scene binary v4);
   the sandbox feeds `GiProbe` markers through `SetGiProbes` and toggles them with `SetGizmoView`.
+  The probe UI can `Fill scene`/`Maximize probes`, distributing a Halton set of up to
+  `kMaxGiProbes` probes over `DeferredRenderer::GetSceneBounds`.
   Probe markers are generated from the uploaded GI probe data and show the SH direction arrow.
 - Namespace `mukki`; PascalCase files/types/methods; `m_` prefixed members.
 - Multithreading: `Core/JobSystem` is the shared thread pool. glTF parsing runs asynchronously
@@ -87,14 +90,18 @@ must not expose backend types, and Vulkan types may only appear under `Renderer/
   G-buffer textures per frame after the G-buffer pass; the mask is bound as a fallback white texture
   when inactive. Spot/point shadows remain cascaded maps.
 - Ray traced reflections: optional (`ReflectionSettings`, requires ray tracing).
-  `rt_reflections.comp.slang` traces `samples` GGX VNDF rays per pixel at the GI trace resolution
-  (roughness cutoff `maxRoughness`, `maxDistance`), shades hits through the shared `gi_shading.slang`
-  (screen-space feedback disabled by binding the 1x1 black texture) and weights by Schlick fresnel.
+  `rt_reflections.comp.slang` traces `samples` Heitz GGX VNDF rays per pixel at
+  `ReflectionSettings::resolutionScale` (default 1.0, i.e. full resolution; the trace/temporal/
+  a-trous/upsample sizes come from `GiUniform.reflectionSize`), shades hits through the shared
+  `gi_shading.slang` (screen-space feedback disabled by binding the 1x1 black texture) and weights
+  by `Schlick fresnel * Smith G2/G1`. Surfaces fade out toward `maxRoughness` while the GI specular
+  signal fades in over the same band, so the specular integral is not double counted (when
+  reflections are inactive `params6.w = 0` makes the GI trace cover smooth specular).
   `reflection_temporal.comp.slang` accumulates with moments and firefly rejection, the a-trous pass
-  reuses the GI atrous pipeline/descriptor sets, and `reflection_upsample.comp.slang` bilaterally
-  upsamples to full res (roughness-aware). The lighting pass adds binding 15 scaled by
-  `SceneUniform.reflectionParams.x`. `GiUniform.params6` carries the reflection parameters and
-  `params5.w` the history reset flag.
+  reuses the GI atrous pipeline with push-constant signal 2 (which switches the tap mapping to
+  `reflectionSize`), and `reflection_upsample.comp.slang` bilaterally upsamples to full res
+  (roughness-aware). The lighting pass adds binding 15 scaled by `SceneUniform.reflectionParams.x`.
+  `GiUniform.params6` carries the reflection parameters and `params5.w` the history reset flag.
 - GI probes: world space `SceneDescription::probes` become irradiance probes. When probes are
   active (`GiSettings.useProbes`, requires ray tracing) `gi_probes.comp.slang` traces `probeRays`
   uniform-sphere rays per probe through the shared hit shading in `gi_shading.slang`, accumulates

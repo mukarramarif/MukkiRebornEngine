@@ -35,16 +35,23 @@ float3 Sanitize(float3 value)
 void computeMain(uint3 dispatchThreadId : SV_DispatchThreadID)
 {
     const int2 halfPixel = int2(dispatchThreadId.xy);
-    if (halfPixel.x >= int(gGi.halfSize.x) || halfPixel.y >= int(gGi.halfSize.y))
+    // Signal 2 is the reflection signal: it can run above the GI half resolution, so the tap
+    // mapping to full resolution follows the reflection trace size instead of a fixed 2x.
+    const bool reflectionPass = gPush.signal >= 2;
+    const float2 traceSize = reflectionPass ? gGi.reflectionSize.xy : gGi.halfSize.xy;
+    if (halfPixel.x >= int(traceSize.x) || halfPixel.y >= int(traceSize.y))
     {
         return;
     }
 
-    const int2 halfMax = int2(gGi.halfSize.xy) - 1;
+    const int2 halfMax = int2(traceSize) - 1;
     const int2 fullMax = int2(gGi.screenSize.xy) - 1;
     const int step = 1 << int(gPush.iteration);
+    const float2 fullScale = gGi.screenSize.xy / traceSize;
 
-    const int2 centerFull = clamp(halfPixel * 2, int2(0, 0), fullMax);
+    const int2 centerFull = reflectionPass
+                                ? clamp(int2(floor((float2(halfPixel) + 0.5) * fullScale)), int2(0, 0), fullMax)
+                                : clamp(halfPixel * 2, int2(0, 0), fullMax);
     const float centerDepth = gDepth.Load(int3(centerFull, 0)).r;
     if (centerDepth <= 0.0 || centerDepth >= 1.0)
     {
@@ -73,7 +80,9 @@ void computeMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         for (int x = -2; x <= 2; ++x)
         {
             const int2 tapHalf = clamp(halfPixel + int2(x, y) * step, int2(0, 0), halfMax);
-            const int2 tapFull = clamp(tapHalf * 2, int2(0, 0), fullMax);
+            const int2 tapFull = reflectionPass
+                                     ? clamp(int2(floor((float2(tapHalf) + 0.5) * fullScale)), int2(0, 0), fullMax)
+                                     : clamp(tapHalf * 2, int2(0, 0), fullMax);
 
             const float tapDepth = gDepth.Load(int3(tapFull, 0)).r;
             if (tapDepth <= 0.0 || tapDepth >= 1.0)
@@ -97,7 +106,7 @@ void computeMain(uint3 dispatchThreadId : SV_DispatchThreadID)
             weight *= pow(saturate(dot(centerNormal, tapNormal)), gGi.params2.z);
             weight *= exp(-abs(centerLum - tapLum) / (gGi.params2.w * sqrt(variance) + 1e-4));
 
-            if (gPush.signal == 1)
+            if (gPush.signal >= 1)
             {
                 // Glossy signals additionally reject taps with different roughness or hit distance.
                 weight *= exp(-abs(centerRoughness - tapNormalRough.w) * 32.0);

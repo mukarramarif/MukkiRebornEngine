@@ -786,6 +786,18 @@ private:
             settings.samples = static_cast<std::uint32_t>(samples);
             changed = true;
         }
+        if (ImGui::SliderFloat(
+                "Reflection trace scale",
+                &settings.resolutionScale,
+                0.25f,
+                1.0f,
+                "%.2f"))
+        {
+            changed = true;
+        }
+        ImGui::SetItemTooltip(
+            "Fraction of the swapchain resolution used for the reflection trace.\n"
+            "1.0 keeps mirror reflections sharp, lower values trade sharpness for performance.");
 
         ImGui::SeparatorText("Glass");
         changed |= ImGui::Checkbox("Dispersion", &settings.dispersion);
@@ -806,6 +818,51 @@ private:
         {
             m_renderer->SetReflectionSettings(settings);
         }
+    }
+
+    static float RadicalInverse(int index, int base)
+    {
+        float result = 0.0f;
+        float fraction = 1.0f;
+        while (index > 0)
+        {
+            fraction /= static_cast<float>(base);
+            result += fraction * static_cast<float>(index % base);
+            index /= base;
+        }
+        return result;
+    }
+
+    void FillSceneProbes(int count)
+    {
+        glm::vec3 boundsMin{0.0f};
+        glm::vec3 boundsMax{0.0f};
+        if (!m_renderer->GetSceneBounds(boundsMin, boundsMax))
+        {
+            m_sceneStatus = "probe fill needs a loaded scene";
+            return;
+        }
+
+        const int probeCount = std::clamp(count, 1, static_cast<int>(mukki::kMaxGiProbes));
+        const glm::vec3 inset{0.05f};
+        m_scene.probes.clear();
+        for (int index = 1; index <= probeCount; ++index)
+        {
+            const glm::vec3 t{
+                RadicalInverse(index, 2),
+                RadicalInverse(index, 3),
+                RadicalInverse(index, 5)};
+            mukki::SceneProbe probe{};
+            probe.name = "Auto " + std::to_string(index);
+            probe.position =
+                glm::mix(boundsMin, boundsMax, inset + t * (glm::vec3{1.0f} - inset * 2.0f));
+            probe.radius = 0.35f;
+            m_scene.probes.push_back(probe);
+        }
+
+        m_selectedProbe = m_scene.probes.empty() ? -1 : 0;
+        ApplySceneProbes();
+        m_sceneStatus = "scene probes: " + std::to_string(m_scene.probes.size());
     }
 
     void DrawProbeSection()
@@ -905,6 +962,43 @@ private:
             m_selectedProbe = -1;
             ApplySceneProbes();
         }
+
+        // Scene fill: distributes probes over the loaded scene bounds (Halton sequence) so the
+        // whole scene can be covered without placing probes by hand. "Maximize" places the GPU
+        // limit in one click.
+        glm::vec3 boundsMin{0.0f};
+        glm::vec3 boundsMax{0.0f};
+        if (m_renderer->GetSceneBounds(boundsMin, boundsMax))
+        {
+            const glm::vec3 extent = boundsMax - boundsMin;
+            ImGui::Text("Scene extent %.1f x %.1f x %.1f", extent.x, extent.y, extent.z);
+        }
+        else
+        {
+            ImGui::TextDisabled("Scene extent: no loaded objects");
+        }
+        ImGui::SetNextItemWidth(130.0f);
+        ImGui::SliderInt(
+            "##probe_fill_count",
+            &m_probeFillCount,
+            1,
+            static_cast<int>(mukki::kMaxGiProbes),
+            "Probes: %d");
+        ImGui::SameLine();
+        if (ImGui::Button("Fill scene"))
+        {
+            FillSceneProbes(m_probeFillCount);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Maximize probes"))
+        {
+            m_probeFillCount = static_cast<int>(mukki::kMaxGiProbes);
+            FillSceneProbes(m_probeFillCount);
+        }
+        ImGui::SetItemTooltip(
+            "Replaces the probe list with probes distributed across the loaded scene bounds,\n"
+            "up to the GPU limit (max %u).",
+            mukki::kMaxGiProbes);
 
         if (m_selectedProbe >= 0 && m_selectedProbe < static_cast<int>(m_scene.probes.size()))
         {
@@ -1229,6 +1323,7 @@ private:
     int m_selectedLight = 0;
     int m_selectedObject = 0;
     int m_selectedProbe = -1;
+    int m_probeFillCount = static_cast<int>(mukki::kMaxGiProbes);
     int m_sceneFileIndex = 0;
     int m_maxFrames = 0;
     int m_frameCount = 0;

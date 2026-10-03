@@ -1046,6 +1046,28 @@ void DeferredRenderer::UpdateSceneObjectTransform(std::size_t objectIndex, const
     }
 }
 
+bool DeferredRenderer::GetSceneBounds(glm::vec3& outMin, glm::vec3& outMax) const
+{
+    if (m_objectInstances.empty())
+    {
+        return false;
+    }
+
+    glm::vec3 boundsMin{std::numeric_limits<float>::max()};
+    glm::vec3 boundsMax{std::numeric_limits<float>::lowest()};
+    for (const SceneObjectInstance& sceneObject : m_objectInstances)
+    {
+        const glm::vec3 center = sceneObject.bounds.center * m_modelScale;
+        const float radius = sceneObject.bounds.radius * m_modelScale;
+        boundsMin = glm::min(boundsMin, center - radius);
+        boundsMax = glm::max(boundsMax, center + radius);
+    }
+
+    outMin = boundsMin;
+    outMax = boundsMax;
+    return true;
+}
+
 void DeferredRenderer::ClearModelInstances()
 {
     m_modelDrawItems.clear();
@@ -1211,10 +1233,14 @@ void DeferredRenderer::BuildAccelerationStructures(rhi::CommandList& commandList
             0u};
         geometry.textureIndices = glm::uvec4{item.pushConstants.textureIndices, 0u, 0u};
         geometry.samplerIndices = glm::uvec4{item.pushConstants.samplerIndices, 0u, 0u};
+        // params.z encodes the alpha mode: 0 opaque, 1 MASK, 2 BLEND.
+        const float alphaMode = item.pushConstants.params.z > 0.5f
+                                    ? 1.0f
+                                    : (item.alpha.x > 0.5f ? 2.0f : 0.0f);
         geometry.params = glm::vec4{
             item.pushConstants.params.x,
             item.pushConstants.params.y,
-            item.alpha.x,
+            alphaMode,
             item.alpha.y};
         geometry.volume = item.volume;
         geometry.attenuation = item.attenuation;
@@ -1371,8 +1397,11 @@ bool DeferredRenderer::CreateReflectionResources(rhi::Device& device)
 
     const std::uint32_t fullWidth = m_gbuffer.GetWidth();
     const std::uint32_t fullHeight = m_gbuffer.GetHeight();
-    const std::uint32_t halfWidth = m_gi.front().diffuseNoisy->GetWidth();
-    const std::uint32_t halfHeight = m_gi.front().diffuseNoisy->GetHeight();
+    const float resolutionScale = std::clamp(m_reflectionSettings.resolutionScale, 0.25f, 1.0f);
+    const std::uint32_t halfWidth =
+        std::max(1u, static_cast<std::uint32_t>(std::lround(static_cast<double>(fullWidth) * resolutionScale)));
+    const std::uint32_t halfHeight =
+        std::max(1u, static_cast<std::uint32_t>(std::lround(static_cast<double>(fullHeight) * resolutionScale)));
 
     const auto createStorage = [&device](std::uint32_t width, std::uint32_t height, rhi::Format format) {
         return device.CreateTexture(rhi::TextureDesc{width, height, format, rhi::TextureUsage::Storage});
@@ -1440,7 +1469,19 @@ bool DeferredRenderer::IsGiActive() const
 
 void DeferredRenderer::SetReflectionSettings(const ReflectionSettings& settings)
 {
+    const bool scaleChanged =
+        std::abs(settings.resolutionScale - m_reflectionSettings.resolutionScale) > 1e-4f;
     m_reflectionSettings = settings;
+
+    if (scaleChanged && m_initialized && m_device != nullptr &&
+        m_device->IsRayTracingSupported())
+    {
+        m_device->WaitIdle();
+        if (!CreateReflectionResources(*m_device))
+        {
+            MRE_CRITICAL("Failed to recreate the ray traced reflection resources");
+        }
+    }
 
     // Reset the temporal history so the new cutoff/intensity converges immediately.
     for (GiFrameResources& gi : m_gi)
@@ -1529,12 +1570,21 @@ void DeferredRenderer::UpdateGiUniform(std::uint32_t frameIndex, const FrameView
         std::max(m_reflectionSettings.maxDistance, 0.1f),
         std::clamp(m_reflectionSettings.maxRoughness, 0.0f, 1.0f),
         static_cast<float>(std::clamp(m_reflectionSettings.samples, 1u, 8u)),
-        std::max(m_reflectionSettings.intensity, 0.0f)};
+        // Zero disables the reflection signal, which makes the GI trace cover smooth specular.
+        IsReflectionActive() ? std::max(m_reflectionSettings.intensity, 0.0f) : 0.0f};
     m_giUniform.params7 = glm::vec4{
         static_cast<float>(std::clamp(m_reflectionSettings.refractionBounces, 1u, 8u)),
         m_reflectionSettings.dispersion ? 1.0f : 0.0f,
         std::max(m_reflectionSettings.volumeAbsorptionScale, 0.0f),
         0.0f};
+    if (m_gi[frameIndex].reflectionNoisy != nullptr)
+    {
+        m_giUniform.reflectionSize = glm::vec4{
+            static_cast<float>(m_gi[frameIndex].reflectionNoisy->GetWidth()),
+            static_cast<float>(m_gi[frameIndex].reflectionNoisy->GetHeight()),
+            0.0f,
+            0.0f};
+    }
 
     m_gi[frameIndex].uniformBuffer->Write(&m_giUniform, sizeof(GiUniform));
 
@@ -1672,7 +1722,7 @@ void DeferredRenderer::RecordGiPasses(rhi::CommandList& commandList, std::uint32
     commandList.Dispatch(groupsX, groupsY, 1);
     commandList.ShaderMemoryBarrier(rhi::ShaderStageMask::Compute, rhi::ShaderStageMask::Compute);
 
-    const bool skipTemporal = std::getenv("MRE_NOTEMPORAL") != nullptr;
+    const bool skipTemporal = std::dupenv("MRE_NOTEMPORAL") != nullptr;
     const bool skipAtrous = std::getenv("MRE_NOATROUS") != nullptr;
     const bool skipUpsample = std::getenv("MRE_NOUPSAMPLE") != nullptr;
 
@@ -3447,7 +3497,9 @@ void DeferredRenderer::RecordReflectionPasses(rhi::CommandList& commandList, std
     for (std::uint32_t iteration = 0; iteration < iterations; ++iteration)
     {
         commandList.BindDescriptorSet(0, *gi.reflectionAtrousSets[iteration]);
-        const GiAtrousPushConstants pushConstants{1, iteration};
+        // Signal 2 marks the reflection signal so the shared a-trous kernel uses the reflection
+        // trace resolution for its full-resolution G-buffer taps.
+        const GiAtrousPushConstants pushConstants{2, iteration};
         commandList.SetPushConstants(&pushConstants, sizeof(pushConstants), rhi::ShaderStageMask::Compute);
         commandList.Dispatch(groupsX, groupsY, 1);
         commandList.ShaderMemoryBarrier(rhi::ShaderStageMask::Compute, rhi::ShaderStageMask::Compute);

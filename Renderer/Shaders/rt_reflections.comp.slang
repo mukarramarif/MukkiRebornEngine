@@ -91,12 +91,12 @@ float3 RefractAroundMicrofacet(float3 incident, float3 halfVector, float ior, ou
 void computeMain(uint3 dispatchThreadId : SV_DispatchThreadID)
 {
     const int2 halfPixel = int2(dispatchThreadId.xy);
-    if (halfPixel.x >= int(gGi.halfSize.x) || halfPixel.y >= int(gGi.halfSize.y))
+    if (halfPixel.x >= int(gGi.reflectionSize.x) || halfPixel.y >= int(gGi.reflectionSize.y))
     {
         return;
     }
 
-    const float2 uv = (float2(halfPixel) + 0.5) / gGi.halfSize.xy;
+    const float2 uv = (float2(halfPixel) + 0.5) / gGi.reflectionSize.xy;
     const int2 fullPixel = clamp(int2(uv * gGi.screenSize.xy), int2(0, 0), int2(gGi.screenSize.xy) - 1);
 
     const float depth = gDepth.Load(int3(fullPixel, 0)).r;
@@ -132,14 +132,19 @@ void computeMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     const uint frame = uint(gGi.params.y);
     const uint sampleCount = uint(clamp(gGi.params6.z, 1.0, 8.0));
 
+    const float alpha = max(roughness * roughness, 1e-4);
+    const float nDotV = saturate(dot(normal, viewDirection));
+
     float3 radianceAccum = 0.0;
     float hitDistanceAccum = 0.0;
 
     for (uint sampleIndex = 0; sampleIndex < sampleCount; ++sampleIndex)
     {
         const uint sampleSeed = frame + sampleIndex * 4099u;
-        const float3 halfVector =
-            SampleGgxHalfVector(viewDirection, roughness, dispatchThreadId.xy, sampleSeed);
+        const float2 sampleUv = float2(
+            Hash01(dispatchThreadId.xy, sampleSeed, 317u),
+            Hash01(dispatchThreadId.xy, sampleSeed, 331u));
+        const float3 halfVector = SampleGgxVndf(normal, viewDirection, sampleUv, alpha);
         const float vDotH = saturate(dot(viewDirection, halfVector));
         const float3 fresnel = f0 + (1.0 - f0) * pow(1.0 - vDotH, 5.0);
         const float reflectProbability =
@@ -154,8 +159,10 @@ void computeMain(uint3 dispatchThreadId : SV_DispatchThreadID)
             if (pick < reflectProbability)
             {
                 const float3 direction = reflect(-viewDirection, halfVector);
+                const float nDotL = dot(normal, direction);
+                const float weight = nDotL > 0.0 ? SpecularVndfWeight(nDotV, nDotL, alpha) : 0.0;
                 radiance = TraceSpecularRay(origin, direction, dispatchThreadId.xy, sampleSeed, hitDistance);
-                radiance *= min(fresnel / max(reflectProbability, 1e-4), float3(4.0, 4.0, 4.0));
+                radiance *= min(fresnel / max(reflectProbability, 1e-4), float3(16.0, 16.0, 16.0)) * weight;
             }
             else
             {
@@ -206,16 +213,24 @@ void computeMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         else
         {
             const float3 direction = reflect(-viewDirection, halfVector);
-            radiance = TraceSpecularRay(origin, direction, dispatchThreadId.xy, sampleSeed, hitDistance);
-            radiance *= fresnel;
+            const float nDotL = dot(normal, direction);
+            if (nDotL > 0.0)
+            {
+                radiance = TraceSpecularRay(origin, direction, dispatchThreadId.xy, sampleSeed, hitDistance);
+                radiance *= fresnel * SpecularVndfWeight(nDotV, nDotL, alpha);
+            }
         }
 
         radianceAccum += radiance;
         hitDistanceAccum += hitDistance;
     }
 
+    // Fade out toward the roughness cutoff where the GI specular signal takes over; the two
+    // signals blend so the specular integral stays continuous.
+    const float reflectionWeight =
+        1.0 - smoothstep(gGi.params6.y * 0.75, gGi.params6.y, roughness);
     const float inverseSamples = 1.0 / float(sampleCount);
     gReflectionOut[halfPixel] =
-        float4(clamp(radianceAccum * inverseSamples, 0.0, kMaxGiRadiance), 1.0);
+        float4(clamp(radianceAccum * inverseSamples * reflectionWeight, 0.0, kMaxGiRadiance), 1.0);
     gHitDistanceOut[halfPixel] = hitDistanceAccum * inverseSamples;
 }

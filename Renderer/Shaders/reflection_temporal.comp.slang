@@ -15,6 +15,8 @@ struct GiUniform
     float4 params4; // x: sunShadowSamples, y: sunAngularRadius (radians), z: traceSamples, w: rtSunMask
     float4 params5; // x: probeRays, y: probeHysteresis, z: probeCount, w: reflectionResetHistory
     float4 params6; // x: reflectionMaxDistance, y: reflectionMaxRoughness, z: reflectionSamples, w: reflectionIntensity
+    float4 params7; // x: glassRefractionBounces, y: dispersionEnabled, z: volumeAbsorptionScale, w: unused
+    float4 reflectionSize; // x/y: reflection trace resolution
 };
 
 [[vk::binding(0, 0)]] ConstantBuffer<GiUniform> gGi;
@@ -73,13 +75,13 @@ bool ValidateHistory(float depth, float3 normal, float2 previousUv)
 void computeMain(uint3 dispatchThreadId : SV_DispatchThreadID)
 {
     const int2 halfPixel = int2(dispatchThreadId.xy);
-    if (halfPixel.x >= int(gGi.halfSize.x) || halfPixel.y >= int(gGi.halfSize.y))
+    if (halfPixel.x >= int(gGi.reflectionSize.x) || halfPixel.y >= int(gGi.reflectionSize.y))
     {
         return;
     }
 
-    const int2 halfMax = int2(gGi.halfSize.xy) - 1;
-    const float2 uv = (float2(halfPixel) + 0.5) / gGi.halfSize.xy;
+    const int2 halfMax = int2(gGi.reflectionSize.xy) - 1;
+    const float2 uv = (float2(halfPixel) + 0.5) / gGi.reflectionSize.xy;
     const int2 fullPixel = clamp(int2(uv * gGi.screenSize.xy), int2(0, 0), int2(gGi.screenSize.xy) - 1);
 
     const float depth = gDepth.Load(int3(fullPixel, 0)).r;
@@ -97,7 +99,7 @@ void computeMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         return;
     }
 
-    const float2 previousHalf = previousUv * gGi.halfSize.xy - 0.5;
+    const float2 previousHalf = previousUv * gGi.reflectionSize.xy - 0.5;
     const int2 historyPixel = clamp(int2(round(previousHalf)), int2(0, 0), halfMax);
     const float4 historySample = gReflectionHistory.Load(int3(historyPixel, 0));
     const float4 momentsSample = gReflectionMoments.Load(int3(historyPixel, 0));
