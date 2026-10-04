@@ -1,6 +1,7 @@
 #include "Renderer/Deferred/DeferredRenderer.h"
 
 #include "Assets/GltfLoader.h"
+#include "Assets/HdrLoader.h"
 #include "Core/JobSystem.h"
 #include "Renderer/GlobalIllumination/GiAtrousSchedule.h"
 #include "Renderer/RHI/Device.h"
@@ -53,6 +54,9 @@ constexpr Vertex kPlaneVertices[] = {
 constexpr std::uint32_t kPlaneIndices[] = {0, 1, 2, 0, 2, 3};
 
 constexpr std::uint32_t kWhitePixel = 0xFFFFFFFFu;
+
+// Split-sum BRDF integration LUT resolution (see BuildEnvironmentBrdfLut).
+constexpr std::uint32_t kBrdfLutSize = 64;
 
 rhi::AddressMode ToRhiAddressMode(GltfWrapMode mode)
 {
@@ -142,6 +146,31 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
         MRE_CRITICAL("Failed to create the default black texture");
         Shutdown();
         return false;
+    }
+
+    // Split-sum BRDF LUT for the image based specular term: r = scale, g = bias.
+    {
+        std::vector<float> brdfLutPixels{};
+        BuildEnvironmentBrdfLut(brdfLutPixels, kBrdfLutSize);
+        const rhi::TextureDesc brdfLutDesc{
+            kBrdfLutSize,
+            kBrdfLutSize,
+            rhi::Format::R32G32Sfloat,
+            rhi::TextureUsage::Sampled,
+            brdfLutPixels.data(),
+            brdfLutPixels.size() * sizeof(float)};
+        m_brdfLut = device.CreateTexture(brdfLutDesc);
+        rhi::SamplerDesc brdfLutSamplerDesc{};
+        brdfLutSamplerDesc.addressModeU = rhi::AddressMode::ClampToEdge;
+        brdfLutSamplerDesc.addressModeV = rhi::AddressMode::ClampToEdge;
+        m_brdfLutSampler = device.CreateSampler(brdfLutSamplerDesc);
+        if (m_brdfLut == nullptr || m_brdfLutSampler == nullptr)
+        {
+            MRE_CRITICAL("Failed to create the environment BRDF LUT");
+            Shutdown();
+            return false;
+        }
+        m_environmentSh = ComputeEnvironmentSh(m_environmentSettings);
     }
 
     if (!LoadShaders(device, desc.shaderDirectory))
@@ -389,6 +418,11 @@ void DeferredRenderer::Shutdown()
     m_bindlessSet.reset();
     m_whiteTexture.reset();
     m_blackTexture.reset();
+    m_brdfLut.reset();
+    m_brdfLutSampler.reset();
+    m_environmentMap.reset();
+    m_environmentMapBound = false;
+    m_loadedEnvironmentMapPath.clear();
     m_bindlessSamplers.clear();
     m_samplerCache.clear();
     m_gbufferSampler.reset();
@@ -648,6 +682,9 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
             createTextureFromImage(textureImageIndex(source.sheenColorTexture), rhi::Format::R8G8B8A8Srgb);
         material.sheenRoughnessTexture =
             createTextureFromImage(textureImageIndex(source.sheenRoughnessTexture), rhi::Format::R8G8B8A8Unorm);
+        // Emissive textures carry light, so they stay linear instead of sRGB.
+        material.emissiveTexture =
+            createTextureFromImage(textureImageIndex(source.emissiveTexture), rhi::Format::R8G8B8A8Unorm);
 
         if (material.baseColorTexture != nullptr)
         {
@@ -701,6 +738,13 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
                 0,
                 *material.sheenRoughnessTexture,
                 material.sheenRoughnessTexture->GetBindlessIndex());
+        }
+        if (material.emissiveTexture != nullptr)
+        {
+            m_bindlessSet->BindTexture(
+                0,
+                *material.emissiveTexture,
+                material.emissiveTexture->GetBindlessIndex());
         }
 
         resources->materials.push_back(std::move(material));
@@ -785,6 +829,9 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
             item.sheen = glm::vec4{0.0f, 0.0f, 0.0f, 0.0f};
             item.sheenTextureIndices = glm::uvec4{whiteIndex, whiteIndex, 0u, 0u};
             item.sheenSamplerIndices = glm::uvec4{defaultSamplerIndex, defaultSamplerIndex, 0u, 0u};
+            item.emissive = glm::vec4{0.0f};
+            item.emissiveTextureIndices = glm::uvec4{whiteIndex, 0u, 0u, 0u};
+            item.emissiveSamplerIndices = glm::uvec4{defaultSamplerIndex, 0u, 0u, 0u};
 
             if (primitive.materialIndex >= 0 &&
                 primitive.materialIndex < static_cast<int>(resources->materials.size()))
@@ -822,6 +869,11 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
                     material.sheenColorFactor.g,
                     material.sheenColorFactor.b,
                     material.sheenRoughnessFactor};
+                item.emissive = glm::vec4{
+                    material.emissiveFactor.r,
+                    material.emissiveFactor.g,
+                    material.emissiveFactor.b,
+                    0.0f};
 
                 const Material& gpuMaterial = resources->materials[static_cast<std::size_t>(primitive.materialIndex)];
                 if (gpuMaterial.baseColorTexture != nullptr)
@@ -923,6 +975,19 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
                     item.sheenSamplerIndices.y =
                         GetSamplerIndex(ToRhiAddressMode(texture.wrapS), ToRhiAddressMode(texture.wrapT));
                 }
+
+                if (gpuMaterial.emissiveTexture != nullptr)
+                {
+                    item.emissiveTextureIndices.x = gpuMaterial.emissiveTexture->GetBindlessIndex();
+                }
+                if (material.emissiveTexture >= 0 &&
+                    material.emissiveTexture < static_cast<int>(model.textures.size()))
+                {
+                    const GltfTexture& texture =
+                        model.textures[static_cast<std::size_t>(material.emissiveTexture)];
+                    item.emissiveSamplerIndices.x =
+                        GetSamplerIndex(ToRhiAddressMode(texture.wrapS), ToRhiAddressMode(texture.wrapT));
+                }
             }
             else
             {
@@ -950,6 +1015,10 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
             ++textureCount;
         }
         if (material.specularColorTexture != nullptr)
+        {
+            ++textureCount;
+        }
+        if (material.emissiveTexture != nullptr)
         {
             ++textureCount;
         }
@@ -1149,6 +1218,9 @@ void DeferredRenderer::UpdateObjectData(std::uint32_t frameIndex)
         objectData[index].sheen = item.sheen;
         objectData[index].sheenTextureIndices = item.sheenTextureIndices;
         objectData[index].sheenSamplerIndices = item.sheenSamplerIndices;
+        objectData[index].emissive = item.emissive;
+        objectData[index].emissiveTextureIndices = item.emissiveTextureIndices;
+        objectData[index].emissiveSamplerIndices = item.emissiveSamplerIndices;
         item.pushConstants.drawIndex = static_cast<std::uint32_t>(index);
         m_previousModels[index] = item.pushConstants.model;
         ++index;
@@ -1251,6 +1323,9 @@ void DeferredRenderer::BuildAccelerationStructures(rhi::CommandList& commandList
         geometry.sheen = item.sheen;
         geometry.sheenTextureIndices = item.sheenTextureIndices;
         geometry.sheenSamplerIndices = item.sheenSamplerIndices;
+        geometry.emissive = item.emissive;
+        geometry.emissiveTextureIndices = item.emissiveTextureIndices;
+        geometry.emissiveSamplerIndices = item.emissiveSamplerIndices;
         m_geometryData.push_back(geometry);
     };
 
@@ -1502,6 +1577,81 @@ void DeferredRenderer::SetReflectionSettings(const ReflectionSettings& settings)
     }
 }
 
+void DeferredRenderer::SetEnvironmentSettings(const EnvironmentSettings& settings)
+{
+    const bool mapChanged = settings.environmentMap != m_loadedEnvironmentMapPath;
+    m_environmentSettings = settings;
+    if (mapChanged)
+    {
+        ReloadEnvironmentMap();
+    }
+
+    // The map/colour SH is stored unscaled; fold the intensity in per update so the slider does not
+    // re-run the projection over the whole image.
+    EnvironmentSh base = m_environmentMapBound ? m_environmentMapShBase : EnvironmentSh{};
+    if (!m_environmentMapBound)
+    {
+        EnvironmentSettings gradient = m_environmentSettings;
+        gradient.intensity = 1.0f;
+        base = ComputeEnvironmentSh(gradient);
+    }
+
+    const float intensity = std::max(m_environmentSettings.intensity, 0.0f);
+    for (std::size_t band = 0; band < 9; ++band)
+    {
+        m_environmentSh.bands[band] = base.bands[band] * intensity;
+    }
+}
+
+void DeferredRenderer::ReloadEnvironmentMap()
+{
+    if (m_device != nullptr)
+    {
+        m_device->WaitIdle();
+    }
+
+    m_environmentMap.reset();
+    m_environmentMapBound = false;
+    m_environmentMapShBase = EnvironmentSh{};
+    m_loadedEnvironmentMapPath = m_environmentSettings.environmentMap;
+
+    const std::filesystem::path& path = m_environmentSettings.environmentMap;
+    if (path.empty())
+    {
+        return;
+    }
+
+    HdrImage image{};
+    if (!LoadHdrImage(path, image))
+    {
+        MRE_WARN("Falling back to the gradient sky; '{}' could not be loaded", PathToUtf8(path));
+        return;
+    }
+
+    const std::vector<std::uint16_t> packed = PackHdrToRgba16(image);
+    const rhi::TextureDesc textureDesc{
+        image.width,
+        image.height,
+        rhi::Format::R16G16B16A16Sfloat,
+        rhi::TextureUsage::Sampled,
+        packed.data(),
+        packed.size() * sizeof(std::uint16_t)};
+    m_environmentMap = m_device->CreateTexture(textureDesc);
+    if (m_environmentMap == nullptr)
+    {
+        MRE_WARN("Falling back to the gradient sky; the environment texture could not be created");
+        return;
+    }
+
+    m_environmentMapIndex = m_environmentMap->GetBindlessIndex();
+    m_bindlessSet->BindTexture(0, *m_environmentMap, m_environmentMapIndex);
+    m_environmentMapSamplerIndex =
+        GetSamplerIndex(rhi::AddressMode::ClampToEdge, rhi::AddressMode::ClampToEdge);
+    m_environmentMapShBase =
+        ComputeEnvironmentSh(image.pixels.data(), image.width, image.height, 1.0f);
+    m_environmentMapBound = true;
+}
+
 bool DeferredRenderer::IsReflectionActive() const
 {
     return m_reflectionSettings.enabled && m_device != nullptr &&
@@ -1593,6 +1743,23 @@ void DeferredRenderer::UpdateGiUniform(std::uint32_t frameIndex, const FrameView
         static_cast<float>(m_giLights.size()),
         m_giSettings.pointLightShadows ? 1.0f : 0.0f,
         std::max(m_giSettings.pointLightShadowBias, 0.0f),
+        0.0f};
+    for (std::size_t band = 0; band < 9; ++band)
+    {
+        m_giUniform.skySh[band] = m_environmentSh.bands[band];
+    }
+    m_giUniform.skyParams = glm::vec4{
+        m_environmentSettings.enabled ? 1.0f : 0.0f,
+        m_environmentSettings.intensity,
+        m_environmentSettings.sunDiscIntensity,
+        0.0f};
+    m_giUniform.skyZenith = glm::vec4{m_environmentSettings.zenithColor, 0.0f};
+    m_giUniform.skyHorizon = glm::vec4{m_environmentSettings.horizonColor, 0.0f};
+    m_giUniform.skyGround = glm::vec4{m_environmentSettings.groundColor, 0.0f};
+    m_giUniform.skyMap = glm::vec4{
+        static_cast<float>(m_environmentMapIndex),
+        static_cast<float>(m_environmentMapSamplerIndex),
+        m_environmentMapBound ? 1.0f : 0.0f,
         0.0f};
     if (!m_giLights.empty() && frameIndex < m_giLightBuffers.size() &&
         m_giLightBuffers[frameIndex] != nullptr)
@@ -2058,6 +2225,7 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
         true);
     commandList.BindPipeline(*m_lightingPipeline);
     commandList.BindDescriptorSet(0, *m_lightingSets[frameIndex]);
+    commandList.BindDescriptorSet(1, *m_bindlessSet);
     commandList.Draw(3);
 
     if (!transparentItems.empty())
@@ -2562,10 +2730,10 @@ bool DeferredRenderer::CreatePipelines(rhi::Device& device)
     gbufferPipelineDesc.colorFormats = {
         rhi::Format::R8G8B8A8Unorm,
         rhi::Format::R8G8B8A8Unorm,
-        rhi::Format::R16G16B16A16Sfloat,
-        rhi::Format::R16G16Sfloat,
-        rhi::Format::R8G8B8A8Unorm,
-        rhi::Format::R16G16B16A16Sfloat,
+    rhi::Format::R16G16B16A16Sfloat,
+    rhi::Format::R16G16B16A16Sfloat,
+    rhi::Format::R8G8B8A8Unorm,
+    rhi::Format::R16G16B16A16Sfloat,
         rhi::Format::R8G8B8A8Unorm,
         rhi::Format::R8G8B8A8Unorm};
     gbufferPipelineDesc.depthFormat = rhi::Format::D32Sfloat;
@@ -2596,7 +2764,8 @@ bool DeferredRenderer::CreatePipelines(rhi::Device& device)
     lightingPipelineDesc.depthWrite = false;
     lightingPipelineDesc.blend = false;
     lightingPipelineDesc.cullMode = rhi::CullMode::None;
-    lightingPipelineDesc.descriptorSetLayouts = {m_lightingSetLayout.get()};
+    // Set 1 is the bindless material set used for the emissive texture lookup.
+    lightingPipelineDesc.descriptorSetLayouts = {m_lightingSetLayout.get(), m_bindlessSetLayout.get()};
     lightingPipelineDesc.colorFormats = {device.GetSwapchainInfo().format};
     // The swapchain scope attaches the G-buffer depth for the transparent pass; pipelines drawn in
     // that scope must declare the matching depth format even when depth testing is disabled.
@@ -2738,6 +2907,9 @@ bool DeferredRenderer::CreateScene()
     ground.sheen = glm::vec4{0.0f};
     ground.sheenTextureIndices = glm::uvec4{whiteIndex, whiteIndex, 0u, 0u};
     ground.sheenSamplerIndices = glm::uvec4{defaultSamplerIndex, defaultSamplerIndex, 0u, 0u};
+    ground.emissive = glm::vec4{0.0f};
+    ground.emissiveTextureIndices = glm::uvec4{whiteIndex, 0u, 0u, 0u};
+    ground.emissiveSamplerIndices = glm::uvec4{defaultSamplerIndex, 0u, 0u, 0u};
     ground.vertexBufferIndex = m_nextBindlessBuffer++;
     ground.indexBufferIndex = m_nextBindlessBuffer++;
     m_bindlessSet->BindStorageBuffer(2, *m_planeVertexBuffer, ground.vertexBufferIndex);
@@ -2805,6 +2977,10 @@ void DeferredRenderer::CreateLightingSets(rhi::Device& device)
         lightingSet->BindTexture(16, m_gbuffer.GetSpecularF0(), 0u);
         lightingSet->BindTexture(17, m_gbuffer.GetTransmission(), 0u);
         lightingSet->BindTexture(18, m_gbuffer.GetSheen(), 0u);
+        lightingSet->BindBuffer(19, *m_objectDataBuffers[frame]);
+        lightingSet->BindTexture(20, m_gbuffer.GetMotion(), 0u);
+        lightingSet->BindTexture(21, *m_brdfLut, 0u);
+        lightingSet->BindSampler(22, *m_brdfLutSampler);
         m_lightingSets.push_back(std::move(lightingSet));
     }
 }
@@ -3059,7 +3235,25 @@ void DeferredRenderer::UpdateUniforms(std::uint32_t frameIndex, const FrameView&
     m_sceneUniform.viewProjection = view.viewProjection;
     m_sceneUniform.previousViewProjection = view.previousViewProjection;
     m_sceneUniform.view = view.view;
+    m_sceneUniform.inverseViewProjection = glm::inverse(view.viewProjection);
     m_sceneUniform.cameraPosition = glm::vec4{view.position, 1.0f};
+    for (std::size_t band = 0; band < 9; ++band)
+    {
+        m_sceneUniform.skySh[band] = m_environmentSh.bands[band];
+    }
+    m_sceneUniform.skyParams = glm::vec4{
+        m_environmentSettings.enabled ? 1.0f : 0.0f,
+        m_environmentSettings.intensity,
+        m_environmentSettings.sunDiscIntensity,
+        0.0f};
+    m_sceneUniform.skyZenith = glm::vec4{m_environmentSettings.zenithColor, 0.0f};
+    m_sceneUniform.skyHorizon = glm::vec4{m_environmentSettings.horizonColor, 0.0f};
+    m_sceneUniform.skyGround = glm::vec4{m_environmentSettings.groundColor, 0.0f};
+    m_sceneUniform.skyMap = glm::vec4{
+        static_cast<float>(m_environmentMapIndex),
+        static_cast<float>(m_environmentMapSamplerIndex),
+        m_environmentMapBound ? 1.0f : 0.0f,
+        0.0f};
     m_sceneUniform.clusterParams = glm::vec4{
         view.nearPlane,
         view.farPlane,

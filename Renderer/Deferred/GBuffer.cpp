@@ -83,10 +83,12 @@ bool GBuffer::CreateTextures(rhi::Device& device)
         m_height,
         rhi::Format::D32Sfloat,
         rhi::TextureUsage::DepthAttachment};
+    // Motion.zw carries the object UV so the lighting pass can sample emissive textures with real
+    // coordinates; position.w carries the object index + 1.
     const rhi::TextureDesc motionDesc{
         m_width,
         m_height,
-        rhi::Format::R16G16Sfloat,
+        rhi::Format::R16G16B16A16Sfloat,
         rhi::TextureUsage::ColorAttachment};
     const rhi::TextureDesc specularF0Desc{
         m_width,

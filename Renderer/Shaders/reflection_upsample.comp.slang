@@ -18,6 +18,12 @@ struct GiUniform
     float4 params7;
     float4 params8;
     float4 reflectionSize; // x/y: reflection trace resolution
+    float4 skySh[9];
+    float4 skyParams;
+    float4 skyZenith;
+    float4 skyHorizon;
+    float4 skyGround;
+    float4 skyMap;
 };
 
 [[vk::binding(0, 0)]] ConstantBuffer<GiUniform> gGi;

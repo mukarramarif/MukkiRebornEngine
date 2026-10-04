@@ -22,6 +22,7 @@
 #include "Renderer/FrameView.h"
 #include "Renderer/GlobalIllumination/GiTypes.h"
 #include "Renderer/Lighting/ClusterGrid.h"
+#include "Renderer/Lighting/Environment.h"
 #include "Renderer/Lighting/Light.h"
 #include "Renderer/Lighting/ShadowCascade.h"
 #include "Renderer/RHI/CommandList.h"
@@ -38,6 +39,7 @@ struct SceneUniform
     glm::mat4 viewProjection{1.0f};
     glm::mat4 previousViewProjection{1.0f};
     glm::mat4 view{1.0f};
+    glm::mat4 inverseViewProjection{1.0f};
     glm::vec4 cameraPosition{0.0f};
     glm::vec4 ambientColor{0.0f};
     glm::vec4 clusterParams{0.0f}; // x: near, y: far, z: tile size, w: z slice count
@@ -46,6 +48,12 @@ struct SceneUniform
     glm::vec4 reflectionParams{0.0f}; // x: ray traced reflection intensity (0 disables)
     glm::vec4 sunDirection{0.0f, -1.0f, 0.0f, 0.0f}; // xyz: direction toward the sun
     glm::vec4 sunColor{0.0f};      // rgb: color * intensity, used by the transparent pass
+    glm::vec4 skySh[9]{};          // environment irradiance / pi SH L2
+    glm::vec4 skyParams{0.0f};     // x: enabled, y: intensity, z: sun disc, w: unused
+    glm::vec4 skyZenith{0.0f};
+    glm::vec4 skyHorizon{0.0f};
+    glm::vec4 skyGround{0.0f};
+    glm::vec4 skyMap{0.0f};        // x: bindless index, y: sampler index, z: has map, w: unused
 };
 
 struct ClusterUniform
@@ -82,6 +90,9 @@ struct GpuObjectData
     glm::vec4 sheen{0.0f};              // rgb: sheenColorFactor, a: sheenRoughnessFactor
     glm::uvec4 sheenTextureIndices{0u}; // x: sheenColorTexture, y: sheenRoughnessTexture
     glm::uvec4 sheenSamplerIndices{0u}; // x: sheen color sampler, y: sheen roughness sampler
+    glm::vec4 emissive{0.0f};           // rgb: emissiveFactor (incl. strength)
+    glm::uvec4 emissiveTextureIndices{0u}; // x: emissiveTexture
+    glm::uvec4 emissiveSamplerIndices{0u}; // x: emissive sampler
 };
 
 class DeferredRenderer
@@ -153,6 +164,14 @@ public:
         return m_reflectionSettings;
     }
 
+    // Image based lighting environment (procedural sky). The SH coefficients and the BRDF LUT are
+    // rebuilt on change.
+    void SetEnvironmentSettings(const EnvironmentSettings& settings);
+    [[nodiscard]] const EnvironmentSettings& GetEnvironmentSettings() const
+    {
+        return m_environmentSettings;
+    }
+
     bool LoadModel(const std::filesystem::path& path);
     void RequestModelLoad(const std::filesystem::path& path);
     bool PollModelLoad();
@@ -201,6 +220,10 @@ private:
         glm::vec4 sheen{0.0f};
         glm::uvec4 sheenTextureIndices{0u};
         glm::uvec4 sheenSamplerIndices{0u};
+        // Emissive: rgb = emissiveFactor (scaled by emissive strength), a = 1 when any emissive.
+        glm::vec4 emissive{0.0f};
+        glm::uvec4 emissiveTextureIndices{0u};
+        glm::uvec4 emissiveSamplerIndices{0u};
     };
 
     // Per draw item data read by ray traced effects (global illumination color bleeding).
@@ -218,6 +241,9 @@ private:
         glm::vec4 sheen{0.0f};               // rgb: sheenColorFactor, a: sheenRoughnessFactor
         glm::uvec4 sheenTextureIndices{0u};  // x: sheenColorTexture, y: sheenRoughnessTexture
         glm::uvec4 sheenSamplerIndices{0u};
+        glm::vec4 emissive{0.0f};             // rgb: emissiveFactor (incl. strength), a: unused
+        glm::uvec4 emissiveTextureIndices{0u}; // x: emissiveTexture
+        glm::uvec4 emissiveSamplerIndices{0u}; // x: emissive sampler
     };
 
     inline static constexpr std::uint32_t kMaxObjectData = 2048;
@@ -232,6 +258,7 @@ private:
         std::unique_ptr<rhi::Texture> thicknessTexture{};
         std::unique_ptr<rhi::Texture> sheenColorTexture{};
         std::unique_ptr<rhi::Texture> sheenRoughnessTexture{};
+        std::unique_ptr<rhi::Texture> emissiveTexture{};
     };
 
     struct SceneObjectBounds
@@ -375,6 +402,7 @@ private:
     bool CreateGiResources(rhi::Device& device);
     void UpdateGiUniform(std::uint32_t frameIndex, const FrameView& view);
     void BindGiDescriptors(std::uint32_t frameIndex);
+    void ReloadEnvironmentMap();
     void RecordGiPasses(rhi::CommandList& commandList, std::uint32_t frameIndex);
     bool CreateRtShadowResources(rhi::Device& device);
     void UpdateRtShadowUniform(std::uint32_t frameIndex);
@@ -476,6 +504,16 @@ private:
     GiUniform m_giUniform{};
     GiSettings m_giSettings{};
     ReflectionSettings m_reflectionSettings{};
+    EnvironmentSettings m_environmentSettings{};
+    EnvironmentSh m_environmentSh{};
+    EnvironmentSh m_environmentMapShBase{};
+    std::unique_ptr<rhi::Texture> m_environmentMap{};
+    std::filesystem::path m_loadedEnvironmentMapPath{};
+    std::uint32_t m_environmentMapIndex = 0;
+    std::uint32_t m_environmentMapSamplerIndex = 0;
+    bool m_environmentMapBound = false;
+    std::unique_ptr<rhi::Texture> m_brdfLut{};
+    std::unique_ptr<rhi::Sampler> m_brdfLutSampler{};
     std::uint32_t m_giFrameCounter = 0;
     std::unique_ptr<rhi::Texture> m_blackTexture{};
     std::unique_ptr<rhi::DescriptorSetLayout> m_reflectionTraceSetLayout{};

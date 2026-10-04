@@ -81,7 +81,7 @@ void computeMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         diffuseQuery.TraceRayInline(gTlas, RAY_FLAG_NONE, 0xFF, diffuseRay);
         diffuseQuery.Proceed();
 
-        float3 diffuseRadiance = gGi.skyColor.rgb * gGi.skyColor.w;
+        float3 diffuseRadiance = GiSkyRadiance(diffuseDirection);
         float diffuseHitDistance = gGi.params.x;
         if (diffuseQuery.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
         {
@@ -119,7 +119,7 @@ void computeMain(uint3 dispatchThreadId : SV_DispatchThreadID)
             specularQuery.TraceRayInline(gTlas, RAY_FLAG_NONE, 0xFF, specularRay);
             specularQuery.Proceed();
 
-            float3 specularRadiance = gGi.skyColor.rgb * gGi.skyColor.w;
+            float3 specularRadiance = GiSkyRadiance(specularDirection);
             if (specularQuery.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
             {
                 specularRadiance = ShadeHit(

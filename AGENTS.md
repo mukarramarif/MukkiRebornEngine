@@ -36,7 +36,11 @@ must not expose backend types, and Vulkan types may only appear under `Renderer/
   through the bindless base color texture (the shadow pipeline binds the bindless set as set 1 and
   uses explicit vertex attribute offsets for position/uv). Ray traced hit shading also honours
   coverage: MASK hits below the cutoff are skipped and BLEND hits are stochastically accepted
-  (`GpuGeometryData.params.z` = alpha mode 0/1/2, `.w` = cutoff).
+  (`GpuGeometryData.params.z` = alpha mode 0/1/2, `.w` = cutoff). Emissive is supported
+  (`emissiveFactor` scaled by `KHR_materials_emissive_strength` + `emissiveTexture`): the G-buffer
+  stores the object index + 1 in `position.w` and the object UV in `motion.zw`, the lighting pass
+  fetches `GpuObjectData` for the factor and samples the emissive texture, the transparent pass
+  reads it through `gObjects`, and ray traced hit shading adds `GpuGeometryData.emissive`.
   `KHR_materials_specular` is supported: factor/color and the extension textures travel through the
   extended `GpuObjectData` SSBO (read by the G-buffer fragment), and the dielectric F0 is baked into
   the fifth G-buffer target (`GBuffer::GetSpecularF0`, 0.04 default); lighting and reflections use
@@ -102,6 +106,22 @@ must not expose backend types, and Vulkan types may only appear under `Renderer/
   `reflectionSize`), and `reflection_upsample.comp.slang` bilaterally upsamples to full res
   (roughness-aware). The lighting pass adds binding 15 scaled by `SceneUniform.reflectionParams.x`.
   `GiUniform.params6` carries the reflection parameters and `params5.w` the history reset flag.
+- Image based lighting: `Renderer/Lighting/Environment.h/.cpp` defines a parametric gradient sky
+  (`EnvironmentSettings`); `ComputeEnvironmentSh` numerically projects it onto SH L2 with the
+  Lambert band factors folded in (diffuse = `albedo * EvaluateSkySh`), and `BuildEnvironmentBrdfLut`
+  generates the split-sum LUT (bound at lighting set 0 binding 21/22). `sky.slang` holds the shared
+  evaluation (`SkyRadiance`, `EvaluateSkySh`, `PrefilteredSky`, `SkyBackground`) used by
+  `lighting.frag` (sky background, SH ambient, prefiltered specular) and by the GI/reflection/probe
+  sky misses through `GiSkyRadiance`/`GiIrradianceOverPi`. `SceneUniform`/`GiUniform` carry
+  `skySh[9]`, `skyParams`, the zenith/horizon/ground colors and `skyMap` (bindless index, sampler,
+  has-map). Disabling the environment falls back to the flat `ambientColor`/`skyColor`.
+  Radiance `.hdr` equirectangular maps (`Assets/HdrLoader.h/.cpp`: flat + RLE RGBE decoding, RGBE
+  to half-float packing, `PackHdrToRgba16`) replace the gradient when
+  `EnvironmentSettings::environmentMap` is set (UI `HDR map (.hdr)` / `--env <path>`): the map is
+  uploaded as an `R16G16B16A16Sfloat` texture in the bindless set, its SH is projected by
+  `ComputeEnvironmentSh(equirectRgb, ...)` and the shaders sample it through
+  `EnvironmentRadiance`/`EnvironmentPrefiltered`/`EnvironmentBackground` (equirect convention
+  `u = atan2(z,x)/2pi + 0.5`, `v = acos(y)/pi`, matching the CPU projection).
 - GI probes: world space `SceneDescription::probes` become irradiance probes. When probes are
   active (`GiSettings.useProbes`, requires ray tracing) `gi_probes.comp.slang` traces `probeRays`
   uniform-sphere rays per probe through the shared hit shading in `gi_shading.slang`, accumulates

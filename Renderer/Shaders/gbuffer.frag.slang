@@ -37,6 +37,9 @@ struct GpuObjectData
     float4 sheen;                  // rgb: sheenColorFactor, a: sheenRoughnessFactor
     uint4 sheenTextureIndices;     // x: sheenColorTexture, y: sheenRoughnessTexture
     uint4 sheenSamplerIndices;
+    float4 emissive;               // rgb: emissiveFactor (incl. strength)
+    uint4 emissiveTextureIndices;  // x: emissiveTexture
+    uint4 emissiveSamplerIndices;  // x: emissive sampler
 };
 
 [[vk::push_constant]] ConstantBuffer<ObjectPushConstants> gObject;
@@ -58,8 +61,8 @@ struct GBufferOutput
 {
     [[vk::location(0)]] float4 albedo : SV_Target0;
     [[vk::location(1)]] float4 normal : SV_Target1;
-    [[vk::location(2)]] float4 position : SV_Target2;
-    [[vk::location(3)]] float2 motion : SV_Target3;
+    [[vk::location(2)]] float4 position : SV_Target2; // w: object index + 1 (0 = sky)
+    [[vk::location(3)]] float4 motion : SV_Target3;   // xy: motion, zw: object UV
     [[vk::location(4)]] float4 specularF0 : SV_Target4;
     [[vk::location(5)]] float4 transmission : SV_Target5;
     [[vk::location(6)]] float4 attenuation : SV_Target6;
@@ -97,8 +100,11 @@ GBufferOutput fragmentMain(VertexOutput input)
     GBufferOutput output;
     output.albedo = float4(baseColorSample.rgb * gObject.baseColorFactor.rgb, gObject.params.y * metalRoughness.b);
     output.normal = float4(normalize(input.normal) * 0.5 + 0.5, gObject.params.x * metalRoughness.g);
-    output.position = float4(input.worldPosition, 1.0);
-    output.motion = input.position.xy - previousPixel;
+    // position.w carries the object index + 1 so the lighting pass can fetch per-object material data
+    // (0 marks sky, matching the previous validity flag test). motion.zw carries the object UV so
+    // the lighting pass can sample the emissive texture with real texture coordinates.
+    output.position = float4(input.worldPosition, float(gObject.drawIndex + 1u));
+    output.motion = float4(input.position.xy - previousPixel, input.uv);
 
     // KHR_materials_specular: store the dielectric F0 so the lighting and reflection passes do not
     // need the material data. Missing textures fall back to white and produce the 0.04 default.

@@ -228,12 +228,11 @@ std::unique_ptr<rhi::Texture> VkResourceAllocator::CreateTexture(const rhi::Text
     if (hasData)
     {
         MRE_ASSERT(desc.usage == rhi::TextureUsage::Sampled, "Initial data is only supported for sampled textures");
+        // The copy uses tightly packed rows, so any format works as long as the data fills whole
+        // pixels.
         MRE_ASSERT(
-            desc.format == rhi::Format::R8G8B8A8Unorm || desc.format == rhi::Format::R8G8B8A8Srgb,
-            "Initial data requires an R8G8B8A8 format");
-        MRE_ASSERT(
-            desc.initialDataSize == static_cast<std::uint64_t>(desc.width) * desc.height * 4,
-            "Initial data size must match width * height * 4");
+            desc.initialDataSize % (static_cast<std::uint64_t>(desc.width) * desc.height) == 0,
+            "Initial data size must be a whole number of pixels");
     }
 
     vk::ImageUsageFlags usage = ToVkTextureUsage(desc.usage);

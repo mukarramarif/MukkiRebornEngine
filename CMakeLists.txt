@@ -104,6 +104,7 @@ add_library(mukki_engine STATIC
     Application/Window.cpp
     Assets/AsyncGltfLoader.cpp
     Assets/GltfLoader.cpp
+    Assets/HdrLoader.cpp
     Core/Engine.cpp
     Core/JobSystem.cpp
     Core/Time.cpp
@@ -112,9 +113,10 @@ add_library(mukki_engine STATIC
     Renderer/Deferred/DeferredRenderer.cpp
     Renderer/Deferred/GBuffer.cpp
     Renderer/GlobalIllumination/GiAtrousSchedule.cpp
-    Renderer/Lighting/ClusterGrid.cpp
-    Renderer/Lighting/Light.cpp
-    Renderer/Lighting/ShadowCascade.cpp
+Renderer/Lighting/ClusterGrid.cpp
+Renderer/Lighting/Environment.cpp
+Renderer/Lighting/Light.cpp
+Renderer/Lighting/ShadowCascade.cpp
     Renderer/RHI/Resources.cpp
     Scene/SceneBinary.cpp
     Scene/SceneDescription.cpp
@@ -186,6 +188,11 @@ if(MRE_BUILD_SANDBOX)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/Sandbox/Scenes")
         target_compile_definitions(mukki_sandbox PRIVATE
             MRE_SCENES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/Sandbox/Scenes")
+    endif()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/AssetLibrary")
+        target_compile_definitions(mukki_sandbox PRIVATE
+            MRE_ASSET_LIBRARY_DIR="${CMAKE_CURRENT_SOURCE_DIR}/AssetLibrary")
     endif()
 
     mre_add_slang_shaders(mukki_sandbox

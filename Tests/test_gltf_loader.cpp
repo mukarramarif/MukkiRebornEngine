@@ -113,6 +113,50 @@ TEST(GltfLoader, ParsesAlphaBlendMaterials)
     EXPECT_TRUE(hasBlend);
 }
 
+TEST(GltfLoader, ParsesEmissiveMaterials)
+{
+    const std::filesystem::path modelPath = SampleModelsRoot() / "Lantern/glTF/Lantern.gltf";
+    if (!std::filesystem::exists(modelPath))
+    {
+        GTEST_SKIP() << "glTF sample models submodule is not initialized";
+    }
+
+    mukki::GltfModel model{};
+    ASSERT_TRUE(mukki::LoadGltfModel(modelPath, model));
+
+    const bool hasEmissive = std::any_of(
+        model.materials.begin(),
+        model.materials.end(),
+        [](const mukki::GltfMaterial& material) { return material.emissiveTexture >= 0; });
+    EXPECT_TRUE(hasEmissive);
+
+    for (const mukki::GltfMaterial& material : model.materials)
+    {
+        EXPECT_GE(material.emissiveFactor.r, 0.0f);
+        EXPECT_GE(material.emissiveFactor.g, 0.0f);
+        EXPECT_GE(material.emissiveFactor.b, 0.0f);
+    }
+}
+
+TEST(GltfLoader, AppliesEmissiveStrength)
+{
+    const std::filesystem::path modelPath =
+        SampleModelsRoot() / "EmissiveStrengthTest/glTF/EmissiveStrengthTest.gltf";
+    if (!std::filesystem::exists(modelPath))
+    {
+        GTEST_SKIP() << "glTF sample models submodule is not initialized";
+    }
+
+    mukki::GltfModel model{};
+    ASSERT_TRUE(mukki::LoadGltfModel(modelPath, model));
+    ASSERT_FALSE(model.materials.empty());
+
+    // The first material scales (0.1, 0.5, 0.9) by an emissive strength of 4.
+    EXPECT_NEAR(model.materials[0].emissiveFactor.r, 0.4f, 1e-4f);
+    EXPECT_NEAR(model.materials[0].emissiveFactor.g, 2.0f, 1e-4f);
+    EXPECT_NEAR(model.materials[0].emissiveFactor.b, 3.6f, 1e-4f);
+}
+
 TEST(GltfLoader, ParsesSheenMaterials)
 {
     const std::filesystem::path modelPath =

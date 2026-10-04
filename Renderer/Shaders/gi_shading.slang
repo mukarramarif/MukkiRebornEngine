@@ -4,6 +4,36 @@
 
 #include "brdf.slang"
 #include "sheen_brdf.slang"
+#include "sky.slang"
+
+// Environment-aware sky radiance for rays that miss the scene (loaded equirect map or gradient).
+// Falls back to the flat sky color when image based lighting is disabled.
+float3 GiSkyRadiance(float3 direction)
+{
+    if (gGi.skyParams.x > 0.5)
+    {
+        return EnvironmentRadiance(
+            direction,
+            gGi.skyZenith.rgb,
+            gGi.skyHorizon.rgb,
+            gGi.skyGround.rgb,
+            gGi.skyParams.y,
+            uint(gGi.skyMap.x + 0.5),
+            uint(gGi.skyMap.y + 0.5),
+            gGi.skyMap.z > 0.5);
+    }
+    return gGi.skyColor.rgb * gGi.skyColor.w;
+}
+
+// Diffuse irradiance / pi from the environment SH (or the flat ambient fallback).
+float3 GiIrradianceOverPi(float3 normal)
+{
+    if (gGi.skyParams.x > 0.5)
+    {
+        return EvaluateSkySh(gGi.skySh, normal);
+    }
+    return gGi.skyColor.rgb * gGi.skyColor.w;
+}
 
 float LoadFloat(ByteAddressBuffer buffer, uint byteOffset)
 {
@@ -214,6 +244,7 @@ struct SurfaceSample
     float attenuationDistance;
     float3 sheenColor;
     float sheenRoughness;
+    float3 emissive;
 };
 
 SurfaceSample LoadSurface(
@@ -270,6 +301,11 @@ SurfaceSample LoadSurface(
             gSamplers[NonUniformResourceIndex(geometry.sheenSamplerIndices.y)],
             uv,
             0.0).a;
+    const float3 emissiveSample =
+        gTextures[NonUniformResourceIndex(geometry.emissiveTextureIndices.x)].SampleLevel(
+            gSamplers[NonUniformResourceIndex(geometry.emissiveSamplerIndices.x)],
+            uv,
+            0.0).rgb;
 
     SurfaceSample surface;
     surface.position = rayOrigin + rayDirection * hitDistance;
@@ -292,6 +328,7 @@ SurfaceSample LoadSurface(
     surface.attenuationDistance = geometry.attenuation.a;
     surface.sheenColor = geometry.sheen.rgb * sheenColorSample;
     surface.sheenRoughness = saturate(geometry.sheen.a * sheenRoughnessSample);
+    surface.emissive = geometry.emissive.rgb * emissiveSample;
     return surface;
 }
 
@@ -375,8 +412,9 @@ float3 ShadeOpaqueSurface(
     const bool sunActive =
         gGi.params3.z > 0.5 && gGi.sunDirectionIntensity.w > 0.0 && sunNdotL > 0.0;
 
-    // Sky/ambient stays diffuse; direct lights are shaded with the full BRDF.
-    float3 radiance = surface.baseColor * (gGi.skyColor.rgb * gGi.skyColor.w);
+    // Sky/ambient stays diffuse; direct lights are shaded with the full BRDF. Emissive surfaces
+    // add their emitted radiance regardless of lighting.
+    float3 radiance = surface.baseColor * GiIrradianceOverPi(normal) + surface.emissive;
 
     if (sunActive)
     {
@@ -575,7 +613,7 @@ float3 TraceHitPath(
     {
         if (!hasHit)
         {
-            radiance += throughput * (gGi.skyColor.rgb * gGi.skyColor.w);
+            radiance += throughput * GiSkyRadiance(direction);
             break;
         }
 

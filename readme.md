@@ -100,8 +100,10 @@ copied next to the executable automatically.
 ```
 
 Pass `--frames N` to run a fixed number of frames and exit (used for smoke testing). Pass
-`--model <path>` to load a specific glTF/GLB file instead of the default scene, or `--scene <path>`
-to load a JSON scene (compiled to bytecode next to the executable, see [Scenes](#scenes)).
+`--model <path>` to load a specific glTF/GLB file instead of the default scene, `--scene <path>`
+to load a JSON scene (compiled to bytecode next to the executable, see [Scenes](#scenes)), or
+`--env <path>` to use a Radiance `.hdr` equirectangular environment map for the image based
+lighting (a sample lives in `AssetLibrary/lakeside_sunrise_2k.hdr`).
 
 Controls: `WASD`/`QE` to move, mouse to look, `Shift` to move faster, `Tab` to toggle the cursor for
 UI interaction (or hold `Left Alt`), `Esc` to quit.
@@ -341,6 +343,16 @@ clustered lights:
   Cook-Torrance BRDF (`GI light count` caps them at `kMaxGiLights`) and one ray traced shadow ray
   per light, so lamps bleed their color into indirect lighting, probes and reflections consistently
   with the analytic lighting pass.
+- **Emissive materials**: glTF `emissiveFactor` (scaled by `KHR_materials_emissive_strength`) and
+  `emissiveTexture` are lit into the HDR image before tonemapping, in the transparent forward pass,
+  and in ray traced hits (so emissive surfaces glow in GI and reflections).
+- **Image based lighting**: the `Environment (IBL)` controls drive a parametric gradient sky that
+  provides diffuse SH irradiance, prefiltered specular reflections (split-sum with a BRDF LUT), the
+  visible sky background (with a sun disc) and the sky term of the GI/reflection/probe rays.
+  A Radiance `.hdr` equirectangular map can replace the gradient (`HDR map` dropdown listing the
+  maps found in `AssetLibrary/`, or `--env <path>`); the SH coefficients are re-projected from the
+  image on load. Controls: `Image based lighting`, `Sky intensity`, `HDR map`,
+  `Sky zenith`/`horizon`/`ground`, `Sun disc`. Without IBL the flat ambient term is used.
 - **GI probes**: world space probes added from the `Probes` section (independent of the glTF objects)
   feed the irradiance probe pass. `gi_probes.comp.slang`
   traces `Probe rays` uniform-sphere rays per probe with the same hit shading as the path tracer,

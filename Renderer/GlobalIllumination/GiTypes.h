@@ -82,6 +82,12 @@ struct GiUniform
     glm::vec4 params7{0.0f}; // x: glassRefractionBounces, y: dispersionEnabled, z: volumeAbsorptionScale, w: unused
     glm::vec4 params8{0.0f}; // x: giLightCount, y: giLightShadows, z: giLightShadowBias, w: unused
     glm::vec4 reflectionSize{0.0f}; // x/y: reflection trace resolution
+    glm::vec4 skySh[9]{};       // irradiance / pi SH L2 of the environment
+    glm::vec4 skyParams{0.0f};  // x: environment enabled, y: intensity, z: sun disc, w: unused
+    glm::vec4 skyZenith{0.0f};
+    glm::vec4 skyHorizon{0.0f};
+    glm::vec4 skyGround{0.0f};
+    glm::vec4 skyMap{0.0f};     // x: bindless index, y: sampler index, z: has map, w: unused
 };
 
 // CPU-side world space GI probe. The radius only controls the debug marker size.

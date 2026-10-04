@@ -558,6 +558,24 @@ bool LoadGltfModel(const std::filesystem::path& path, GltfModel& model)
             converted.sheenRoughnessTexture = readTextureIndex(*sheen, "sheenRoughnessTexture");
         }
 
+        converted.emissiveFactor = glm::vec3{
+            static_cast<float>(material.emissiveFactor.size() > 0 ? material.emissiveFactor[0] : 0.0),
+            static_cast<float>(material.emissiveFactor.size() > 1 ? material.emissiveFactor[1] : 0.0),
+            static_cast<float>(material.emissiveFactor.size() > 2 ? material.emissiveFactor[2] : 0.0)};
+        if (const tinygltf::Value* emissiveStrength =
+                extensionValue("KHR_materials_emissive_strength"))
+        {
+            const float strength =
+                readNumber(*emissiveStrength, "emissiveStrength", 1.0f);
+            converted.emissiveFactor *= std::max(strength, 0.0f);
+        }
+        const int emissiveTextureIndex = material.emissiveTexture.index;
+        if (emissiveTextureIndex >= 0 &&
+            emissiveTextureIndex < static_cast<int>(gltf.textures.size()))
+        {
+            converted.emissiveTexture = emissiveTextureIndex;
+        }
+
         const int baseColorTextureIndex = material.pbrMetallicRoughness.baseColorTexture.index;
         if (baseColorTextureIndex >= 0 && baseColorTextureIndex < static_cast<int>(gltf.textures.size()))
         {

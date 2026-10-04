@@ -49,7 +49,7 @@ void computeMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         const float phi = 2.0 * kPi * u2;
         const float3 direction = float3(r * cos(phi), r * sin(phi), z);
 
-        float3 radiance = gGi.skyColor.rgb * gGi.skyColor.w;
+        float3 radiance = GiSkyRadiance(direction);
         RayQuery<RAY_FLAG_NONE> query;
         RayDesc ray;
         ray.Origin = origin;

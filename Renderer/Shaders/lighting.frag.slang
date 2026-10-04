@@ -3,6 +3,7 @@ struct SceneUniform
     float4x4 viewProjection;
     float4x4 previousViewProjection;
     float4x4 view;
+    float4x4 inverseViewProjection;
     float4 cameraPosition;
     float4 ambientColor;
     float4 clusterParams; // x: near, y: far, z: tile size in pixels, w: z slice count
@@ -11,6 +12,12 @@ struct SceneUniform
     float4 reflectionParams; // x: reflection intensity
     float4 sunDirection;     // xyz: direction toward the sun
     float4 sunColor;         // rgb: color * intensity
+    float4 skySh[9];         // environment irradiance / pi SH L2
+    float4 skyParams;        // x: enabled, y: intensity, z: sun disc, w: unused
+    float4 skyZenith;
+    float4 skyHorizon;
+    float4 skyGround;
+    float4 skyMap;    // x: bindless index, y: sampler index, z: has map, w: unused
 };
 
 struct GpuLight
@@ -38,6 +45,26 @@ struct GpuGiProbe
     float4 shZ;
 };
 
+// Must match DeferredRenderer::GpuObjectData.
+struct GpuObjectData
+{
+    float4x4 previousModel;
+    float4 specular;
+    uint4 specularTextureIndices;
+    uint4 specularSamplerIndices;
+    float4 volume;
+    float4 attenuation;
+    uint4 volumeTextureIndices;
+    uint4 volumeSamplerIndices;
+    float4 alpha;
+    float4 sheen;
+    uint4 sheenTextureIndices;
+    uint4 sheenSamplerIndices;
+    float4 emissive; // rgb: emissiveFactor (incl. strength)
+    uint4 emissiveTextureIndices;
+    uint4 emissiveSamplerIndices;
+};
+
 [[vk::binding(0, 0)]] ConstantBuffer<SceneUniform> gScene;
 [[vk::binding(1, 0)]] Sampler2D gAlbedo;
 [[vk::binding(2, 0)]] Sampler2D gNormal;
@@ -57,12 +84,20 @@ struct GpuGiProbe
 [[vk::binding(16, 0)]] Texture2D gSpecularF0;
 [[vk::binding(17, 0)]] Texture2D gTransmissionMaterial; // x: transmission, y: ior, z: thickness, w: attenuationDistance
 [[vk::binding(18, 0)]] Texture2D gSheenMaterial;        // rgb: sheen color, a: sheen roughness
+[[vk::binding(19, 0)]] StructuredBuffer<GpuObjectData> gObjects;
+[[vk::binding(20, 0)]] Texture2D gMotion; // xy: motion, zw: object UV
+[[vk::binding(21, 0)]] Texture2D gBrdfLut; // r: scale, g: bias (split-sum)
+[[vk::binding(22, 0)]] SamplerState gBrdfLutSampler;
+
+[[vk::binding(0, 1)]] Texture2D gTextures[];
+[[vk::binding(1, 1)]] SamplerState gSamplers[16];
 
 static const uint kMaxLightsPerCluster = 64;
 static const uint kLightTypeDirectional = 0;
 static const uint kLightTypePoint = 1;
 #include "brdf.slang"
 #include "sheen_brdf.slang"
+#include "sky.slang"
 
 static const float kShadowMapSize = 1024.0;
 static const float kShadowCompareBiasScale = 0.0002;
@@ -310,7 +345,28 @@ float4 fragmentMain(VertexOutput input) : SV_Target
 
     if (worldPosition.w < 0.5)
     {
-        return float4(gScene.ambientColor.rgb, 1.0);
+        if (gScene.skyParams.x > 0.5)
+        {
+            const float2 ndc = input.uv * 2.0 - 1.0;
+            const float4 clip = mul(gScene.inverseViewProjection, float4(ndc, 1.0, 1.0));
+            const float3 direction =
+                normalize(clip.xyz / max(clip.w, 1e-6) - gScene.cameraPosition.xyz);
+            return float4(
+                acesTonemap(EnvironmentBackground(
+                    direction,
+                    gScene.skyZenith.rgb,
+                    gScene.skyHorizon.rgb,
+                    gScene.skyGround.rgb,
+                    gScene.skyParams.y,
+                    gScene.sunDirection.xyz,
+                    gScene.sunColor.rgb,
+                    gScene.skyParams.z,
+                    uint(gScene.skyMap.x + 0.5),
+                    uint(gScene.skyMap.y + 0.5),
+                    gScene.skyMap.z > 0.5)),
+                1.0);
+        }
+        return float4(acesTonemap(gScene.ambientColor.rgb), 1.0);
     }
 
     const float3 albedo = albedoMetalness.rgb;
@@ -328,7 +384,24 @@ float4 fragmentMain(VertexOutput input) : SV_Target
     const float3 sheenColor = sheenMaterial.rgb;
     const float sheenRoughness = sheenMaterial.a;
 
-    float3 color = gScene.ambientColor.rgb * albedo * surfaceWeight;
+    // Emissive: position.w stores the object index + 1 (0 = sky) and motion.zw the object UV, so
+    // the emissive texture is sampled with its real texture coordinates instead of screen UVs.
+    const float4 gbufferMotion = gMotion.Load(int3(int2(input.position.xy), 0));
+    float3 emissive = 0.0;
+    if (worldPosition.w > 0.5)
+    {
+        const GpuObjectData object = gObjects[uint(worldPosition.w - 0.5)];
+        const float3 emissiveSample =
+            gTextures[NonUniformResourceIndex(object.emissiveTextureIndices.x)].Sample(
+                gSamplers[NonUniformResourceIndex(object.emissiveSamplerIndices.x)],
+                gbufferMotion.zw).rgb;
+        emissive = object.emissive.rgb * emissiveSample;
+    }
+
+    // Ambient/indirect diffuse: SH irradiance from the environment, or the flat ambient fallback.
+    float3 color = gScene.skyParams.x > 0.5
+                       ? EvaluateSkySh(gScene.skySh, normal) * albedo * (1.0 - metalness) * surfaceWeight
+                       : gScene.ambientColor.rgb * albedo * surfaceWeight;
 
     const float shadowFactor = sampleShadowFactor(worldPosition.xyz, normal, int2(input.position.xy));
 
@@ -425,6 +498,27 @@ float4 fragmentMain(VertexOutput input) : SV_Target
         }
     }
 
+    if (gScene.skyParams.x > 0.5)
+    {
+        // Image based specular: prefiltered environment times the split-sum BRDF terms.
+        const float3 reflection = reflect(-viewDirection, normal);
+        const float3 prefiltered = EnvironmentPrefiltered(
+            reflection,
+            roughness,
+            gScene.skyZenith.rgb,
+            gScene.skyHorizon.rgb,
+            gScene.skyGround.rgb,
+            gScene.skyParams.y,
+            gScene.skySh,
+            uint(gScene.skyMap.x + 0.5),
+            uint(gScene.skyMap.y + 0.5),
+            gScene.skyMap.z > 0.5);
+        const float2 brdf = gBrdfLut
+                                .Sample(gBrdfLutSampler, float2(saturate(dot(normal, viewDirection)), roughness))
+                                .rg;
+        color += prefiltered * (f0 * brdf.x + brdf.y) * surfaceWeight;
+    }
+
     if (gScene.screenSize.w > 0.5)
     {
         color += gIndirect.Load(int3(int2(input.position.xy), 0)).rgb * surfaceWeight;
@@ -458,5 +552,5 @@ float4 fragmentMain(VertexOutput input) : SV_Target
                  gScene.reflectionParams.x;
     }
 
-    return float4(acesTonemap(color), 1.0);
+    return float4(acesTonemap(color + emissive), 1.0);
 }

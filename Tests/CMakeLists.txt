@@ -5,9 +5,11 @@ add_executable(mukki_tests
     test_camera.cpp
     test_cluster_grid.cpp
     test_engine.cpp
+    test_environment.cpp
     test_gi_atrous_schedule.cpp
     test_gi_probes.cpp
     test_gltf_loader.cpp
+    test_hdr_loader.cpp
     test_job_system.cpp
     test_keybinds.cpp
     test_light_selection.cpp

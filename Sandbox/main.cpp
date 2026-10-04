@@ -17,6 +17,7 @@
 #include "Utilities/PathUtils.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -69,11 +70,13 @@ public:
         int maxFrames,
         std::filesystem::path shaderDirectory,
         std::filesystem::path requestedModel,
-        std::filesystem::path requestedScene)
+        std::filesystem::path requestedScene,
+        std::filesystem::path requestedEnvironment)
         : m_maxFrames(maxFrames)
         , m_shaderDirectory(std::move(shaderDirectory))
         , m_requestedModel(std::move(requestedModel))
         , m_requestedScene(std::move(requestedScene))
+        , m_requestedEnvironment(std::move(requestedEnvironment))
     {
     }
 
@@ -130,7 +133,15 @@ protected:
             return;
         }
 
+        if (!m_requestedEnvironment.empty())
+        {
+            mukki::EnvironmentSettings environment = m_renderer->GetEnvironmentSettings();
+            environment.environmentMap = m_requestedEnvironment;
+            m_renderer->SetEnvironmentSettings(environment);
+        }
+
         ScanSceneFiles();
+        ScanEnvironmentMaps();
 
         if (!m_requestedModel.empty())
         {
@@ -361,6 +372,47 @@ private:
         MRE_INFO("Found {} scene files in '{}'", m_sceneFiles.size(), mukki::PathToUtf8(m_scenesRoot));
 #else
         MRE_WARN("Scenes directory was not configured at build time");
+#endif
+    }
+
+    void ScanEnvironmentMaps()
+    {
+#ifdef MRE_ASSET_LIBRARY_DIR
+        m_assetLibraryRoot = std::filesystem::path{MRE_ASSET_LIBRARY_DIR};
+        if (!std::filesystem::exists(m_assetLibraryRoot))
+        {
+            MRE_WARN(
+                "Asset library directory '{}' does not exist",
+                mukki::PathToUtf8(m_assetLibraryRoot));
+            return;
+        }
+
+        std::error_code error{};
+        for (const std::filesystem::directory_entry& entry :
+             std::filesystem::recursive_directory_iterator(m_assetLibraryRoot, error))
+        {
+            if (error || !entry.is_regular_file())
+            {
+                continue;
+            }
+
+            std::string extension = mukki::PathToUtf8(entry.path().extension());
+            std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char character) {
+                return static_cast<char>(std::tolower(character));
+            });
+            if (extension == ".hdr")
+            {
+                m_environmentMaps.push_back(entry.path());
+            }
+        }
+
+        std::sort(m_environmentMaps.begin(), m_environmentMaps.end());
+        MRE_INFO(
+            "Found {} HDR environment map(s) in '{}'",
+            m_environmentMaps.size(),
+            mukki::PathToUtf8(m_assetLibraryRoot));
+#else
+        MRE_WARN("Asset library directory was not configured at build time");
 #endif
     }
 
@@ -744,6 +796,7 @@ private:
         }
 
         DrawShadowSettings();
+        DrawEnvironmentSettings();
         DrawGiSettings();
         DrawReflectionSettings();
 
@@ -863,6 +916,70 @@ private:
         m_selectedProbe = m_scene.probes.empty() ? -1 : 0;
         ApplySceneProbes();
         m_sceneStatus = "scene probes: " + std::to_string(m_scene.probes.size());
+    }
+
+    void DrawEnvironmentSettings()
+    {
+        ImGui::SeparatorText("Environment (IBL)");
+
+        mukki::EnvironmentSettings settings = m_renderer->GetEnvironmentSettings();
+        bool changed = ImGui::Checkbox("Image based lighting", &settings.enabled);
+        ImGui::SetItemTooltip(
+            "Procedural sky providing diffuse SH irradiance, prefiltered specular reflections,\n"
+            "the visible background and the sky term of the ray traced GI.");
+        changed |= ImGui::SliderFloat("Sky intensity", &settings.intensity, 0.0f, 4.0f, "%.2f");
+
+        // Radiance maps discovered in AssetLibrary/ at startup.
+        const std::string currentMap = settings.environmentMap.empty()
+                                           ? std::string{"(gradient sky)"}
+                                           : mukki::PathToUtf8(settings.environmentMap.filename());
+        if (ImGui::BeginCombo("HDR map", currentMap.c_str()))
+        {
+            if (ImGui::Selectable("(gradient sky)", settings.environmentMap.empty()))
+            {
+                settings.environmentMap.clear();
+                changed = true;
+            }
+
+            for (const std::filesystem::path& map : m_environmentMaps)
+            {
+                const bool selected = map == settings.environmentMap;
+                if (ImGui::Selectable(mukki::PathToUtf8(map.filename()).c_str(), selected))
+                {
+                    settings.environmentMap = map;
+                    changed = true;
+                }
+                if (selected)
+                {
+                    ImGui::SetItemDefaultFocus();
+                }
+            }
+
+            // Keep a map selected through --env selectable even when it is outside the library.
+            const bool currentInList = std::any_of(
+                m_environmentMaps.begin(),
+                m_environmentMaps.end(),
+                [&settings](const std::filesystem::path& map) { return map == settings.environmentMap; });
+            if (!settings.environmentMap.empty() && !currentInList &&
+                ImGui::Selectable(currentMap.c_str(), true))
+            {
+            }
+
+            ImGui::EndCombo();
+        }
+        ImGui::SetItemTooltip(
+            "Radiance .hdr equirectangular maps found in AssetLibrary.\n"
+            "The gradient colors below are ignored while a map is selected.");
+
+        changed |= ImGui::ColorEdit3("Sky zenith", &settings.zenithColor.x);
+        changed |= ImGui::ColorEdit3("Sky horizon", &settings.horizonColor.x);
+        changed |= ImGui::ColorEdit3("Sky ground", &settings.groundColor.x);
+        changed |= ImGui::SliderFloat("Sun disc", &settings.sunDiscIntensity, 0.0f, 50.0f, "%.0f");
+
+        if (changed)
+        {
+            m_renderer->SetEnvironmentSettings(settings);
+        }
     }
 
     void DrawProbeSection()
@@ -1334,6 +1451,9 @@ private:
     std::filesystem::path m_sceneSourcePath{};
     std::filesystem::path m_requestedModel{};
     std::filesystem::path m_requestedScene{};
+    std::filesystem::path m_requestedEnvironment{};
+    std::filesystem::path m_assetLibraryRoot{};
+    std::vector<std::filesystem::path> m_environmentMaps{};
     std::string m_sceneStatus{};
     float m_frameTimeMs = 0.0f;
     int m_selectedLight = 0;
@@ -1358,6 +1478,7 @@ int main(int argc, char** argv)
     int maxFrames = 0;
     std::filesystem::path requestedModel{};
     std::filesystem::path requestedScene{};
+    std::filesystem::path requestedEnvironment{};
     for (int i = 1; i < argc; ++i)
     {
         if (std::strcmp(argv[i], "--frames") == 0 && i + 1 < argc)
@@ -1372,6 +1493,17 @@ int main(int argc, char** argv)
         {
             requestedScene = argv[i + 1];
         }
+        else if (std::strcmp(argv[i], "--env") == 0 && i + 1 < argc)
+        {
+            // Absolute so the environment dropdown can match the scanned library entries.
+            std::error_code absoluteError{};
+            const std::filesystem::path requested = argv[i + 1];
+            requestedEnvironment = std::filesystem::absolute(requested, absoluteError);
+            if (absoluteError)
+            {
+                requestedEnvironment = requested;
+            }
+        }
     }
 
     mukki::Log::Init(mukki::LogConfig{});
@@ -1382,7 +1514,7 @@ int main(int argc, char** argv)
         const std::filesystem::path shaderDirectory =
             std::filesystem::absolute(argv[0]).parent_path() / "shaders";
 
-        SandboxApp app{maxFrames, shaderDirectory, requestedModel, requestedScene};
+        SandboxApp app{maxFrames, shaderDirectory, requestedModel, requestedScene, requestedEnvironment};
         if (!app.Init(mukki::WindowDesc{}))
         {
             MRE_CRITICAL("Failed to initialize the application");

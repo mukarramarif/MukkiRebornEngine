@@ -18,6 +18,12 @@ struct GiUniform
     float4 params7; // x: glassRefractionBounces, y: dispersionEnabled, z: volumeAbsorptionScale, w: unused
     float4 params8; // x: giLightCount, y: giLightShadows, z: giLightShadowBias, w: unused
     float4 reflectionSize; // x/y: reflection trace resolution
+    float4 skySh[9];       // irradiance / pi SH L2 of the environment
+    float4 skyParams;      // x: environment enabled, y: intensity, z: sun disc, w: unused
+    float4 skyZenith;
+    float4 skyHorizon;
+    float4 skyGround;
+    float4 skyMap;
 };
 
 [[vk::binding(0, 0)]] ConstantBuffer<GiUniform> gGi;

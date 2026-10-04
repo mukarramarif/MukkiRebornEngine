@@ -23,6 +23,26 @@ struct ObjectPushConstants
     uint drawIndex;
 };
 
+// Must match DeferredRenderer::GpuObjectData.
+struct GpuObjectData
+{
+    float4x4 previousModel;
+    float4 specular;
+    uint4 specularTextureIndices;
+    uint4 specularSamplerIndices;
+    float4 volume;
+    float4 attenuation;
+    uint4 volumeTextureIndices;
+    uint4 volumeSamplerIndices;
+    float4 alpha;
+    float4 sheen;
+    uint4 sheenTextureIndices;
+    uint4 sheenSamplerIndices;
+    float4 emissive; // rgb: emissiveFactor (incl. strength)
+    uint4 emissiveTextureIndices;
+    uint4 emissiveSamplerIndices;
+};
+
 struct VertexOutput
 {
     float4 position : SV_Position;
@@ -34,6 +54,7 @@ struct VertexOutput
 
 [[vk::push_constant]] ConstantBuffer<ObjectPushConstants> gObject;
 [[vk::binding(0, 0)]] ConstantBuffer<SceneUniform> gScene;
+[[vk::binding(1, 0)]] StructuredBuffer<GpuObjectData> gObjects;
 [[vk::binding(0, 1)]] Texture2D gTextures[];
 [[vk::binding(1, 1)]] SamplerState gSamplers[16];
 
@@ -57,5 +78,13 @@ float4 fragmentMain(VertexOutput input) : SV_Target
     const float3 normal = normalize(input.normal);
     const float nDotL = max(dot(normal, -gScene.sunDirection.xyz), 0.0);
     const float3 lit = gScene.ambientColor.rgb + gScene.sunColor.rgb * nDotL;
-    return float4(albedo * lit, alpha);
+
+    const GpuObjectData object = gObjects[gObject.drawIndex];
+    const float3 emissiveSample =
+        gTextures[NonUniformResourceIndex(object.emissiveTextureIndices.x)].Sample(
+            gSamplers[NonUniformResourceIndex(object.emissiveSamplerIndices.x)],
+            input.uv).rgb;
+    const float3 emissive = object.emissive.rgb * emissiveSample;
+
+    return float4(albedo * lit + emissive, alpha);
 }

@@ -35,6 +35,12 @@ struct GiUniform
     float4 params7; // x: glassRefractionBounces, y: dispersionEnabled, z: volumeAbsorptionScale, w: unused
     float4 params8; // x: giLightCount, y: giLightShadows, z: giLightShadowBias, w: unused
     float4 reflectionSize; // x/y: reflection trace resolution
+    float4 skySh[9];       // irradiance / pi SH L2 of the environment
+    float4 skyParams;      // x: environment enabled, y: intensity, z: sun disc, w: unused
+    float4 skyZenith;
+    float4 skyHorizon;
+    float4 skyGround;
+    float4 skyMap;         // x: bindless index, y: sampler index, z: has map, w: unused
 };
 
 struct GpuGeometryData
@@ -51,6 +57,9 @@ struct GpuGeometryData
     float4 sheen;               // rgb: sheenColorFactor, a: sheenRoughnessFactor
     uint4 sheenTextureIndices;  // x: sheenColorTexture, y: sheenRoughnessTexture
     uint4 sheenSamplerIndices;
+    float4 emissive;            // rgb: emissiveFactor (incl. strength)
+    uint4 emissiveTextureIndices; // x: emissiveTexture
+    uint4 emissiveSamplerIndices; // x: emissive sampler
 };
 
 struct GpuGiProbe

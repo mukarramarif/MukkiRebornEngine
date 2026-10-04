@@ -73,6 +73,9 @@ struct GltfMaterial
     float sheenRoughnessFactor = 0.0f;
     int sheenColorTexture = -1;
     int sheenRoughnessTexture = -1;
+    // Emissive. `emissiveFactor` is already scaled by KHR_materials_emissive_strength.
+    glm::vec3 emissiveFactor{0.0f};
+    int emissiveTexture = -1;
 };
 
 struct GltfImage

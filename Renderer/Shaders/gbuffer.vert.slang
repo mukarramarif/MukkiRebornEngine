@@ -29,6 +29,17 @@ struct GpuObjectData
     float4 specular;               // x: specularFactor, yzw: specularColorFactor
     uint4 specularTextureIndices;  // x: specularTexture, y: specularColorTexture
     uint4 specularSamplerIndices;  // x: specular sampler, y: specular color sampler
+    float4 volume;                 // x: transmission, y: ior, z: thickness, w: dispersion
+    float4 attenuation;            // rgb: attenuation color, a: attenuation distance (0 = none)
+    uint4 volumeTextureIndices;    // x: transmission texture, y: thickness texture
+    uint4 volumeSamplerIndices;    // x: transmission sampler, y: thickness sampler
+    float4 alpha;                  // x: blend, y: cutoff, z/w: unused
+    float4 sheen;                  // rgb: sheenColorFactor, a: sheenRoughnessFactor
+    uint4 sheenTextureIndices;     // x: sheenColorTexture, y: sheenRoughnessTexture
+    uint4 sheenSamplerIndices;
+    float4 emissive;               // rgb: emissiveFactor (incl. strength)
+    uint4 emissiveTextureIndices;  // x: emissiveTexture
+    uint4 emissiveSamplerIndices;  // x: emissive sampler
 };
 
 [[vk::binding(0, 0)]] ConstantBuffer<SceneUniform> gScene;

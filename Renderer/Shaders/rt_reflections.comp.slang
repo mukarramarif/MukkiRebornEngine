@@ -40,7 +40,7 @@ float3 TraceSpecularRay(
     hitDistance = gGi.params6.x;
     if (query.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
     {
-        return gGi.skyColor.rgb * gGi.skyColor.w;
+        return GiSkyRadiance(direction);
     }
 
     hitDistance = query.CommittedRayT();
