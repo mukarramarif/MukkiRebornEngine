@@ -1124,6 +1124,22 @@ private:
         }
         changed |= ImGui::Checkbox("Sun shadow ray", &settings.sunShadowRay);
 
+        ImGui::SeparatorText("GI punctual lights");
+        changed |= ImGui::Checkbox("Point/spot lights in GI", &settings.pointLights);
+        int giLights = static_cast<int>(settings.maxGiLights);
+        if (ImGui::SliderInt("GI light count", &giLights, 1, static_cast<int>(mukki::kMaxGiLights)))
+        {
+            settings.maxGiLights = static_cast<std::uint32_t>(giLights);
+            changed = true;
+        }
+        changed |= ImGui::Checkbox("GI light shadows", &settings.pointLightShadows);
+        changed |= ImGui::SliderFloat(
+            "GI light shadow bias",
+            &settings.pointLightShadowBias,
+            0.0f,
+            0.2f,
+            "%.3f");
+
         int sunSamples = static_cast<int>(settings.sunShadowSamples);
         if (ImGui::SliderInt("Sun shadow samples", &sunSamples, 1, 16))
         {

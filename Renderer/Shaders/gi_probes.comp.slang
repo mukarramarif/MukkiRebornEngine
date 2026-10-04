@@ -8,6 +8,7 @@
 [[vk::binding(5, 0)]] StructuredBuffer<GpuGiProbe> gProbeIn;
 [[vk::binding(6, 0)]] RWStructuredBuffer<GpuGiProbe> gProbeOut;
 [[vk::binding(9, 0)]] Texture2D<float> gRtSunShadow;
+[[vk::binding(13, 0)]] StructuredBuffer<GpuLight> gGiLights;
 
 [[vk::binding(0, 1)]] Texture2D gTextures[];
 [[vk::binding(1, 1)]] SamplerState gSamplers[16];

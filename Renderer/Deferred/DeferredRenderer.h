@@ -499,6 +499,8 @@ private:
     std::unique_ptr<rhi::Pipeline> m_giProbePipeline{};
     std::vector<std::unique_ptr<rhi::Buffer>> m_giProbeUniformBuffers{};
     std::vector<std::unique_ptr<rhi::DescriptorSet>> m_giProbeSets{};
+    std::vector<std::unique_ptr<rhi::Buffer>> m_giLightBuffers{};
+    std::vector<GpuLight> m_giLights{};
     std::unique_ptr<rhi::Buffer> m_giProbeBuffer{};
     std::unique_ptr<rhi::Buffer> m_giProbeDummyBuffer{};
     std::vector<GpuGiProbe> m_giProbeData{};

@@ -61,9 +61,9 @@ struct GpuGiProbe
 static const uint kMaxLightsPerCluster = 64;
 static const uint kLightTypeDirectional = 0;
 static const uint kLightTypePoint = 1;
+#include "brdf.slang"
 #include "sheen_brdf.slang"
 
-static const float kPi = 3.14159265359;
 static const float kShadowMapSize = 1024.0;
 static const float kShadowCompareBiasScale = 0.0002;
 static const float kPerspectiveCompareBiasScale = 0.001;
@@ -87,51 +87,6 @@ float3 acesTonemap(float3 color)
     const float d = 0.59;
     const float e = 0.14;
     return saturate((color * (a * color + b)) / (color * (c * color + d) + e));
-}
-
-float3 fresnelSchlick(float cosTheta, float3 f0)
-{
-    return f0 + (1.0 - f0) * pow(saturate(1.0 - cosTheta), 5.0);
-}
-
-float distributionGgx(float nDotH, float roughness)
-{
-    const float a = roughness * roughness;
-    const float a2 = a * a;
-    const float denominator = nDotH * nDotH * (a2 - 1.0) + 1.0;
-    return a2 / max(kPi * denominator * denominator, 1e-6);
-}
-
-float geometrySchlickGgx(float nDotX, float roughness)
-{
-    const float r = roughness + 1.0;
-    const float k = (r * r) / 8.0;
-    return nDotX / max(nDotX * (1.0 - k) + k, 1e-4);
-}
-
-float3 evaluateBrdf(
-    float3 albedo,
-    float3 f0,
-    float metalness,
-    float roughness,
-    float3 normal,
-    float3 viewDirection,
-    float3 lightDirection,
-    float3 radiance,
-    float nDotL)
-{
-    const float3 halfVector = normalize(viewDirection + lightDirection);
-    const float nDotV = max(dot(normal, viewDirection), 1e-4);
-    const float nDotH = max(dot(normal, halfVector), 0.0);
-    const float vDotH = max(dot(viewDirection, halfVector), 0.0);
-
-    const float3 fresnel = fresnelSchlick(vDotH, f0);
-    const float distribution = distributionGgx(nDotH, roughness);
-    const float geometry = geometrySchlickGgx(nDotV, roughness) * geometrySchlickGgx(nDotL, roughness);
-    const float3 specular = (distribution * geometry * fresnel) / max(4.0 * nDotV * nDotL, 1e-4);
-
-    const float3 diffuseWeight = (1.0 - fresnel) * (1.0 - metalness);
-    return (diffuseWeight * albedo / kPi + specular) * radiance * nDotL;
 }
 
 float distanceAttenuation(float distance, float range)
@@ -448,7 +403,7 @@ float4 fragmentMain(VertexOutput input) : SV_Target
         const float nDotL = max(dot(normal, lightDirection), 0.0);
         if (nDotL > 0.0)
         {
-            color += evaluateBrdf(
+            color += EvaluateCookTorrance(
                          albedo,
                          f0,
                          metalness,
@@ -456,8 +411,7 @@ float4 fragmentMain(VertexOutput input) : SV_Target
                          normal,
                          viewDirection,
                          lightDirection,
-                         radiance,
-                         nDotL) *
+                         radiance) *
                      surfaceWeight;
             color += EvaluateSheenBRDF(
                          sheenColor,

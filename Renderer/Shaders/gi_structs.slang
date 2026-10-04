@@ -3,6 +3,17 @@
 
 static const float kPi = 3.14159265359;
 static const float kMaxGiRadiance = 20.0;
+static const uint kMaxGiLights = 16;
+
+// Punctual light evaluated by the ray traced hit shading. The GI light buffer packs
+// `params.w` as the cast-shadows flag (the lighting pass uses it for the shadow map slot).
+struct GpuLight
+{
+    float4 positionRange;      // xyz: position, w: range
+    float4 directionIntensity; // xyz: direction, w: intensity
+    float4 color;              // rgb: color
+    float4 params;             // x: type (1 point, 2 spot), y/z: cone cosines, w: casts shadows
+};
 
 struct GiUniform
 {
@@ -22,6 +33,7 @@ struct GiUniform
     float4 params5; // x: probeRays, y: probeHysteresis, z: probeCount, w: reflectionResetHistory
     float4 params6; // x: reflectionMaxDistance, y: reflectionMaxRoughness, z: reflectionSamples, w: reflectionIntensity
     float4 params7; // x: glassRefractionBounces, y: dispersionEnabled, z: volumeAbsorptionScale, w: unused
+    float4 params8; // x: giLightCount, y: giLightShadows, z: giLightShadowBias, w: unused
     float4 reflectionSize; // x/y: reflection trace resolution
 };
 

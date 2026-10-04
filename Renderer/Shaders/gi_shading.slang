@@ -1,7 +1,8 @@
 // Shared hit shading used by the per-pixel GI trace and the probe update pass. The includer must
-// declare GiUniform, GpuGeometryData and the bindings for gGi, gTlas, gGeometry, gDepth,
-// gTextures, gSamplers, gBuffers and gRtSunShadow before including this file.
+// declare GiUniform, GpuGeometryData, GpuLight and the bindings for gGi, gTlas, gGeometry, gDepth,
+// gRtSunShadow, gGiLights, gTextures, gSamplers and gBuffers before including this file.
 
+#include "brdf.slang"
 #include "sheen_brdf.slang"
 
 float LoadFloat(ByteAddressBuffer buffer, uint byteOffset)
@@ -323,8 +324,39 @@ bool TraceSceneRay(
     return true;
 }
 
-// Outgoing radiance of an opaque hit: albedo times (sun visibility plus sky) plus the multi-bounce
-// feedback from the previous frame.
+// Windowed inverse-square falloff, matching the analytic lighting pass.
+float DistanceAttenuation(float distance, float range)
+{
+    const float distanceSquared = max(distance * distance, 1e-4);
+    const float ratio = distance / max(range, 1e-4);
+    const float ratio2 = ratio * ratio;
+    const float ratio4 = ratio2 * ratio2;
+    const float cutoff = saturate(1.0 - ratio4);
+    return cutoff * cutoff / distanceSquared;
+}
+
+// One occlusion ray per punctual light; returns 0 when the light is blocked.
+float TraceLightVisibility(
+    float3 position,
+    float3 normal,
+    float3 lightDirection,
+    float lightDistance,
+    float bias)
+{
+    const float offset = max(bias, 0.005);
+    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> query;
+    RayDesc ray;
+    ray.Origin = position + normal * offset;
+    ray.Direction = lightDirection;
+    ray.TMin = 0.0;
+    ray.TMax = max(lightDistance - offset * 2.0, 0.0);
+    query.TraceRayInline(gTlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFF, ray);
+    query.Proceed();
+    return query.CommittedStatus() != COMMITTED_TRIANGLE_HIT ? 1.0 : 0.0;
+}
+
+// Outgoing radiance of an opaque hit: the Cook-Torrance response to the sun and the punctual GI
+// lights plus the sky/ambient term and the multi-bounce feedback from the previous frame.
 float3 ShadeOpaqueSurface(
     const SurfaceSample surface,
     Texture2D feedbackTexture,
@@ -333,14 +365,22 @@ float3 ShadeOpaqueSurface(
 {
     const float3 hitPosition = surface.position;
     const float3 normal = surface.normal;
+    const float3 viewDirection = surface.viewDirection;
+    const float3 f0 =
+        lerp(float3(0.04, 0.04, 0.04), surface.baseColor, clamp(surface.metalness, 0.0, 1.0));
+    const float roughness = clamp(surface.roughness, 0.04, 1.0);
+
     const float3 sunDirection = gGi.sunDirectionIntensity.xyz;
     const float sunNdotL = max(dot(normal, sunDirection), 0.0);
     const bool sunActive =
         gGi.params3.z > 0.5 && gGi.sunDirectionIntensity.w > 0.0 && sunNdotL > 0.0;
 
-    float visibility = 0.0;
+    // Sky/ambient stays diffuse; direct lights are shaded with the full BRDF.
+    float3 radiance = surface.baseColor * (gGi.skyColor.rgb * gGi.skyColor.w);
+
     if (sunActive)
     {
+        float visibility = 0.0;
         // Prefer the ray traced sun mask: it is already smoothed by the lighting resolve and
         // removes the binary visibility noise from the indirect signal.
         if (gGi.params4.w <= 0.5 || !SampleRtSunVisibility(hitPosition, normal, visibility))
@@ -388,29 +428,102 @@ float3 ShadeOpaqueSurface(
 
             visibility /= float(sampleCount);
         }
-    }
 
-    float3 incident = gGi.skyColor.rgb * gGi.skyColor.w;
-    if (sunActive)
-    {
-        incident += gGi.sunColor.rgb * gGi.sunDirectionIntensity.w * sunNdotL * visibility;
-    }
-
-    float3 radiance = surface.baseColor * incident;
-
-    // Sheen sees the direct sun; the sky term is ambient and contributes no sheen.
-    if (any(surface.sheenColor > 1e-5) && sunActive)
-    {
         const float3 sunRadiance =
             gGi.sunColor.rgb * gGi.sunDirectionIntensity.w * visibility;
-        radiance += EvaluateSheenBRDF(
-            surface.sheenColor,
-            surface.sheenRoughness,
+        radiance += EvaluateCookTorrance(
+            surface.baseColor,
+            f0,
+            surface.metalness,
+            roughness,
             normal,
-            surface.viewDirection,
+            viewDirection,
             sunDirection,
-            sunRadiance,
-            sunNdotL);
+            sunRadiance);
+        if (any(surface.sheenColor > 1e-5))
+        {
+            radiance += EvaluateSheenBRDF(
+                surface.sheenColor,
+                surface.sheenRoughness,
+                normal,
+                viewDirection,
+                sunDirection,
+                sunRadiance,
+                sunNdotL);
+        }
+    }
+
+    // Punctual GI lights (point and spot) with one ray traced shadow ray per light.
+    const uint giLightCount = min(uint(max(gGi.params8.x, 0.0) + 0.5), kMaxGiLights);
+    if (giLightCount > 0)
+    {
+        const bool lightShadows = gGi.params8.y > 0.5;
+        const float shadowBias = max(gGi.params8.z, 0.0);
+        for (uint lightIndex = 0; lightIndex < giLightCount; ++lightIndex)
+        {
+            const GpuLight light = gGiLights[lightIndex];
+            const float3 offset = light.positionRange.xyz - hitPosition;
+            const float distance = length(offset);
+            const float3 lightDirection = offset / max(distance, 1e-4);
+            const float attenuation = DistanceAttenuation(distance, light.positionRange.w);
+            if (attenuation <= 1e-4)
+            {
+                continue;
+            }
+
+            float cone = 1.0;
+            if (uint(light.params.x + 0.5) != 1u)
+            {
+                const float spotCosine = dot(-lightDirection, light.directionIntensity.xyz);
+                cone = saturate(
+                    (spotCosine - light.params.z) / max(light.params.y - light.params.z, 1e-4));
+                cone *= cone;
+                if (cone <= 0.0)
+                {
+                    continue;
+                }
+            }
+
+            const float nDotL = dot(normal, lightDirection);
+            if (nDotL <= 0.0)
+            {
+                continue;
+            }
+
+            float visibility = 1.0;
+            if (lightShadows && light.params.w > 0.5)
+            {
+                visibility = TraceLightVisibility(
+                    hitPosition,
+                    normal,
+                    lightDirection,
+                    distance,
+                    shadowBias);
+            }
+
+            const float3 lightRadiance =
+                light.color.rgb * light.directionIntensity.w * attenuation * cone * visibility;
+            radiance += EvaluateCookTorrance(
+                surface.baseColor,
+                f0,
+                surface.metalness,
+                roughness,
+                normal,
+                viewDirection,
+                lightDirection,
+                lightRadiance);
+            if (any(surface.sheenColor > 1e-5))
+            {
+                radiance += EvaluateSheenBRDF(
+                    surface.sheenColor,
+                    surface.sheenRoughness,
+                    normal,
+                    viewDirection,
+                    lightDirection,
+                    lightRadiance,
+                    saturate(nDotL));
+            }
+        }
     }
 
     const float4 previousClip = mul(gGi.previousViewProjection, float4(hitPosition, 1.0));

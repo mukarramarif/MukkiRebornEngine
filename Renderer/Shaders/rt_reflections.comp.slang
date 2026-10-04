@@ -13,6 +13,7 @@
 [[vk::binding(10, 0)]] Texture2D gSpecularF0;
 [[vk::binding(11, 0)]] Texture2D gTransmission;
 [[vk::binding(12, 0)]] Texture2D gAttenuation;
+[[vk::binding(13, 0)]] StructuredBuffer<GpuLight> gGiLights;
 
 [[vk::binding(0, 1)]] Texture2D gTextures[];
 [[vk::binding(1, 1)]] SamplerState gSamplers[16];

@@ -337,6 +337,10 @@ clustered lights:
   over, so the specular integral stays energy consistent. Controls: `Reflections`,
   `Reflection intensity`, `Reflection max roughness`, `Reflection distance`, `Reflection samples`,
   `Reflection trace scale`.
+- **Punctual lights in GI**: point and spot lights are evaluated at ray hit points with the shared
+  Cook-Torrance BRDF (`GI light count` caps them at `kMaxGiLights`) and one ray traced shadow ray
+  per light, so lamps bleed their color into indirect lighting, probes and reflections consistently
+  with the analytic lighting pass.
 - **GI probes**: world space probes added from the `Probes` section (independent of the glTF objects)
   feed the irradiance probe pass. `gi_probes.comp.slang`
   traces `Probe rays` uniform-sphere rays per probe with the same hit shading as the path tracer,
@@ -355,8 +359,9 @@ clustered lights:
 
 The `Scene` window exposes the GI controls: `Ray traced GI`, `Trace scale`, `GI intensity`,
 `Max ray distance`, `Bounce feedback`, `Specular min roughness`, the temporal/edge-stop
-parameters, `À-trous iterations` and `Sun shadow ray`. Devices without ray tracing report
-`(ray tracing unavailable)` and render the clustered lights only.
+parameters, `A-trous iterations`, `Sun shadow ray` and the punctual-light controls
+(`Point/spot lights in GI`, `GI light count`, `GI light shadows`, `GI light shadow bias`). Devices
+without ray tracing report `(ray tracing unavailable)` and render the clustered lights only.
 
 In the sandbox, the `Scenes` window browses and loads the JSON scenes found in `Sandbox/Scenes`
 (with a global transform scale). The `Scene` window lists the loaded objects and lights:

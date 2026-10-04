@@ -12,6 +12,9 @@ namespace mukki
 // Maximum number of GI probes uploaded to the GPU.
 inline constexpr std::uint32_t kMaxGiProbes = 64;
 
+// Maximum number of punctual lights evaluated by the ray traced hit shading.
+inline constexpr std::uint32_t kMaxGiLights = 16;
+
 struct GiSettings
 {
     bool enabled = true;
@@ -35,6 +38,11 @@ struct GiSettings
     bool useProbes = true;
     std::uint32_t probeRays = 64;
     float probeHysteresis = 0.9f; // fraction of the previous probe irradiance kept per update
+    // Punctual lights (point and spot) contributing to the ray traced hit shading.
+    bool pointLights = true;
+    std::uint32_t maxGiLights = kMaxGiLights;
+    bool pointLightShadows = true;  // one ray traced occlusion ray per light and hit
+    float pointLightShadowBias = 0.02f;
 };
 
 // Ray traced glossy reflections. They reuse the GI trace resolution and the GI a-trous passes.
@@ -72,6 +80,7 @@ struct GiUniform
     glm::vec4 params5{0.0f}; // x: probeRays, y: probeHysteresis, z: probeCount, w: reflectionResetHistory
     glm::vec4 params6{0.0f}; // x: reflectionMaxDistance, y: reflectionMaxRoughness, z: reflectionSamples, w: reflectionIntensity
     glm::vec4 params7{0.0f}; // x: glassRefractionBounces, y: dispersionEnabled, z: volumeAbsorptionScale, w: unused
+    glm::vec4 params8{0.0f}; // x: giLightCount, y: giLightShadows, z: giLightShadowBias, w: unused
     glm::vec4 reflectionSize{0.0f}; // x/y: reflection trace resolution
 };
 

@@ -125,6 +125,12 @@ must not expose backend types, and Vulkan types may only appear under `Renderer/
   declares `FragmentCompute` stages; geometry buffers need storage usage for the ray hit shading;
   RT pipelines use two descriptor set layouts (GI set 0 + bindless set 1). Slang gotchas: no
   lambdas, `RayQuery.CommittedInstanceID()`.
+  Punctual lights feed the hit shading through a dedicated per-frame `GpuLight` buffer bound at set
+  0 binding 13 in `gi_trace`/`gi_probes`/`rt_reflections` (`gi_structs.slang` `kMaxGiLights`,
+  `SelectGiLights` in `Light.cpp`, `GiUniform.params8`: count/shadows/bias). `ShadeOpaqueSurface`
+  shades the sun and every GI light with the shared `brdf.slang` Cook-Torrance evaluation plus one
+  ray traced shadow ray per light (`TraceLightVisibility`); spot cones and the windowed
+  inverse-square falloff match `lighting.frag`.
 - Profiling: Tracy (on-demand). Use the `MRE_PROFILE_*` macros from `Utilities/Profiling.h` for CPU
   zones and `rhi::CommandList::BeginGpuZone/EndGpuZone` for GPU pass zones. Enabled via the
   `*-tracy` CMake presets (`MRE_ENABLE_TRACY=ON`, `VCPKG_MANIFEST_FEATURES=tracy`); connect with the

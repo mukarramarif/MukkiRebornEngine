@@ -16,6 +16,7 @@ struct GiUniform
     float4 params5;
     float4 params6;
     float4 params7;
+    float4 params8;
     float4 reflectionSize; // x/y: reflection trace resolution
 };
 

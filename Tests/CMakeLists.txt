@@ -10,6 +10,7 @@ add_executable(mukki_tests
     test_gltf_loader.cpp
     test_job_system.cpp
     test_keybinds.cpp
+    test_light_selection.cpp
     test_log.cpp
     test_path_utils.cpp
     test_resources.cpp

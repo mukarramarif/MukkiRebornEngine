@@ -16,6 +16,7 @@ struct GiUniform
     float4 params5; // x: probeRays, y: probeHysteresis, z: probeCount, w: reflectionResetHistory
     float4 params6; // x: reflectionMaxDistance, y: reflectionMaxRoughness, z: reflectionSamples, w: reflectionIntensity
     float4 params7; // x: glassRefractionBounces, y: dispersionEnabled, z: volumeAbsorptionScale, w: unused
+    float4 params8; // x: giLightCount, y: giLightShadows, z: giLightShadowBias, w: unused
     float4 reflectionSize; // x/y: reflection trace resolution
 };
 

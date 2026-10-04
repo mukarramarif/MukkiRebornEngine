@@ -351,6 +351,8 @@ void DeferredRenderer::Shutdown()
     m_tlasInstanceCounts.clear();
     m_blasDirty = false;
     m_gi.clear();
+    m_giLightBuffers.clear();
+    m_giLights.clear();
     m_giAtrousPipeline.reset();
     m_giUpsamplePipeline.reset();
     m_giTemporalPipeline.reset();
@@ -1311,6 +1313,16 @@ bool DeferredRenderer::CreateGiResources(rhi::Device& device)
     m_gi.clear();
     m_gi.resize(device.GetFramesInFlight());
 
+    // Per-frame buffer with the punctual lights evaluated by the ray traced hit shading. The cap
+    // keeps the per-hit loop bounded; the buffer is always large enough for kMaxGiLights entries.
+    m_giLightBuffers.clear();
+    m_giLightBuffers.reserve(device.GetFramesInFlight());
+    for (std::uint32_t frame = 0; frame < device.GetFramesInFlight(); ++frame)
+    {
+        m_giLightBuffers.push_back(device.CreateBuffer(
+            rhi::BufferDesc{sizeof(GpuLight) * kMaxGiLights, rhi::BufferUsage::Storage, true}));
+    }
+
     const std::uint32_t fullWidth = m_gbuffer.GetWidth();
     const std::uint32_t fullHeight = m_gbuffer.GetHeight();
     const auto halfWidth = std::max(
@@ -1577,6 +1589,16 @@ void DeferredRenderer::UpdateGiUniform(std::uint32_t frameIndex, const FrameView
         m_reflectionSettings.dispersion ? 1.0f : 0.0f,
         std::max(m_reflectionSettings.volumeAbsorptionScale, 0.0f),
         0.0f};
+    m_giUniform.params8 = glm::vec4{
+        static_cast<float>(m_giLights.size()),
+        m_giSettings.pointLightShadows ? 1.0f : 0.0f,
+        std::max(m_giSettings.pointLightShadowBias, 0.0f),
+        0.0f};
+    if (!m_giLights.empty() && frameIndex < m_giLightBuffers.size() &&
+        m_giLightBuffers[frameIndex] != nullptr)
+    {
+        m_giLightBuffers[frameIndex]->Write(m_giLights.data(), m_giLights.size() * sizeof(GpuLight));
+    }
     if (m_gi[frameIndex].reflectionNoisy != nullptr)
     {
         m_giUniform.reflectionSize = glm::vec4{
@@ -1629,6 +1651,10 @@ void DeferredRenderer::BindGiDescriptors(std::uint32_t frameIndex)
         9,
         m_rtSunShadowMask != nullptr ? *m_rtSunShadowMask : *m_whiteTexture,
         0u);
+    if (frameIndex < m_giLightBuffers.size() && m_giLightBuffers[frameIndex] != nullptr)
+    {
+        gi.traceSet->BindBuffer(13, *m_giLightBuffers[frameIndex]);
+    }
 
     // Temporal: reads history[parity], writes history[parity ^ 1].
     gi.temporalSet->BindBuffer(0, *gi.uniformBuffer);
@@ -1722,7 +1748,7 @@ void DeferredRenderer::RecordGiPasses(rhi::CommandList& commandList, std::uint32
     commandList.Dispatch(groupsX, groupsY, 1);
     commandList.ShaderMemoryBarrier(rhi::ShaderStageMask::Compute, rhi::ShaderStageMask::Compute);
 
-    const bool skipTemporal = std::dupenv("MRE_NOTEMPORAL") != nullptr;
+    const bool skipTemporal = std::getenv("MRE_NOTEMPORAL") != nullptr;
     const bool skipAtrous = std::getenv("MRE_NOATROUS") != nullptr;
     const bool skipUpsample = std::getenv("MRE_NOUPSAMPLE") != nullptr;
 
@@ -3020,6 +3046,16 @@ void DeferredRenderer::UpdateUniforms(std::uint32_t frameIndex, const FrameView&
         m_gpuLights.push_back(gpuLight);
     }
 
+    // Ray traced GI evaluates punctual lights through its own capped buffer.
+    if (m_giSettings.pointLights)
+    {
+        m_giLights = SelectGiLights(m_lights, std::min(m_giSettings.maxGiLights, kMaxGiLights));
+    }
+    else
+    {
+        m_giLights.clear();
+    }
+
     m_sceneUniform.viewProjection = view.viewProjection;
     m_sceneUniform.previousViewProjection = view.previousViewProjection;
     m_sceneUniform.view = view.view;
@@ -3370,6 +3406,10 @@ void DeferredRenderer::RecordGiProbes(rhi::CommandList& commandList, std::uint32
         9,
         m_rtSunShadowMask != nullptr ? *m_rtSunShadowMask : *m_whiteTexture,
         0u);
+    if (frameIndex < m_giLightBuffers.size() && m_giLightBuffers[frameIndex] != nullptr)
+    {
+        set.BindBuffer(13, *m_giLightBuffers[frameIndex]);
+    }
 
     const std::uint32_t probeCount = static_cast<std::uint32_t>(m_giProbeData.size());
     commandList.BeginGpuZone("GiProbes");
@@ -3409,6 +3449,10 @@ void DeferredRenderer::BindReflectionDescriptors(std::uint32_t frameIndex)
     gi.reflectionTraceSet->BindTexture(10, m_gbuffer.GetSpecularF0(), 0u);
     gi.reflectionTraceSet->BindTexture(11, m_gbuffer.GetTransmission(), 0u);
     gi.reflectionTraceSet->BindTexture(12, m_gbuffer.GetAttenuation(), 0u);
+    if (frameIndex < m_giLightBuffers.size() && m_giLightBuffers[frameIndex] != nullptr)
+    {
+        gi.reflectionTraceSet->BindBuffer(13, *m_giLightBuffers[frameIndex]);
+    }
 
     // Temporal: reads history[parity], writes history[parity ^ 1].
     gi.reflectionTemporalSet->BindBuffer(0, *gi.uniformBuffer);

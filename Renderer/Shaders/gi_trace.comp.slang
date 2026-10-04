@@ -10,6 +10,7 @@
 [[vk::binding(7, 0)]] RWTexture2D<float4> gSpecularOut;
 [[vk::binding(8, 0)]] RWTexture2D<float4> gHitDistanceOut;
 [[vk::binding(9, 0)]] Texture2D<float> gRtSunShadow;
+[[vk::binding(13, 0)]] StructuredBuffer<GpuLight> gGiLights;
 
 [[vk::binding(0, 1)]] Texture2D gTextures[];
 [[vk::binding(1, 1)]] SamplerState gSamplers[16];
