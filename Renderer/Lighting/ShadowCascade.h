@@ -17,15 +17,11 @@ inline constexpr std::uint32_t kShadowCascadeCount = 4;
 inline constexpr std::uint32_t kShadowResolution = 1024;
 inline constexpr std::uint32_t kMaxSpotShadowLights = 4;
 inline constexpr std::uint32_t kSpotShadowResolution = 1024;
-inline constexpr std::uint32_t kMaxPointShadowLights = 2;
+// Each shadow casting point light owns a cube's worth of shadow map layers, so they can be
+// updated independently from each other.
+inline constexpr std::uint32_t kMaxPointShadowLights = 4;
 inline constexpr std::uint32_t kPointShadowFaceCount = 6;
-inline constexpr std::uint32_t kPointShadowTileSize = 512;
-inline constexpr std::uint32_t kPointShadowAtlasColumns = 3;
-inline constexpr std::uint32_t kPointShadowAtlasRows = 2 * kMaxPointShadowLights;
-inline constexpr std::uint32_t kPointShadowAtlasWidth =
-    kPointShadowAtlasColumns * kPointShadowTileSize;
-inline constexpr std::uint32_t kPointShadowAtlasHeight =
-    kPointShadowAtlasRows * kPointShadowTileSize;
+inline constexpr std::uint32_t kPointShadowResolution = 512;
 inline constexpr float kShadowNearPlane = 0.05f;
 
 // Shadow matrices live in one flat array per frame: cascades first, then spot maps, then the six
@@ -49,7 +45,28 @@ struct ShadowSettings
     bool rtSunShadows = true;
     std::uint32_t rtShadowSamples = 4;
     float rtSunAngularRadiusDegrees = 0.5f;
+    // When enabled, a point light's shadow map is only re-rendered when the light or the scene
+    // geometry changed (moving lights still update every frame). When disabled, every point face
+    // is re-rendered each frame.
+    bool dynamicPointShadows = true;
 };
+
+// Tracks what a point shadow slot's map was last rendered from.
+struct PointShadowSlotState
+{
+    glm::vec3 position{0.0f};
+    float range = 0.0f;
+    std::uint32_t geometryRevision = 0;
+    bool valid = false;
+};
+
+// Returns true when the slot's shadow map must be re-rendered: the slot is new, the light moved or
+// changed, or the scene geometry changed.
+[[nodiscard]] bool PointShadowNeedsUpdate(
+    const PointShadowSlotState& state,
+    const glm::vec3& position,
+    float range,
+    std::uint32_t geometryRevision);
 
 struct ShadowCascade
 {

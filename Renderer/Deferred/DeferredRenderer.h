@@ -465,7 +465,11 @@ private:
     std::unique_ptr<rhi::DescriptorSetLayout> m_shadowSetLayout{};
     std::unique_ptr<rhi::Texture> m_shadowMap{};
     std::unique_ptr<rhi::Texture> m_spotShadowMap{};
-    std::unique_ptr<rhi::Texture> m_pointShadowMap{};
+    // One six-layer depth map per point shadow slot, updated independently (see ShadowView).
+    std::vector<std::unique_ptr<rhi::Texture>> m_pointShadowMaps{};
+    std::array<PointShadowSlotState, kMaxPointShadowLights> m_pointShadowSlotStates{};
+    // Bumped whenever model/instance geometry or transforms change; invalidates cached point maps.
+    std::uint32_t m_geometryRevision = 0;
     std::unique_ptr<rhi::Sampler> m_shadowSampler{};
     std::vector<std::unique_ptr<rhi::DescriptorSet>> m_shadowSets{};
     std::vector<std::unique_ptr<rhi::Buffer>> m_shadowUniformBuffers{};

@@ -1214,6 +1214,11 @@ private:
             3.0f,
             "%.2f");
 
+        changed |= ImGui::Checkbox("Dynamic point shadows", &settings.dynamicPointShadows);
+        ImGui::SetItemTooltip(
+            "When enabled, each point light's shadow map only re-renders when the light or the\n"
+            "scene geometry changes (moving lights still update every frame).");
+
         ImGui::Text(
             "%u cascades at %u, %u spot maps, %u point atlases",
             static_cast<unsigned>(settings.cascadeCount),

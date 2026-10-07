@@ -13,9 +13,10 @@ struct ShadowPushConstants
     uint viewIndex;
 };
 
+// Must match mukki::kMaxShadowViews (4 cascades + 4 spots + 4 point lights * 6 faces).
 struct ShadowUniform
 {
-    float4x4 viewProjections[20]; // 4 cascades + 4 spots + 2 point lights * 6 faces
+    float4x4 viewProjections[32];
     float4 cascadeSplits;
     float4 params;   // x: depthBias, y: normalBias, z: distance, w: enabled
     float4 rtParams; // x: ray traced sun shadows enabled, y/z/w: unused

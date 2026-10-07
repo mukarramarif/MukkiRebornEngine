@@ -170,4 +170,14 @@ std::vector<ShadowCascade> ComputeShadowCascades(
     return cascades;
 }
 
+bool PointShadowNeedsUpdate(
+    const PointShadowSlotState& state,
+    const glm::vec3& position,
+    float range,
+    std::uint32_t geometryRevision)
+{
+    return !state.valid || state.geometryRevision != geometryRevision ||
+           state.position != position || state.range != range;
+}
+
 } // namespace mukki

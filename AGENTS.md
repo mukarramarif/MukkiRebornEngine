@@ -77,14 +77,19 @@ must not expose backend types, and Vulkan types may only appear under `Renderer/
   supported; lights are uploaded as an SSBO (`GpuLight`, packed float4s). `SetClusterDebugView`
   renders a light-count heatmap for debugging.
 - Shadows: `Renderer/Lighting/ShadowCascade.h` drives cascaded shadow maps (4x1024 `D32Sfloat`
-  array) for the first directional `Light` with `castShadows`, spot shadows (4x1024 array) and
-  point shadows (2 lights x six 512x512 faces packed into one 2D atlas). The shadow pass renders
-  every view (cascade layer, spot layer, atlas tile) with depth-only dynamic rendering and
-  secondary command buffers, culling spot/point views by light range with per-instance bounding
-  spheres. The RHI supports array textures with per-layer depth views, sub-rect render
-  areas/viewports for atlas tiles, comparison samplers and dynamic depth bias. The lighting pass
-  does 3x3 hardware PCF with a normal bias from `ShadowSettings` (UI-adjustable); spot/point slot
-  indices are packed into `GpuLight::params.w`.
+  array) for the first directional `Light` with `castShadows`, spot shadows (4x1024 array) and up
+  to 4 point shadow lights with their own 512x512x6 `D32Sfloat` cube arrays (`m_pointShadowMaps`).
+  The shadow pass renders every view (cascade layer, spot layer, point face) with depth-only
+  dynamic rendering and secondary command buffers, culling spot/point views by light range with
+  per-instance bounding spheres. With `ShadowSettings.dynamicPointShadows` (default on) a point
+  light's map is only re-rendered when `PointShadowNeedsUpdate` reports that the light moved/
+  changed or `m_geometryRevision` changed (bumped by model/instance transform edits), so static
+  lights keep their cached map while moving lights refresh every frame; faces still clear even with
+  no casters. The RHI supports array textures with per-layer depth views, sub-rect render
+  areas/viewports, comparison samplers and dynamic depth bias. The lighting pass samples the maps
+  as a `Texture2DArray` descriptor array (set 0 binding 11, indexed by shadow slot) and does 3x3
+  hardware PCF with a normal bias from `ShadowSettings` (UI-adjustable); spot/point slot indices
+  are packed into `GpuLight::params.w`.
 - Ray traced sun shadows: optional (`ShadowSettings.rtSunShadows`, requires ray tracing).
   `Renderer/Shaders/rt_shadows.comp.slang` reconstructs the surface from the G-buffer position/normal
   and traces `rtShadowSamples` jittered rays toward the sun into a full-res `R16Sfloat` mask; the

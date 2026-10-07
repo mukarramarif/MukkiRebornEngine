@@ -242,6 +242,28 @@ TEST(ShadowCascades, PointFacesProjectAlongTheirAxes)
     }
 }
 
+TEST(PointShadows, UpdatePolicyTracksLightAndGeometryChanges)
+{
+    mukki::PointShadowSlotState state{};
+    const glm::vec3 position{1.0f, 2.0f, 3.0f};
+    constexpr float kRange = 12.0f;
+    constexpr std::uint32_t kRevision = 7u;
+
+    // A fresh slot always renders.
+    EXPECT_TRUE(mukki::PointShadowNeedsUpdate(state, position, kRange, kRevision));
+    state = mukki::PointShadowSlotState{position, kRange, kRevision, true};
+
+    // A cached map is reused while nothing changes.
+    EXPECT_FALSE(mukki::PointShadowNeedsUpdate(state, position, kRange, kRevision));
+
+    // Moving the light or changing its range invalidates the map.
+    EXPECT_TRUE(mukki::PointShadowNeedsUpdate(state, glm::vec3{1.1f, 2.0f, 3.0f}, kRange, kRevision));
+    EXPECT_TRUE(mukki::PointShadowNeedsUpdate(state, position, kRange + 1.0f, kRevision));
+
+    // Scene geometry changes invalidate it as well.
+    EXPECT_TRUE(mukki::PointShadowNeedsUpdate(state, position, kRange, kRevision + 1u));
+}
+
 TEST(ShadowCascades, ClampsCascadeCountAndIsDeterministic)
 {
     const mukki::FrameView view = MakeView();
