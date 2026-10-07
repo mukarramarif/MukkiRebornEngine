@@ -470,6 +470,111 @@ bool LoadGltfModel(const std::filesystem::path& path, GltfModel& model)
         converted.metallicFactor = static_cast<float>(material.pbrMetallicRoughness.metallicFactor);
         converted.roughnessFactor = static_cast<float>(material.pbrMetallicRoughness.roughnessFactor);
         converted.doubleSided = material.doubleSided;
+        converted.alphaMask = material.alphaMode == "MASK";
+        converted.alphaBlend = material.alphaMode == "BLEND";
+        converted.alphaCutoff = static_cast<float>(material.alphaCutoff);
+
+        const auto extensionValue = [&material](const char* name) -> const tinygltf::Value* {
+            const auto found = material.extensions.find(name);
+            return found == material.extensions.end() ? nullptr : &found->second;
+        };
+        const auto readNumber = [](const tinygltf::Value& value, const char* key, float fallback) {
+            if (!value.Has(key) || !value.Get(key).IsNumber())
+            {
+                return fallback;
+            }
+            return static_cast<float>(value.Get(key).GetNumberAsDouble());
+        };
+        const auto readColor = [](const tinygltf::Value& value, const char* key, const glm::vec3& fallback) {
+            if (!value.Has(key))
+            {
+                return fallback;
+            }
+            const tinygltf::Value& color = value.Get(key);
+            if (!color.IsArray() || color.ArrayLen() != 3)
+            {
+                return fallback;
+            }
+            return glm::vec3{
+                static_cast<float>(color.Get(0).GetNumberAsDouble()),
+                static_cast<float>(color.Get(1).GetNumberAsDouble()),
+                static_cast<float>(color.Get(2).GetNumberAsDouble())};
+        };
+        const auto readTextureIndex = [](const tinygltf::Value& value, const char* key) -> int {
+            if (!value.Has(key))
+            {
+                return -1;
+            }
+            const tinygltf::Value& info = value.Get(key);
+            if (!info.IsObject() || !info.Has("index") || !info.Get("index").IsNumber())
+            {
+                return -1;
+            }
+            return static_cast<int>(info.Get("index").GetNumberAsInt());
+        };
+
+        if (const tinygltf::Value* specular = extensionValue("KHR_materials_specular"))
+        {
+            converted.specularFactor = readNumber(*specular, "specularFactor", converted.specularFactor);
+            converted.specularColorFactor =
+                readColor(*specular, "specularColorFactor", converted.specularColorFactor);
+            converted.specularTexture = readTextureIndex(*specular, "specularTexture");
+            converted.specularColorTexture = readTextureIndex(*specular, "specularColorTexture");
+        }
+
+        if (const tinygltf::Value* iorExtension = extensionValue("KHR_materials_ior"))
+        {
+            converted.ior = readNumber(*iorExtension, "ior", converted.ior);
+        }
+
+        if (const tinygltf::Value* transmission = extensionValue("KHR_materials_transmission"))
+        {
+            converted.transmissionFactor =
+                readNumber(*transmission, "transmissionFactor", converted.transmissionFactor);
+            converted.transmissionTexture = readTextureIndex(*transmission, "transmissionTexture");
+        }
+
+        if (const tinygltf::Value* volume = extensionValue("KHR_materials_volume"))
+        {
+            converted.thicknessFactor = readNumber(*volume, "thicknessFactor", converted.thicknessFactor);
+            converted.thicknessTexture = readTextureIndex(*volume, "thicknessTexture");
+            converted.attenuationColor = readColor(*volume, "attenuationColor", converted.attenuationColor);
+            converted.attenuationDistance =
+                readNumber(*volume, "attenuationDistance", converted.attenuationDistance);
+        }
+
+        if (const tinygltf::Value* dispersion = extensionValue("KHR_materials_dispersion"))
+        {
+            converted.dispersion = readNumber(*dispersion, "dispersion", converted.dispersion);
+        }
+
+        if (const tinygltf::Value* sheen = extensionValue("KHR_materials_sheen"))
+        {
+            converted.sheenColorFactor =
+                readColor(*sheen, "sheenColorFactor", converted.sheenColorFactor);
+            converted.sheenRoughnessFactor =
+                readNumber(*sheen, "sheenRoughnessFactor", converted.sheenRoughnessFactor);
+            converted.sheenColorTexture = readTextureIndex(*sheen, "sheenColorTexture");
+            converted.sheenRoughnessTexture = readTextureIndex(*sheen, "sheenRoughnessTexture");
+        }
+
+        converted.emissiveFactor = glm::vec3{
+            static_cast<float>(material.emissiveFactor.size() > 0 ? material.emissiveFactor[0] : 0.0),
+            static_cast<float>(material.emissiveFactor.size() > 1 ? material.emissiveFactor[1] : 0.0),
+            static_cast<float>(material.emissiveFactor.size() > 2 ? material.emissiveFactor[2] : 0.0)};
+        if (const tinygltf::Value* emissiveStrength =
+                extensionValue("KHR_materials_emissive_strength"))
+        {
+            const float strength =
+                readNumber(*emissiveStrength, "emissiveStrength", 1.0f);
+            converted.emissiveFactor *= std::max(strength, 0.0f);
+        }
+        const int emissiveTextureIndex = material.emissiveTexture.index;
+        if (emissiveTextureIndex >= 0 &&
+            emissiveTextureIndex < static_cast<int>(gltf.textures.size()))
+        {
+            converted.emissiveTexture = emissiveTextureIndex;
+        }
 
         const int baseColorTextureIndex = material.pbrMetallicRoughness.baseColorTexture.index;
         if (baseColorTextureIndex >= 0 && baseColorTextureIndex < static_cast<int>(gltf.textures.size()))

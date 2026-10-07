@@ -7,7 +7,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <limits>
+#include <vector>
 
 namespace mukki::vulkan
 {
@@ -40,7 +42,23 @@ bool VkDevice::Init(const rhi::DeviceDesc& desc)
         return false;
     }
 
-    m_resourceAllocator.Init(m_device, m_allocator, *m_graphicsQueue, m_graphicsQueueFamily);
+    if (m_rayTracingSupported)
+    {
+        // Ray tracing entry points are extensions and are not exported by the loader import
+        // library, so they are resolved through vkGetDeviceProcAddr.
+        if (!m_rayTracingDispatch.Load(*m_instance.GetInstance(), *m_device))
+        {
+            MRE_WARN("Failed to resolve the ray tracing entry points, ray tracing is disabled");
+            m_rayTracingSupported = false;
+        }
+    }
+
+    m_resourceAllocator.Init(
+        m_device,
+        m_allocator,
+        *m_graphicsQueue,
+        m_graphicsQueueFamily,
+        m_rayTracingSupported ? &m_rayTracingDispatch : nullptr);
 
 #ifdef MRE_ENABLE_TRACY
     MRE_ASSERT(!m_commandLists.empty(), "Tracy calibration requires at least one command list");
@@ -100,6 +118,8 @@ void VkDevice::Shutdown()
     m_requestedExtent = rhi::Extent2D{};
     m_descriptorIndexingFeatures = vk::PhysicalDeviceDescriptorIndexingFeatures{};
     m_descriptorIndexingProperties = vk::PhysicalDeviceDescriptorIndexingProperties{};
+    m_accelerationStructureFeatures = vk::PhysicalDeviceAccelerationStructureFeaturesKHR{};
+    m_rayQueryFeatures = vk::PhysicalDeviceRayQueryFeaturesKHR{};
     m_graphicsQueueFamily = 0;
     m_apiVersion = VK_API_VERSION_1_3;
     m_framesInFlight = 2;
@@ -107,6 +127,7 @@ void VkDevice::Shutdown()
     m_currentImageIndex = 0;
     m_nextBindlessIndex = 0;
     m_descriptorIndexingSupported = false;
+    m_rayTracingSupported = false;
     m_swapchainDirty = false;
     m_initialized = false;
 }
@@ -149,6 +170,11 @@ bool VkDevice::BeginFrame()
     {
         m_swapchainDirty = true;
         return false;
+    }
+    catch (const vk::DeviceLostError&)
+    {
+        LogDeviceFault();
+        throw;
     }
 
     commandList.SetSwapchainTarget(
@@ -197,7 +223,15 @@ void VkDevice::EndFrame()
     submitInfo.signalSemaphoreInfoCount = static_cast<std::uint32_t>(signalInfos.size());
     submitInfo.pSignalSemaphoreInfos = signalInfos.data();
 
-    m_graphicsQueue.submit2(submitInfo);
+    try
+    {
+        m_graphicsQueue.submit2(submitInfo);
+    }
+    catch (const vk::DeviceLostError&)
+    {
+        LogDeviceFault();
+        throw;
+    }
     m_frameSync.SetFrameValue(m_frameIndex, signalValue);
 
     if (commandList.WasSwapchainRendered())
@@ -337,6 +371,30 @@ std::unique_ptr<rhi::Pipeline> VkDevice::CreatePipeline(const rhi::PipelineDesc&
     return std::make_unique<VkPipeline>(m_device, desc);
 }
 
+std::unique_ptr<rhi::AccelerationStructure> VkDevice::CreateBottomLevelAccelerationStructure(
+    const rhi::BottomLevelAccelerationStructureDesc& desc)
+{
+    MRE_ASSERT(m_initialized, "VkDevice::CreateBottomLevelAccelerationStructure called before VkDevice::Init");
+    MRE_ASSERT(m_rayTracingSupported, "Ray tracing is not supported by the selected device");
+    return m_resourceAllocator.CreateBottomLevelAccelerationStructure(desc);
+}
+
+std::unique_ptr<rhi::AccelerationStructure> VkDevice::CreateTopLevelAccelerationStructure(
+    const rhi::TopLevelAccelerationStructureDesc& desc)
+{
+    MRE_ASSERT(m_initialized, "VkDevice::CreateTopLevelAccelerationStructure called before VkDevice::Init");
+    MRE_ASSERT(m_rayTracingSupported, "Ray tracing is not supported by the selected device");
+    return m_resourceAllocator.CreateTopLevelAccelerationStructure(desc);
+}
+
+void VkDevice::UpdateTopLevelAccelerationStructure(
+    rhi::AccelerationStructure& accelerationStructure,
+    std::span<const rhi::AccelerationStructureInstance> instances)
+{
+    MRE_ASSERT(m_initialized, "VkDevice::UpdateTopLevelAccelerationStructure called before VkDevice::Init");
+    static_cast<VkAccelerationStructure&>(accelerationStructure).UpdateInstances(instances);
+}
+
 bool VkDevice::PickPhysicalDevice()
 {
     const std::vector<vk::raii::PhysicalDevice> devices = m_instance.GetInstance().enumeratePhysicalDevices();
@@ -352,6 +410,9 @@ bool VkDevice::PickPhysicalDevice()
     std::uint32_t bestApiVersion = 0;
     vk::PhysicalDeviceDescriptorIndexingFeatures bestIndexingFeatures{};
     vk::PhysicalDeviceDescriptorIndexingProperties bestIndexingProperties{};
+    vk::PhysicalDeviceAccelerationStructureFeaturesKHR bestAccelerationStructureFeatures{};
+    vk::PhysicalDeviceRayQueryFeaturesKHR bestRayQueryFeatures{};
+    bool bestRayTracingSupported = false;
 
     for (const vk::raii::PhysicalDevice& candidate : devices)
     {
@@ -378,6 +439,17 @@ bool VkDevice::PickPhysicalDevice()
         vk::PhysicalDeviceFeatures2 indexingFeatures2{};
         indexingFeatures2.pNext = &indexingFeatures;
         (*candidate).getFeatures2(&indexingFeatures2);
+
+        vk::PhysicalDeviceAccelerationStructureFeaturesKHR accelerationStructureFeatures{};
+        vk::PhysicalDeviceRayQueryFeaturesKHR rayQueryFeatures{};
+        vk::PhysicalDeviceFeatures2 rayTracingFeatures2{};
+        rayTracingFeatures2.pNext = &rayQueryFeatures;
+        rayQueryFeatures.pNext = &accelerationStructureFeatures;
+        (*candidate).getFeatures2(&rayTracingFeatures2);
+
+        const bool rayTracingSupported = accelerationStructureFeatures.accelerationStructure &&
+                                         rayQueryFeatures.rayQuery &&
+                                         features12.bufferDeviceAddress;
 
         const std::vector<vk::QueueFamilyProperties> families = candidate.getQueueFamilyProperties();
         std::uint32_t graphicsFamily = 0;
@@ -425,6 +497,12 @@ bool VkDevice::PickPhysicalDevice()
             break;
         }
 
+        // Prefer ray tracing capable devices within the same device class.
+        if (rayTracingSupported)
+        {
+            score += 500;
+        }
+
         if (score > bestScore)
         {
             vk::PhysicalDeviceDescriptorIndexingProperties indexingProperties{};
@@ -438,6 +516,9 @@ bool VkDevice::PickPhysicalDevice()
             bestApiVersion = std::min(properties.apiVersion, VK_API_VERSION_1_4);
             bestIndexingFeatures = indexingFeatures;
             bestIndexingProperties = indexingProperties;
+            bestAccelerationStructureFeatures = accelerationStructureFeatures;
+            bestRayQueryFeatures = rayQueryFeatures;
+            bestRayTracingSupported = rayTracingSupported;
         }
     }
 
@@ -455,6 +536,9 @@ bool VkDevice::PickPhysicalDevice()
     m_descriptorIndexingFeatures = bestIndexingFeatures;
     m_descriptorIndexingProperties = bestIndexingProperties;
     m_descriptorIndexingSupported = true;
+    m_accelerationStructureFeatures = bestAccelerationStructureFeatures;
+    m_rayQueryFeatures = bestRayQueryFeatures;
+    m_rayTracingSupported = bestRayTracingSupported;
 
     const vk::PhysicalDeviceProperties properties = best.getProperties();
     MRE_INFO(
@@ -467,6 +551,10 @@ bool VkDevice::PickPhysicalDevice()
         "Descriptor indexing supported ({} update-after-bind sampled images per set, {} per stage)",
         m_descriptorIndexingProperties.maxDescriptorSetUpdateAfterBindSampledImages,
         m_descriptorIndexingProperties.maxPerStageDescriptorUpdateAfterBindSampledImages);
+    MRE_INFO(
+        "Ray tracing {} (acceleration structures, ray query{})",
+        m_rayTracingSupported ? "supported" : "not supported",
+        m_rayTracingSupported ? ", buffer device address" : "");
 
     return true;
 }
@@ -501,13 +589,66 @@ bool VkDevice::CreateLogicalDevice()
 
     MRE_ASSERT(m_descriptorIndexingSupported, "The selected physical device must support descriptor indexing");
 
+    vk::PhysicalDeviceAccelerationStructureFeaturesKHR accelerationStructureFeatures{};
+    vk::PhysicalDeviceRayQueryFeaturesKHR rayQueryFeatures{};
+    if (m_rayTracingSupported)
+    {
+        features12.bufferDeviceAddress = true;
+        accelerationStructureFeatures.accelerationStructure = true;
+        rayQueryFeatures.rayQuery = true;
+        features13.pNext = &accelerationStructureFeatures;
+        accelerationStructureFeatures.pNext = &rayQueryFeatures;
+    }
+
     features11.pNext = &features12;
     features12.pNext = &features13;
 
     vk::PhysicalDeviceFeatures2 features2{};
     features2.pNext = &features11;
 
-    const std::array<const char*, 1> extensions{vk::KHRSwapchainExtensionName};
+    std::vector<const char*> extensions{vk::KHRSwapchainExtensionName};
+    if (m_rayTracingSupported)
+    {
+        extensions.push_back(vk::KHRDeferredHostOperationsExtensionName);
+        extensions.push_back(vk::KHRAccelerationStructureExtensionName);
+        extensions.push_back(vk::KHRRayQueryExtensionName);
+    }
+
+    // VK_EXT_device_fault reports the faulting address when the device is lost, which is the only
+    // runtime diagnostic available for shader memory faults.
+    vk::PhysicalDeviceFaultFeaturesEXT faultFeatures{};
+    {
+        const std::vector<vk::ExtensionProperties> availableExtensions =
+            m_physicalDevice.enumerateDeviceExtensionProperties();
+        m_deviceFaultSupported = std::any_of(
+            availableExtensions.begin(),
+            availableExtensions.end(),
+            [](const vk::ExtensionProperties& extension) {
+                return std::strcmp(extension.extensionName, vk::EXTDeviceFaultExtensionName) == 0;
+            });
+        if (m_deviceFaultSupported)
+        {
+            const vk::StructureChain<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceFaultFeaturesEXT>
+                queriedFeatures = m_physicalDevice.getFeatures2<
+                    vk::PhysicalDeviceFeatures2,
+                    vk::PhysicalDeviceFaultFeaturesEXT>();
+            m_deviceFaultSupported =
+                queriedFeatures.get<vk::PhysicalDeviceFaultFeaturesEXT>().deviceFault == vk::True;
+        }
+        if (m_deviceFaultSupported)
+        {
+            faultFeatures.deviceFault = true;
+            extensions.push_back(vk::EXTDeviceFaultExtensionName);
+            if (m_rayTracingSupported)
+            {
+                rayQueryFeatures.pNext = &faultFeatures;
+            }
+            else
+            {
+                features13.pNext = &faultFeatures;
+            }
+        }
+    }
 
     vk::DeviceCreateInfo createInfo{};
     createInfo.pNext = &features2;
@@ -527,6 +668,13 @@ bool VkDevice::CreateLogicalDevice()
     }
 
     m_graphicsQueue = m_device.getQueue(m_graphicsQueueFamily, 0);
+    const vk::PhysicalDeviceLimits limits = m_physicalDevice.getProperties().limits;
+    MRE_INFO(
+        "Device limits: maxColorAttachments {}, maxFragmentCombinedOutputResources {}, "
+        "maxPerStageDescriptorStorageBuffers {}",
+        limits.maxColorAttachments,
+        limits.maxFragmentCombinedOutputResources,
+        limits.maxPerStageDescriptorStorageBuffers);
     MRE_INFO("Logical device created (graphics queue family {})", m_graphicsQueueFamily);
     return true;
 }
@@ -538,6 +686,10 @@ bool VkDevice::CreateAllocator()
     createInfo.device = *m_device;
     createInfo.instance = *m_instance.GetInstance();
     createInfo.vulkanApiVersion = m_apiVersion;
+    if (m_rayTracingSupported)
+    {
+        createInfo.flags |= VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
+    }
 
     const VkResult result = vmaCreateAllocator(&createInfo, &m_allocator);
     if (result != VK_SUCCESS)
@@ -552,12 +704,14 @@ bool VkDevice::CreateAllocator()
 
 bool VkDevice::CreateDescriptorPool()
 {
-    const std::array<vk::DescriptorPoolSize, 5> poolSizes{
+    const std::array<vk::DescriptorPoolSize, 7> poolSizes{
         vk::DescriptorPoolSize{vk::DescriptorType::eUniformBuffer, 256},
-        vk::DescriptorPoolSize{vk::DescriptorType::eStorageBuffer, 256},
+        vk::DescriptorPoolSize{vk::DescriptorType::eStorageBuffer, 2048},
         vk::DescriptorPoolSize{vk::DescriptorType::eCombinedImageSampler, 256},
         vk::DescriptorPoolSize{vk::DescriptorType::eSampledImage, rhi::kMaxBindlessTextures},
         vk::DescriptorPoolSize{vk::DescriptorType::eSampler, 64},
+        vk::DescriptorPoolSize{vk::DescriptorType::eStorageImage, 256},
+        vk::DescriptorPoolSize{vk::DescriptorType::eAccelerationStructureKHR, 64},
     };
 
     const vk::DescriptorPoolCreateInfo createInfo =
@@ -653,6 +807,63 @@ void VkDevice::WaitForFrame(std::uint32_t frame)
     if (result != vk::Result::eSuccess)
     {
         MRE_ERROR("Failed to wait for frame {} ({})", frame, vk::to_string(result));
+    }
+}
+
+void VkDevice::LogDeviceFault()
+{
+    if (!m_deviceFaultSupported || m_device == nullptr)
+    {
+        return;
+    }
+
+    const auto getFaultInfo = reinterpret_cast<PFN_vkGetDeviceFaultInfoEXT>(
+        m_device.getProcAddr("vkGetDeviceFaultInfoEXT"));
+    if (getFaultInfo == nullptr)
+    {
+        return;
+    }
+
+    VkDeviceFaultCountsEXT counts{};
+    counts.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT;
+    if (getFaultInfo(*m_device, &counts, nullptr) != VK_SUCCESS)
+    {
+        return;
+    }
+
+    std::vector<VkDeviceFaultAddressInfoEXT> addressInfos(counts.addressInfoCount);
+    std::vector<VkDeviceFaultVendorInfoEXT> vendorInfos(counts.vendorInfoCount);
+    std::vector<std::byte> vendorBinary(counts.vendorBinarySize);
+
+    VkDeviceFaultInfoEXT info{};
+    info.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT;
+    info.pAddressInfos = addressInfos.empty() ? nullptr : addressInfos.data();
+    info.pVendorInfos = vendorInfos.empty() ? nullptr : vendorInfos.data();
+    info.pVendorBinaryData = vendorBinary.empty() ? nullptr : vendorBinary.data();
+
+    if (getFaultInfo(*m_device, &counts, &info) != VK_SUCCESS)
+    {
+        return;
+    }
+
+    MRE_CRITICAL(
+        "Device fault: '{}'",
+        info.description[0] != '\0' ? info.description : "no description");
+    for (const VkDeviceFaultAddressInfoEXT& address : addressInfos)
+    {
+        MRE_CRITICAL(
+            "  address type {} reported 0x{:x} precision 0x{:x}",
+            static_cast<int>(address.addressType),
+            static_cast<unsigned long long>(address.reportedAddress),
+            static_cast<unsigned long long>(address.addressPrecision));
+    }
+    for (const VkDeviceFaultVendorInfoEXT& vendor : vendorInfos)
+    {
+        MRE_CRITICAL(
+            "  vendor fault '{}' code {} data {}",
+            vendor.description,
+            static_cast<unsigned long long>(vendor.vendorFaultCode),
+            static_cast<unsigned long long>(vendor.vendorFaultData));
     }
 }
 

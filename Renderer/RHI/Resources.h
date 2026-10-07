@@ -17,7 +17,10 @@ enum class Format : std::uint8_t
     R8G8B8A8Srgb,
     B8G8R8A8Unorm,
     B8G8R8A8Srgb,
+    R16Sfloat,
+    R16G16Sfloat,
     R16G16B16A16Sfloat,
+    R32Sfloat,
     R32G32Sfloat,
     R32G32B32Sfloat,
     R32G32B32A32Sfloat,
@@ -38,6 +41,9 @@ enum class BufferUsage : std::uint8_t
     Uniform,
     Storage,
     Staging,
+    AccelerationStructure,      // backing storage for an acceleration structure
+    AccelerationStructureInput, // vertex/index/instance data read by an acceleration structure build
+    AccelerationStructureScratch,
 };
 
 enum class TextureUsage : std::uint8_t
@@ -45,6 +51,7 @@ enum class TextureUsage : std::uint8_t
     Sampled = 0,
     ColorAttachment,
     DepthAttachment,
+    Storage,
 };
 
 enum class ShaderStage : std::uint8_t
@@ -61,6 +68,7 @@ enum class ShaderStageMask : std::uint8_t
     Fragment = 2,
     Compute = 4,
     VertexFragment = 3,
+    FragmentCompute = 6,
 };
 
 enum class CullMode : std::uint8_t
@@ -68,6 +76,12 @@ enum class CullMode : std::uint8_t
     None = 0,
     Front,
     Back,
+};
+
+enum class PrimitiveTopology : std::uint8_t
+{
+    TriangleList = 0,
+    LineList,
 };
 
 enum class Filter : std::uint8_t
@@ -90,10 +104,13 @@ enum class DescriptorType : std::uint8_t
     CombinedImageSampler,
     SampledImage,
     Sampler,
+    StorageImage,
+    AccelerationStructure,
 };
 
 inline constexpr std::uint32_t kMaxBindlessTextures = 4096;
 inline constexpr std::uint32_t kMaxBindlessSamplers = 16;
+inline constexpr std::uint32_t kMaxBindlessBuffers = 1024;
 
 struct Extent2D
 {
@@ -114,6 +131,8 @@ struct BufferDesc
     std::uint64_t size = 0;
     BufferUsage usage = BufferUsage::Vertex;
     bool hostVisible = false;
+    bool deviceAddress = false; // expose a buffer device address (ray tracing)
+    std::uint32_t alignment = 0; // optional allocation alignment, 0 for the backend default
 };
 
 class Buffer
@@ -126,10 +145,55 @@ public:
 
     [[nodiscard]] virtual std::uint64_t GetSize() const = 0;
     [[nodiscard]] virtual bool IsHostVisible() const = 0;
+    [[nodiscard]] virtual std::uint64_t GetDeviceAddress() const = 0;
     virtual void Write(const void* data, std::uint64_t size, std::uint64_t offset = 0) = 0;
 
 protected:
     Buffer() = default;
+};
+
+class AccelerationStructure
+{
+public:
+    virtual ~AccelerationStructure();
+
+    AccelerationStructure(const AccelerationStructure&) = delete;
+    AccelerationStructure& operator=(const AccelerationStructure&) = delete;
+
+    // Device address of the acceleration structure handle, used for ray tracing descriptors.
+    [[nodiscard]] virtual std::uint64_t GetDeviceAddress() const = 0;
+    [[nodiscard]] virtual std::uint64_t GetSize() const = 0;
+
+protected:
+    AccelerationStructure() = default;
+};
+
+// Row-major 3x4 transform followed by instance metadata, matching VkAccelerationStructureInstanceKHR.
+struct AccelerationStructureInstance
+{
+    float transform[12] = {
+        1.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 1.0f, 0.0f};
+    std::uint32_t instanceCustomIndex = 0;
+    std::uint32_t instanceMask = 0xFF;
+    const AccelerationStructure* bottomLevel = nullptr;
+};
+
+struct BottomLevelAccelerationStructureDesc
+{
+    const Buffer* vertexBuffer = nullptr;
+    std::uint32_t vertexStride = 0;
+    std::uint32_t vertexCount = 0;
+    const Buffer* indexBuffer = nullptr;
+    std::uint32_t indexCount = 0;
+    bool fastTrace = true;
+};
+
+struct TopLevelAccelerationStructureDesc
+{
+    std::span<const AccelerationStructureInstance> instances{};
+    bool fastTrace = true;
 };
 
 struct TextureDesc
@@ -141,6 +205,8 @@ struct TextureDesc
     const void* initialData = nullptr;
     std::uint64_t initialDataSize = 0;
     std::uint32_t arrayLayers = 1;
+    // depth > 1 creates a 3D texture (arrayLayers must stay 1).
+    std::uint32_t depth = 1;
 };
 
 class Texture
@@ -156,6 +222,8 @@ public:
     [[nodiscard]] virtual Format GetFormat() const = 0;
     [[nodiscard]] virtual TextureUsage GetUsage() const = 0;
     [[nodiscard]] virtual std::uint32_t GetArrayLayers() const = 0;
+    // 1 for 2D textures, the slice count for 3D textures.
+    [[nodiscard]] virtual std::uint32_t GetDepth() const = 0;
     [[nodiscard]] virtual std::uint32_t GetBindlessIndex() const = 0;
 
 protected:
@@ -225,6 +293,8 @@ class VertexLayout
 {
 public:
     void AddAttribute(std::uint32_t location, Format format);
+    // Explicit offset for shaders that consume a subset of an interleaved vertex format.
+    void AddAttribute(std::uint32_t location, Format format, std::uint32_t offset);
 
     // Overrides the vertex binding stride for pipelines that only consume a prefix of the vertex
     // format (for example a depth-only shadow pipeline). Attribute offsets keep using the stride
@@ -311,6 +381,14 @@ public:
     virtual void BindTexture(std::uint32_t binding, const Texture& texture, std::uint32_t arrayIndex) = 0;
     virtual void BindSampler(std::uint32_t binding, const Sampler& sampler) = 0;
     virtual void BindSampler(std::uint32_t binding, const Sampler& sampler, std::uint32_t arrayIndex) = 0;
+    virtual void BindStorageImage(std::uint32_t binding, const Texture& texture) = 0;
+    virtual void BindStorageBuffer(
+        std::uint32_t binding,
+        const Buffer& buffer,
+        std::uint32_t arrayIndex = 0) = 0;
+    virtual void BindAccelerationStructure(
+        std::uint32_t binding,
+        const AccelerationStructure& accelerationStructure) = 0;
 
 protected:
     DescriptorSet() = default;
@@ -333,6 +411,7 @@ struct PipelineDesc
     float depthBiasClamp = 0.0f;
     bool blend = false;
     CullMode cullMode = CullMode::Back;
+    PrimitiveTopology topology = PrimitiveTopology::TriangleList;
     std::uint32_t pushConstantSize = 0;
     ShaderStageMask pushConstantStages = ShaderStageMask::Vertex;
     std::vector<const DescriptorSetLayout*> descriptorSetLayouts{};

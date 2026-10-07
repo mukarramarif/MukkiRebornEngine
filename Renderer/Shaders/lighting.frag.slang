@@ -1,12 +1,23 @@
 struct SceneUniform
 {
     float4x4 viewProjection;
+    float4x4 previousViewProjection;
     float4x4 view;
+    float4x4 inverseViewProjection;
     float4 cameraPosition;
     float4 ambientColor;
     float4 clusterParams; // x: near, y: far, z: tile size in pixels, w: z slice count
     uint4 clusterGrid;    // x, y, z grid dimensions, w: light count
-    float4 screenSize;    // x: width, y: height
+    float4 screenSize;
+    float4 reflectionParams; // x: reflection intensity
+    float4 sunDirection;     // xyz: direction toward the sun
+    float4 sunColor;         // rgb: color * intensity
+    float4 skySh[9];         // environment irradiance / pi SH L2
+    float4 skyParams;        // x: enabled, y: intensity, z: sun disc, w: unused
+    float4 skyZenith;
+    float4 skyHorizon;
+    float4 skyGround;
+    float4 skyMap;    // x: bindless index, y: sampler index, z: has map, w: unused
 };
 
 struct GpuLight
@@ -21,7 +32,37 @@ struct ShadowUniform
 {
     float4x4 viewProjections[20]; // 4 cascades + 4 spots + 2 point lights * 6 faces
     float4 cascadeSplits;
-    float4 params; // x: depthBias, y: normalBias, z: distance, w: enabled
+    float4 params;   // x: depthBias, y: normalBias, z: distance, w: enabled
+    float4 rtParams; // x: ray traced sun shadows enabled, y/z/w: unused
+};
+
+struct GpuGiProbe
+{
+    float4 position; // xyz: world position
+    float4 sh0;      // L0 rgb
+    float4 shX;
+    float4 shY;
+    float4 shZ;
+};
+
+// Must match DeferredRenderer::GpuObjectData.
+struct GpuObjectData
+{
+    float4x4 previousModel;
+    float4 specular;
+    uint4 specularTextureIndices;
+    uint4 specularSamplerIndices;
+    float4 volume;
+    float4 attenuation;
+    uint4 volumeTextureIndices;
+    uint4 volumeSamplerIndices;
+    float4 alpha;
+    float4 sheen;
+    uint4 sheenTextureIndices;
+    uint4 sheenSamplerIndices;
+    float4 emissive; // rgb: emissiveFactor (incl. strength)
+    uint4 emissiveTextureIndices;
+    uint4 emissiveSamplerIndices;
 };
 
 [[vk::binding(0, 0)]] ConstantBuffer<SceneUniform> gScene;
@@ -36,15 +77,36 @@ struct ShadowUniform
 [[vk::binding(9, 0)]] SamplerComparisonState gShadowSampler;
 [[vk::binding(10, 0)]] Texture2DArray gSpotShadowMap;
 [[vk::binding(11, 0)]] Texture2D gPointShadowMap;
+[[vk::binding(12, 0)]] Texture2D gIndirect;
+[[vk::binding(13, 0)]] Texture2D<float> gRtSunShadow;
+[[vk::binding(14, 0)]] StructuredBuffer<GpuGiProbe> gGiProbes;
+[[vk::binding(15, 0)]] Texture2D gReflections;
+[[vk::binding(16, 0)]] Texture2D gSpecularF0;
+[[vk::binding(17, 0)]] Texture2D gTransmissionMaterial; // x: transmission, y: ior, z: thickness, w: attenuationDistance
+[[vk::binding(18, 0)]] Texture2D gSheenMaterial;        // rgb: sheen color, a: sheen roughness
+[[vk::binding(19, 0)]] StructuredBuffer<GpuObjectData> gObjects;
+[[vk::binding(20, 0)]] Texture2D gMotion; // xy: motion, zw: object UV
+[[vk::binding(21, 0)]] Texture2D gBrdfLut; // r: scale, g: bias (split-sum)
+[[vk::binding(22, 0)]] SamplerState gBrdfLutSampler;
+[[vk::binding(23, 0)]] Texture2D gClouds; // rgb: scattering, a: transmittance
+[[vk::binding(24, 0)]] SamplerState gCloudSampler;
+[[vk::binding(25, 0)]] Texture2D gGodRays; // rgb: sun-tinted god rays
+
+[[vk::binding(0, 1)]] Texture2D gTextures[];
+[[vk::binding(1, 1)]] SamplerState gSamplers[16];
 
 static const uint kMaxLightsPerCluster = 64;
 static const uint kLightTypeDirectional = 0;
 static const uint kLightTypePoint = 1;
-static const float kPi = 3.14159265359;
+#include "brdf.slang"
+#include "sheen_brdf.slang"
+#include "sky.slang"
+
 static const float kShadowMapSize = 1024.0;
 static const float kShadowCompareBiasScale = 0.0002;
 static const float kPerspectiveCompareBiasScale = 0.001;
 
+static const uint kMaxGiProbes = 64;
 static const uint kShadowCascadeCount = 4;
 static const uint kMaxSpotShadowLights = 4;
 static const uint kSpotShadowOffset = kShadowCascadeCount;
@@ -65,51 +127,6 @@ float3 acesTonemap(float3 color)
     return saturate((color * (a * color + b)) / (color * (c * color + d) + e));
 }
 
-float3 fresnelSchlick(float cosTheta, float3 f0)
-{
-    return f0 + (1.0 - f0) * pow(saturate(1.0 - cosTheta), 5.0);
-}
-
-float distributionGgx(float nDotH, float roughness)
-{
-    const float a = roughness * roughness;
-    const float a2 = a * a;
-    const float denominator = nDotH * nDotH * (a2 - 1.0) + 1.0;
-    return a2 / max(kPi * denominator * denominator, 1e-6);
-}
-
-float geometrySchlickGgx(float nDotX, float roughness)
-{
-    const float r = roughness + 1.0;
-    const float k = (r * r) / 8.0;
-    return nDotX / max(nDotX * (1.0 - k) + k, 1e-4);
-}
-
-float3 evaluateBrdf(
-    float3 albedo,
-    float metalness,
-    float roughness,
-    float3 normal,
-    float3 viewDirection,
-    float3 lightDirection,
-    float3 radiance,
-    float nDotL)
-{
-    const float3 halfVector = normalize(viewDirection + lightDirection);
-    const float nDotV = max(dot(normal, viewDirection), 1e-4);
-    const float nDotH = max(dot(normal, halfVector), 0.0);
-    const float vDotH = max(dot(viewDirection, halfVector), 0.0);
-
-    const float3 f0 = lerp(float3(0.04, 0.04, 0.04), albedo, metalness);
-    const float3 fresnel = fresnelSchlick(vDotH, f0);
-    const float distribution = distributionGgx(nDotH, roughness);
-    const float geometry = geometrySchlickGgx(nDotV, roughness) * geometrySchlickGgx(nDotL, roughness);
-    const float3 specular = (distribution * geometry * fresnel) / max(4.0 * nDotV * nDotL, 1e-4);
-
-    const float3 diffuseWeight = (1.0 - fresnel) * (1.0 - metalness);
-    return (diffuseWeight * albedo / kPi + specular) * radiance * nDotL;
-}
-
 float distanceAttenuation(float distance, float range)
 {
     const float distanceSquared = max(distance * distance, 1e-4);
@@ -120,11 +137,30 @@ float distanceAttenuation(float distance, float range)
     return cutoff * cutoff / distanceSquared;
 }
 
-float sampleShadowFactor(float3 worldPosition, float3 normal)
+float sampleShadowFactor(float3 worldPosition, float3 normal, int2 pixel)
 {
     if (gShadow.params.w < 0.5)
     {
         return 1.0;
+    }
+
+    if (gShadow.rtParams.x > 0.5)
+    {
+        // Ray traced sun visibility. The mask is binary per sample, so average a small
+        // neighborhood to soften the shadow edges.
+        const int2 size = int2(gScene.screenSize.xy);
+        float visibility = 0.0;
+        [unroll]
+        for (int y = -1; y <= 1; ++y)
+        {
+            [unroll]
+            for (int x = -1; x <= 1; ++x)
+            {
+                const int2 tap = clamp(pixel + int2(x, y), int2(0, 0), size - 1);
+                visibility += gRtSunShadow.Load(int3(tap, 0)).r;
+            }
+        }
+        return visibility / 9.0;
     }
 
     const float viewDepth = -mul(gScene.view, float4(worldPosition, 1.0)).z;
@@ -312,7 +348,32 @@ float4 fragmentMain(VertexOutput input) : SV_Target
 
     if (worldPosition.w < 0.5)
     {
-        return float4(gScene.ambientColor.rgb, 1.0);
+        float3 sky = gScene.ambientColor.rgb;
+        if (gScene.skyParams.x > 0.5)
+        {
+            const float2 ndc = input.uv * 2.0 - 1.0;
+            const float4 clip = mul(gScene.inverseViewProjection, float4(ndc, 1.0, 1.0));
+            const float3 direction =
+                normalize(clip.xyz / max(clip.w, 1e-6) - gScene.cameraPosition.xyz);
+            sky = EnvironmentBackground(
+                direction,
+                gScene.skyZenith.rgb,
+                gScene.skyHorizon.rgb,
+                gScene.skyGround.rgb,
+                gScene.skyParams.y,
+                gScene.sunDirection.xyz,
+                gScene.sunColor.rgb,
+                gScene.skyParams.z,
+                uint(gScene.skyMap.x + 0.5),
+                uint(gScene.skyMap.y + 0.5),
+                gScene.skyMap.z > 0.5);
+        }
+
+        // Nubis-style clouds composite over the sky: coverage attenuates the background and adds
+        // the in-scattered light.
+        const float4 clouds = gClouds.Sample(gCloudSampler, input.uv);
+        sky = sky * clouds.a + clouds.rgb + gGodRays.Sample(gCloudSampler, input.uv).rgb;
+        return float4(acesTonemap(sky), 1.0);
     }
 
     const float3 albedo = albedoMetalness.rgb;
@@ -320,10 +381,36 @@ float4 fragmentMain(VertexOutput input) : SV_Target
     const float3 normal = normalize(normalRoughness.xyz * 2.0 - 1.0);
     const float roughness = clamp(normalRoughness.a, 0.04, 1.0);
     const float3 viewDirection = normalize(gScene.cameraPosition.xyz - worldPosition.xyz);
+    const float3 dielectricF0 = gSpecularF0.Load(int3(int2(input.position.xy), 0)).rgb;
+    const float3 f0 = lerp(dielectricF0, albedo, metalness);
+    // Transmissive surfaces keep only the (1 - transmission) part of the surface response; the
+    // traced specular signal carries the reflection + refraction lobes.
+    const float transmission = saturate(gTransmissionMaterial.Load(int3(int2(input.position.xy), 0)).x);
+    const float surfaceWeight = 1.0 - transmission;
+    const float4 sheenMaterial = gSheenMaterial.Load(int3(int2(input.position.xy), 0));
+    const float3 sheenColor = sheenMaterial.rgb;
+    const float sheenRoughness = sheenMaterial.a;
 
-    float3 color = gScene.ambientColor.rgb * albedo;
+    // Emissive: position.w stores the object index + 1 (0 = sky) and motion.zw the object UV, so
+    // the emissive texture is sampled with its real texture coordinates instead of screen UVs.
+    const float4 gbufferMotion = gMotion.Load(int3(int2(input.position.xy), 0));
+    float3 emissive = 0.0;
+    if (worldPosition.w > 0.5)
+    {
+        const GpuObjectData object = gObjects[uint(worldPosition.w - 0.5)];
+        const float3 emissiveSample =
+            gTextures[NonUniformResourceIndex(object.emissiveTextureIndices.x)].Sample(
+                gSamplers[NonUniformResourceIndex(object.emissiveSamplerIndices.x)],
+                gbufferMotion.zw).rgb;
+        emissive = object.emissive.rgb * emissiveSample;
+    }
 
-    const float shadowFactor = sampleShadowFactor(worldPosition.xyz, normal);
+    // Ambient/indirect diffuse: SH irradiance from the environment, or the flat ambient fallback.
+    float3 color = gScene.skyParams.x > 0.5
+                       ? EvaluateSkySh(gScene.skySh, normal) * albedo * (1.0 - metalness) * surfaceWeight
+                       : gScene.ambientColor.rgb * albedo * surfaceWeight;
+
+    const float shadowFactor = sampleShadowFactor(worldPosition.xyz, normal, int2(input.position.xy));
 
     const uint clusterIndex = clusterIndexOf(worldPosition.xyz, input.position.xy);
     const uint clusterBase = clusterIndex * kMaxLightsPerCluster;
@@ -396,17 +483,81 @@ float4 fragmentMain(VertexOutput input) : SV_Target
         const float nDotL = max(dot(normal, lightDirection), 0.0);
         if (nDotL > 0.0)
         {
-            color += evaluateBrdf(
-                albedo,
-                metalness,
-                roughness,
-                normal,
-                viewDirection,
-                lightDirection,
-                radiance,
-                nDotL);
+            color += EvaluateCookTorrance(
+                         albedo,
+                         f0,
+                         metalness,
+                         roughness,
+                         normal,
+                         viewDirection,
+                         lightDirection,
+                         radiance) *
+                     surfaceWeight;
+            color += EvaluateSheenBRDF(
+                         sheenColor,
+                         sheenRoughness,
+                         normal,
+                         viewDirection,
+                         lightDirection,
+                         radiance,
+                         nDotL) *
+                     surfaceWeight;
         }
     }
 
-    return float4(acesTonemap(color), 1.0);
+    if (gScene.skyParams.x > 0.5)
+    {
+        // Image based specular: prefiltered environment times the split-sum BRDF terms.
+        const float3 reflection = reflect(-viewDirection, normal);
+        const float3 prefiltered = EnvironmentPrefiltered(
+            reflection,
+            roughness,
+            gScene.skyZenith.rgb,
+            gScene.skyHorizon.rgb,
+            gScene.skyGround.rgb,
+            gScene.skyParams.y,
+            gScene.skySh,
+            uint(gScene.skyMap.x + 0.5),
+            uint(gScene.skyMap.y + 0.5),
+            gScene.skyMap.z > 0.5);
+        const float2 brdf = gBrdfLut
+                                .Sample(gBrdfLutSampler, float2(saturate(dot(normal, viewDirection)), roughness))
+                                .rg;
+        color += prefiltered * (f0 * brdf.x + brdf.y) * surfaceWeight;
+    }
+
+    if (gScene.screenSize.w > 0.5)
+    {
+        color += gIndirect.Load(int3(int2(input.position.xy), 0)).rgb * surfaceWeight;
+    }
+    else if (gScene.ambientColor.w > 0.5)
+    {
+        // Probe GI: inverse distance blend of the surrounding irradiance probes.
+        const uint probeCount = min(uint(gScene.ambientColor.w + 0.5), kMaxGiProbes);
+        float3 indirect = 0.0;
+        float weightSum = 0.0;
+        for (uint probeIndex = 0; probeIndex < probeCount; ++probeIndex)
+        {
+            const GpuGiProbe probe = gGiProbes[probeIndex];
+            const float3 offset = probe.position.xyz - worldPosition.xyz;
+            const float weight = 1.0 / (dot(offset, offset) + 0.05);
+            indirect +=
+                (probe.sh0.rgb + probe.shX.rgb * normal.x + probe.shY.rgb * normal.y +
+                 probe.shZ.rgb * normal.z) * weight;
+            weightSum += weight;
+        }
+        if (weightSum > 0.0)
+        {
+            color += albedo * indirect / weightSum * surfaceWeight;
+        }
+    }
+
+    if (gScene.reflectionParams.x > 0.0)
+    {
+        // Ray traced glossy reflections (already fresnel weighted) at the GI trace resolution.
+        color += gReflections.Load(int3(int2(input.position.xy), 0)).rgb *
+                 gScene.reflectionParams.x;
+    }
+
+    return float4(acesTonemap(color + emissive), 1.0);
 }

@@ -29,6 +29,13 @@ mukki::SceneDescription MakeScene()
     duck.modelPath = "Duck.gltf";
     scene.objects.push_back(duck);
 
+    mukki::SceneProbe probe{};
+    probe.name = "Probe";
+    probe.position = glm::vec3{-1.0f, 2.5f, 3.5f};
+    probe.radius = 0.75f;
+    probe.enabled = false;
+    scene.probes.push_back(probe);
+
     mukki::SceneLight sun{};
     sun.name = "Sun";
     sun.light.type = mukki::LightType::Directional;
@@ -71,6 +78,12 @@ TEST(SceneBinary, RoundTrips)
     EXPECT_FLOAT_EQ(decoded.objects[0].position.y, scene.objects[0].position.y);
     EXPECT_FLOAT_EQ(decoded.objects[0].rotation.z, scene.objects[0].rotation.z);
     EXPECT_FLOAT_EQ(decoded.objects[0].scale.x, scene.objects[0].scale.x);
+
+    ASSERT_EQ(decoded.probes.size(), scene.probes.size());
+    EXPECT_EQ(decoded.probes[0].name, scene.probes[0].name);
+    EXPECT_FLOAT_EQ(decoded.probes[0].position.y, scene.probes[0].position.y);
+    EXPECT_FLOAT_EQ(decoded.probes[0].radius, scene.probes[0].radius);
+    EXPECT_FALSE(decoded.probes[0].enabled);
 
     ASSERT_EQ(decoded.lights.size(), scene.lights.size());
     EXPECT_EQ(decoded.lights[0].light.type, mukki::LightType::Directional);

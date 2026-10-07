@@ -38,6 +38,25 @@ TEST(Camera, PitchIsClamped)
     EXPECT_LT(std::abs(camera.GetPitch()), 1.5707963268f);
 }
 
+// Documents the NDC convention used by the screen-space reprojections: the projection flips y and
+// the viewport has a positive height, so world-up maps to negative NDC y (top of the framebuffer,
+// since Vulkan's framebuffer y grows downward). NDC -> uv must therefore be uv.y = ndc.y * 0.5 + 0.5.
+TEST(Camera, WorldUpMapsToNegativeNdcY)
+{
+    mukki::Camera camera{};
+    camera.SetPerspective(1.0471975512f, 1.0f, 0.1f, 100.0f);
+    camera.SetPosition(glm::vec3{0.0f, 0.0f, 0.0f});
+    camera.SetRotation(0.0f, 0.0f);
+
+    const glm::vec4 above = camera.GetViewProjectionMatrix() * glm::vec4{0.0f, 10.0f, -10.0f, 1.0f};
+    ASSERT_GT(above.w, 0.0f);
+    EXPECT_LT(above.y / above.w, 0.0f);
+
+    const glm::vec4 below = camera.GetViewProjectionMatrix() * glm::vec4{0.0f, -10.0f, -10.0f, 1.0f};
+    ASSERT_GT(below.w, 0.0f);
+    EXPECT_GT(below.y / below.w, 0.0f);
+}
+
 TEST(Camera, ViewProjectionIsProjectionTimesView)
 {
     mukki::Camera camera{};

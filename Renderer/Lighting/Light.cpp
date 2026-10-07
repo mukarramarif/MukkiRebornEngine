@@ -8,6 +8,28 @@
 namespace mukki
 {
 
+std::vector<GpuLight> SelectGiLights(std::span<const Light> lights, std::uint32_t maxCount)
+{
+    std::vector<GpuLight> selected{};
+    selected.reserve(std::min<std::size_t>(lights.size(), maxCount));
+    for (const Light& light : lights)
+    {
+        if (selected.size() >= maxCount)
+        {
+            break;
+        }
+        if (light.type != LightType::Point && light.type != LightType::Spot)
+        {
+            continue;
+        }
+
+        GpuLight gpu = ToGpuLight(light);
+        gpu.params.w = light.castShadows ? 1.0f : 0.0f;
+        selected.push_back(gpu);
+    }
+    return selected;
+}
+
 GpuLight ToGpuLight(const Light& light)
 {
     const float directionLength = glm::length(light.direction);

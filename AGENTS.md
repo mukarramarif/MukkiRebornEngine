@@ -30,6 +30,38 @@ must not expose backend types, and Vulkan types may only appear under `Renderer/
   [scene.mres]`; the sandbox compiles and loads `Sandbox/Scenes/demo.scene.json`. `DeferredRenderer
   ::LoadScene` loads/caches the referenced glTF models and instantiates them. A scene graph and
   entity-component-system architecture is still planned.
+- Materials: glTF `alphaMode = MASK` is supported. The flag and `alphaCutoff` are packed into
+  `ObjectPushConstants.params.z/.w` (set by `DeferredRenderer` from `GltfMaterial`), the G-buffer
+  discards `baseColor.a * baseColorFactor.a < cutoff`, and the shadow fragment stage alpha-tests
+  through the bindless base color texture (the shadow pipeline binds the bindless set as set 1 and
+  uses explicit vertex attribute offsets for position/uv). Ray traced hit shading also honours
+  coverage: MASK hits below the cutoff are skipped and BLEND hits are stochastically accepted
+  (`GpuGeometryData.params.z` = alpha mode 0/1/2, `.w` = cutoff). Emissive is supported
+  (`emissiveFactor` scaled by `KHR_materials_emissive_strength` + `emissiveTexture`): the G-buffer
+  stores the object index + 1 in `position.w` and the object UV in `motion.zw`, the lighting pass
+  fetches `GpuObjectData` for the factor and samples the emissive texture, the transparent pass
+  reads it through `gObjects`, and ray traced hit shading adds `GpuGeometryData.emissive`.
+  `KHR_materials_specular` is supported: factor/color and the extension textures travel through the
+  extended `GpuObjectData` SSBO (read by the G-buffer fragment), and the dielectric F0 is baked into
+  the fifth G-buffer target (`GBuffer::GetSpecularF0`, 0.04 default); lighting and reflections use
+  `f0 = lerp(specularF0, albedo, metalness)`.
+  Transparency: `alphaMode = BLEND` surfaces skip the G-buffer and are drawn by a sorted
+  back-to-front forward pass after lighting (`BeginSwapchainRendering` depth overload, depth test
+  against the G-buffer depth, no depth write); shadow maps still include them. `KHR_materials_ior`,
+  `transmission`, `volume` and `dispersion` are packed into G-buffer targets 5/6
+  (`GBuffer::GetTransmission/GetAttenuation`); `rt_reflections` splits the microfacet lobe into
+  reflection/refraction by fresnel and `ShadeHit` (`gi_shading.slang`) follows up to `params7.x`
+  dielectric bounces with Beer-Lambert absorption and optional 3-channel dispersion. The lighting
+  pass scales the surface terms by `(1 - transmission)` and composites the traced dielectric signal,
+  so glass is reflected/refracted consistently in reflections, GI and probes.
+- Debug gizmos: `Renderer/Debug/DebugLines.h` builds CPU line lists (`DebugLines`) for light and
+  probe markers; `DeferredRenderer::RecordDebugLines` draws them at the end of the swapchain
+  lighting scope with a `PrimitiveTopology::LineList` pipeline (push constant viewProjection, no
+  depth). World space GI probes are authored as `SceneDescription::probes` (JSON + scene binary v4);
+  the sandbox feeds `GiProbe` markers through `SetGiProbes` and toggles them with `SetGizmoView`.
+  The probe UI can `Fill scene`/`Maximize probes`, distributing a Halton set of up to
+  `kMaxGiProbes` probes over `DeferredRenderer::GetSceneBounds`.
+  Probe markers are generated from the uploaded GI probe data and show the SH direction arrow.
 - Namespace `mukki`; PascalCase files/types/methods; `m_` prefixed members.
 - Multithreading: `Core/JobSystem` is the shared thread pool. glTF parsing runs asynchronously
   (`Assets/AsyncGltfLoader`) and the G-buffer draw calls are recorded into secondary command buffers
@@ -53,6 +85,88 @@ must not expose backend types, and Vulkan types may only appear under `Renderer/
   areas/viewports for atlas tiles, comparison samplers and dynamic depth bias. The lighting pass
   does 3x3 hardware PCF with a normal bias from `ShadowSettings` (UI-adjustable); spot/point slot
   indices are packed into `GpuLight::params.w`.
+- Ray traced sun shadows: optional (`ShadowSettings.rtSunShadows`, requires ray tracing).
+  `Renderer/Shaders/rt_shadows.comp.slang` reconstructs the surface from the G-buffer position/normal
+  and traces `rtShadowSamples` jittered rays toward the sun into a full-res `R16Sfloat` mask; the
+  lighting pass samples binding 13 and uses it instead of the cascades while `ShadowUniform.rtParams.x`
+  is set; the GI trace also samples it (set 0 binding 9, `GiUniform.params4.w`) for hit points that
+  are visible on screen, falling back to jittered shadow rays otherwise. The pass binds the TLAS +
+  G-buffer textures per frame after the G-buffer pass; the mask is bound as a fallback white texture
+  when inactive. Spot/point shadows remain cascaded maps.
+- Ray traced reflections: optional (`ReflectionSettings`, requires ray tracing).
+  `rt_reflections.comp.slang` traces `samples` Heitz GGX VNDF rays per pixel at
+  `ReflectionSettings::resolutionScale` (default 1.0, i.e. full resolution; the trace/temporal/
+  a-trous/upsample sizes come from `GiUniform.reflectionSize`), shades hits through the shared
+  `gi_shading.slang` (screen-space feedback disabled by binding the 1x1 black texture) and weights
+  by `Schlick fresnel * Smith G2/G1`. Surfaces fade out toward `maxRoughness` while the GI specular
+  signal fades in over the same band, so the specular integral is not double counted (when
+  reflections are inactive `params6.w = 0` makes the GI trace cover smooth specular).
+  `reflection_temporal.comp.slang` accumulates with moments and firefly rejection, the a-trous pass
+  reuses the GI atrous pipeline with push-constant signal 2 (which switches the tap mapping to
+  `reflectionSize`), and `reflection_upsample.comp.slang` bilaterally upsamples to full res
+  (roughness-aware). The lighting pass adds binding 15 scaled by `SceneUniform.reflectionParams.x`.
+  `GiUniform.params6` carries the reflection parameters and `params5.w` the history reset flag.
+- Volumetric clouds: Nubis/Decima-style ray marched layer (`Renderer/Clouds/`). `CloudNoise.h/.cpp`
+  generates tileable noise on the JobSystem at init (no authored assets): 128^3 RGBA8 base
+  (r Perlin-Worley, g/b/a Worley octaves), 32^3 detail, 128^2 curl and a 256^2 weather map holding
+  regional variation around 0.5 (the sliders offset coverage/type/altitude in the shader).
+  `clouds.comp.slang` traces the half-resolution layer (`CloudSettings::resolutionScale`, default
+  0.5, sky pixels only so geometry occludes clouds), applies curl distortion and per-cloud-type
+  height gradients, then light-marches toward the sun (cone samples, dual-lobe Henyey-Greenstein,
+  double Beer-Lambert and powder) and writes scattering/transmittance, a sun-occlusion mask and an
+  estimated distance. `cloud_reproject.comp.slang` accumulates per frame slot (world reprojection
+  at the estimated distance with previous view-projection, depth/distance validation, history
+  invalidated by setting changes), `cloud_upsample.comp.slang` resolves to full res, and
+  `cloud_godrays.comp.slang` radially blurs the mask toward the sun's screen position.
+  `lighting.frag` composites `sky * transmittance + scattering + godRays` on sky pixels (bindings
+  23-25). `CloudSettings`/`CloudUniform` (`Renderer/Clouds/CloudSettings.h`) mirror the shaders;
+  noise generation costs ~4 s Debug (<1 s Release) at startup. `.hdr` environment maps, the
+  gradient sky, GI and reflections are unaffected (clouds are sky-only).
+- Image based lighting: `Renderer/Lighting/Environment.h/.cpp` defines a parametric gradient sky
+  (`EnvironmentSettings`); `ComputeEnvironmentSh` numerically projects it onto SH L2 with the
+  Lambert band factors folded in (diffuse = `albedo * EvaluateSkySh`), and `BuildEnvironmentBrdfLut`
+  generates the split-sum LUT (bound at lighting set 0 binding 21/22). `sky.slang` holds the shared
+  evaluation (`SkyRadiance`, `EvaluateSkySh`, `PrefilteredSky`, `SkyBackground`) used by
+  `lighting.frag` (sky background, SH ambient, prefiltered specular) and by the GI/reflection/probe
+  sky misses through `GiSkyRadiance`/`GiIrradianceOverPi`. `SceneUniform`/`GiUniform` carry
+  `skySh[9]`, `skyParams`, the zenith/horizon/ground colors and `skyMap` (bindless index, sampler,
+  has-map). Disabling the environment falls back to the flat `ambientColor`/`skyColor`.
+  Radiance `.hdr` equirectangular maps (`Assets/HdrLoader.h/.cpp`: flat + RLE RGBE decoding, RGBE
+  to half-float packing, `PackHdrToRgba16`) replace the gradient when
+  `EnvironmentSettings::environmentMap` is set (UI `HDR map (.hdr)` / `--env <path>`): the map is
+  uploaded as an `R16G16B16A16Sfloat` texture in the bindless set, its SH is projected by
+  `ComputeEnvironmentSh(equirectRgb, ...)` and the shaders sample it through
+  `EnvironmentRadiance`/`EnvironmentPrefiltered`/`EnvironmentBackground` (equirect convention
+  `u = atan2(z,x)/2pi + 0.5`, `v = acos(y)/pi`, matching the CPU projection).
+- GI probes: world space `SceneDescription::probes` become irradiance probes. When probes are
+  active (`GiSettings.useProbes`, requires ray tracing) `gi_probes.comp.slang` traces `probeRays`
+  uniform-sphere rays per probe through the shared hit shading in `gi_shading.slang`, accumulates
+  premultiplied SH L1 and blends with `probeHysteresis`; the lighting pass inverse-distance blends
+  the probes (binding 14, count in `SceneUniform.ambientColor.w`) and the per-pixel trace + SVGF
+  denoiser are skipped so indirect is not double counted (`IsPerPixelGiActive`). `gi_shading.slang`
+  is an include, not a standalone shader; keep `GiUniform` in sync across all gi_*.slang files.
+- Global illumination: optional hardware ray tracing (`VK_KHR_acceleration_structure`,
+  `VK_KHR_ray_query`, `VK_KHR_deferred_host_operations`; `Device::IsRayTracingSupported()`). The RT
+  entry points are loaded manually by `Renderer/Vulkan/Core/VkRayTracingDispatch` because the Vulkan
+  loader import library does not export them. `Renderer/GlobalIllumination/` holds `GiTypes.h`
+  (`GiSettings`/`GiUniform`, keep in sync with `Renderer/Shaders/gi_*.slang`) and the a-trous
+  schedule (tested). Per frame: half-res trace (`traceSamples` diffuse+specular path pairs per
+  pixel; sun visibility from the RT shadow mask when active, else `sunShadowSamples` jittered rays
+  within `sunAngularRadiusDegrees`; previous-frame feedback) -> SVGF temporal accumulation with
+  moments and firefly rejection -> a-trous ping-pong (variance-clamped taps) ->
+  joint bilateral upsample into `indirect`, composited in `lighting.frag.slang` (`gIndirect`,
+  gated by `SceneUniform.screenSize.w`). Storage textures live in `GENERAL` (transitioned once at
+  creation); each a-trous iteration uses its own descriptor set because updating a descriptor set
+  bound to a recording command buffer invalidates that command buffer. The bindless descriptor set
+  declares `FragmentCompute` stages; geometry buffers need storage usage for the ray hit shading;
+  RT pipelines use two descriptor set layouts (GI set 0 + bindless set 1). Slang gotchas: no
+  lambdas, `RayQuery.CommittedInstanceID()`.
+  Punctual lights feed the hit shading through a dedicated per-frame `GpuLight` buffer bound at set
+  0 binding 13 in `gi_trace`/`gi_probes`/`rt_reflections` (`gi_structs.slang` `kMaxGiLights`,
+  `SelectGiLights` in `Light.cpp`, `GiUniform.params8`: count/shadows/bias). `ShadeOpaqueSurface`
+  shades the sun and every GI light with the shared `brdf.slang` Cook-Torrance evaluation plus one
+  ray traced shadow ray per light (`TraceLightVisibility`); spot cones and the windowed
+  inverse-square falloff match `lighting.frag`.
 - Profiling: Tracy (on-demand). Use the `MRE_PROFILE_*` macros from `Utilities/Profiling.h` for CPU
   zones and `rhi::CommandList::BeginGpuZone/EndGpuZone` for GPU pass zones. Enabled via the
   `*-tracy` CMake presets (`MRE_ENABLE_TRACY=ON`, `VCPKG_MANIFEST_FEATURES=tracy`); connect with the

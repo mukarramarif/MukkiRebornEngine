@@ -1,0 +1,64 @@
+// Zed debug configurations. C++ debugging uses the CodeLLDB adapter over the MSVC debug
+// information (build/windows-debug/Debug/*.pdb).
+// Open the debug panel (F4) and pick a configuration.
+[
+  {
+    "label": "Sandbox (Debug)",
+    "adapter": "CodeLLDB",
+    "request": "launch",
+    "program": "$ZED_WORKTREE_ROOT/build/windows-debug/Debug/mukki_sandbox.exe",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "sourceLanguages": ["cpp"],
+    "build": {
+      "command": "cmake",
+      "args": ["--build", "build/windows-debug", "--config", "Debug"],
+      "cwd": "$ZED_WORKTREE_ROOT"
+    }
+  },
+  {
+    "label": "Sandbox (Debug) - 120 frames",
+    "adapter": "CodeLLDB",
+    "request": "launch",
+    "program": "$ZED_WORKTREE_ROOT/build/windows-debug/Debug/mukki_sandbox.exe",
+    "args": ["--frames", "120"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "sourceLanguages": ["cpp"],
+    "build": {
+      "command": "cmake",
+      "args": ["--build", "build/windows-debug", "--config", "Debug"],
+      "cwd": "$ZED_WORKTREE_ROOT"
+    }
+  },
+  {
+    "label": "Sandbox (Debug) - glTF model",
+    "adapter": "CodeLLDB",
+    "request": "launch",
+    "program": "$ZED_WORKTREE_ROOT/build/windows-debug/Debug/mukki_sandbox.exe",
+    "args": [
+      "--model",
+      "$ZED_WORKTREE_ROOT/ThirdParty/glTF-Sample-Models/2.0/DamagedHelmet/glTF/DamagedHelmet.gltf",
+      "--frames",
+      "120"
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "sourceLanguages": ["cpp"],
+    "build": {
+      "command": "cmake",
+      "args": ["--build", "build/windows-debug", "--config", "Debug"],
+      "cwd": "$ZED_WORKTREE_ROOT"
+    }
+  },
+  {
+    "label": "Tests (Debug)",
+    "adapter": "CodeLLDB",
+    "request": "launch",
+    "program": "$ZED_WORKTREE_ROOT/build/windows-debug/Tests/Debug/mukki_tests.exe",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "sourceLanguages": ["cpp"],
+    "build": {
+      "command": "cmake",
+      "args": ["--build", "build/windows-debug", "--config", "Debug"],
+      "cwd": "$ZED_WORKTREE_ROOT"
+    }
+  }
+]

@@ -10,6 +10,8 @@ namespace mukki::rhi
 
 Buffer::~Buffer() = default;
 
+AccelerationStructure::~AccelerationStructure() = default;
+
 Texture::~Texture() = default;
 
 Sampler::~Sampler() = default;
@@ -24,6 +26,11 @@ Pipeline::~Pipeline() = default;
 
 void VertexLayout::AddAttribute(std::uint32_t location, Format format)
 {
+    AddAttribute(location, format, m_stride);
+}
+
+void VertexLayout::AddAttribute(std::uint32_t location, Format format, std::uint32_t offset)
+{
     const std::uint32_t formatSize = GetFormatSize(format);
     MRE_ASSERT(formatSize > 0, "Vertex attribute format must have a known size");
 
@@ -32,8 +39,8 @@ void VertexLayout::AddAttribute(std::uint32_t location, Format format)
         MRE_ASSERT(attribute.location != location, "Vertex attribute locations must be unique");
     }
 
-    m_attributes.push_back(VertexAttribute{location, format, m_stride});
-    m_stride += formatSize;
+    m_attributes.push_back(VertexAttribute{location, format, offset});
+    m_stride = std::max(m_stride, offset + formatSize);
 }
 
 std::vector<DescriptorBinding> MergeShaderReflectionBindings(
@@ -138,9 +145,14 @@ std::uint32_t GetFormatSize(Format format)
     case Format::B8G8R8A8Srgb:
     case Format::D32Sfloat:
         return 4;
+    case Format::R16Sfloat:
+    case Format::R16G16Sfloat:
+        return 4;
     case Format::R16G16B16A16Sfloat:
     case Format::R32G32Sfloat:
         return 8;
+    case Format::R32Sfloat:
+        return 4;
     case Format::R32G32B32Sfloat:
         return 12;
     case Format::R32G32B32A32Sfloat:

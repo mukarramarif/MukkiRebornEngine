@@ -11,13 +11,21 @@ BufferManager::BufferManager(rhi::Device& device) : m_device(&device) {}
 rhi::Buffer& BufferManager::CreateVertexBuffer(const void* data, std::uint64_t size)
 {
     MRE_ASSERT(data != nullptr, "BufferManager::CreateVertexBuffer requires vertex data");
-    return Store(m_device->CreateBuffer(rhi::BufferDesc{size, rhi::BufferUsage::Vertex, false}, data, size));
+    const bool deviceAddress = m_device->IsRayTracingSupported();
+    return Store(m_device->CreateBuffer(
+        rhi::BufferDesc{size, rhi::BufferUsage::Vertex, false, deviceAddress},
+        data,
+        size));
 }
 
 rhi::Buffer& BufferManager::CreateIndexBuffer(const void* data, std::uint64_t size)
 {
     MRE_ASSERT(data != nullptr, "BufferManager::CreateIndexBuffer requires index data");
-    return Store(m_device->CreateBuffer(rhi::BufferDesc{size, rhi::BufferUsage::Index, false}, data, size));
+    const bool deviceAddress = m_device->IsRayTracingSupported();
+    return Store(m_device->CreateBuffer(
+        rhi::BufferDesc{size, rhi::BufferUsage::Index, false, deviceAddress},
+        data,
+        size));
 }
 
 rhi::Buffer& BufferManager::CreateUniformBuffer(std::uint64_t size)

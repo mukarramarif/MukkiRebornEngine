@@ -53,6 +53,17 @@ function(mre_add_slang_shaders target)
     set(output_dir "${CMAKE_CURRENT_BINARY_DIR}/shaders")
     set(spirv_outputs "")
 
+    # Slang include dependencies are not tracked by the compiler invocation, so every shader
+    # depends on all shaders in the directory. Without this, editing a shared include such as
+    # gi_structs.slang leaves other shaders compiled against a stale struct layout, which reads
+    # garbage indices and faults the GPU.
+    if(ARGN)
+        list(GET ARGN 0 mre_first_shader)
+        get_filename_component(mre_shader_directory
+            "${CMAKE_CURRENT_SOURCE_DIR}/${mre_first_shader}" DIRECTORY)
+        file(GLOB shader_sources "${mre_shader_directory}/*.slang")
+    endif()
+
     foreach(shader IN LISTS ARGN)
         get_filename_component(shader_file_name "${shader}" NAME)
         string(REGEX REPLACE "\\.slang$" "" shader_name "${shader_file_name}")
@@ -65,7 +76,7 @@ function(mre_add_slang_shaders target)
                 -matrix-layout-column-major
                 -fvk-use-entrypoint-name
                 -o "${spirv}"
-            DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${shader}"
+            DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${shader}" ${shader_sources}
             COMMENT "Compiling Slang shader ${shader}"
             VERBATIM
         )
@@ -93,15 +104,20 @@ add_library(mukki_engine STATIC
     Application/Window.cpp
     Assets/AsyncGltfLoader.cpp
     Assets/GltfLoader.cpp
+    Assets/HdrLoader.cpp
     Core/Engine.cpp
     Core/JobSystem.cpp
     Core/Time.cpp
     Renderer/BufferManager.cpp
+    Renderer/Clouds/CloudNoise.cpp
+    Renderer/Debug/DebugLines.cpp
     Renderer/Deferred/DeferredRenderer.cpp
     Renderer/Deferred/GBuffer.cpp
-    Renderer/Lighting/ClusterGrid.cpp
-    Renderer/Lighting/Light.cpp
-    Renderer/Lighting/ShadowCascade.cpp
+    Renderer/GlobalIllumination/GiAtrousSchedule.cpp
+Renderer/Lighting/ClusterGrid.cpp
+Renderer/Lighting/Environment.cpp
+Renderer/Lighting/Light.cpp
+Renderer/Lighting/ShadowCascade.cpp
     Renderer/RHI/Resources.cpp
     Scene/SceneBinary.cpp
     Scene/SceneDescription.cpp
@@ -112,8 +128,10 @@ add_library(mukki_engine STATIC
     Renderer/Vulkan/Core/VkDevice.cpp
     Renderer/Vulkan/Core/VkInstance.cpp
     Renderer/Vulkan/Core/VkPipeline.cpp
+    Renderer/Vulkan/Core/VkRayTracingDispatch.cpp
     Renderer/Vulkan/Core/VkShader.cpp
     Renderer/Vulkan/Core/VkSwapchain.cpp
+    Renderer/Vulkan/Resources/AccelerationStructure.cpp
     Renderer/Vulkan/Resources/Buffer.cpp
     Renderer/Vulkan/Resources/DescriptorSet.cpp
     Renderer/Vulkan/Resources/ResourceAllocator.cpp
@@ -173,14 +191,35 @@ if(MRE_BUILD_SANDBOX)
             MRE_SCENES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/Sandbox/Scenes")
     endif()
 
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/AssetLibrary")
+        target_compile_definitions(mukki_sandbox PRIVATE
+            MRE_ASSET_LIBRARY_DIR="${CMAKE_CURRENT_SOURCE_DIR}/AssetLibrary")
+    endif()
+
     mre_add_slang_shaders(mukki_sandbox
         Renderer/Shaders/gbuffer.vert.slang
         Renderer/Shaders/gbuffer.frag.slang
+        Renderer/Shaders/transparent.frag.slang
         Renderer/Shaders/lighting.vert.slang
         Renderer/Shaders/lighting.frag.slang
         Renderer/Shaders/cluster_culling.comp.slang
         Renderer/Shaders/shadow.vert.slang
         Renderer/Shaders/shadow.frag.slang
+        Renderer/Shaders/gi_trace.comp.slang
+        Renderer/Shaders/gi_temporal.comp.slang
+        Renderer/Shaders/gi_atrous.comp.slang
+        Renderer/Shaders/gi_upsample.comp.slang
+        Renderer/Shaders/gi_probes.comp.slang
+        Renderer/Shaders/rt_reflections.comp.slang
+        Renderer/Shaders/reflection_temporal.comp.slang
+        Renderer/Shaders/reflection_upsample.comp.slang
+        Renderer/Shaders/rt_shadows.comp.slang
+        Renderer/Shaders/clouds.comp.slang
+        Renderer/Shaders/cloud_reproject.comp.slang
+        Renderer/Shaders/cloud_godrays.comp.slang
+        Renderer/Shaders/cloud_upsample.comp.slang
+        Renderer/Shaders/debug_line.vert.slang
+        Renderer/Shaders/debug_line.frag.slang
     )
 endif()
 

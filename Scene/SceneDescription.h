@@ -27,6 +27,16 @@ struct SceneLight
     Light light{};
 };
 
+// World space GI probe. Probes are authored independently of the glTF objects and feed the
+// irradiance probe pass; radius only controls the debug marker size.
+struct SceneProbe
+{
+    std::string name{};
+    glm::vec3 position{0.0f}; // world units
+    float radius = 0.5f;
+    bool enabled = true;
+};
+
 // Authoring format shared by the JSON loader and the compiled scene binary. The assets referenced
 // by SceneObject::modelPath live under assetRoot.
 struct SceneDescription
@@ -35,6 +45,7 @@ struct SceneDescription
     std::filesystem::path assetRoot{};
     std::vector<SceneObject> objects{};
     std::vector<SceneLight> lights{};
+    std::vector<SceneProbe> probes{};
 };
 
 [[nodiscard]] glm::mat4 BuildObjectTransform(const SceneObject& object);

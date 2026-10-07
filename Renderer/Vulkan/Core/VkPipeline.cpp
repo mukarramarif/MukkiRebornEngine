@@ -110,9 +110,10 @@ VkPipeline::VkPipeline(const vk::raii::Device& device, const rhi::PipelineDesc& 
             .setVertexBindingDescriptions(bindingDescriptions)
             .setVertexAttributeDescriptions(attributeDescriptions);
 
-    const vk::PipelineInputAssemblyStateCreateInfo inputAssemblyState = vk::PipelineInputAssemblyStateCreateInfo{}
-                                                                            .setTopology(vk::PrimitiveTopology::eTriangleList)
-                                                                            .setPrimitiveRestartEnable(false);
+    const vk::PipelineInputAssemblyStateCreateInfo inputAssemblyState =
+        vk::PipelineInputAssemblyStateCreateInfo{}
+            .setTopology(ToVkTopology(desc.topology))
+            .setPrimitiveRestartEnable(false);
 
     const std::array<vk::DynamicState, 3> dynamicStates{
         vk::DynamicState::eViewport,

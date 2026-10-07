@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <span>
+#include <vector>
 
 #include <glm/vec3.hpp>
 #include <glm/vec4.hpp>
@@ -39,5 +41,11 @@ struct GpuLight
 };
 
 [[nodiscard]] GpuLight ToGpuLight(const Light& light);
+
+// Punctual lights (point and spot) packed for the ray traced GI light buffer. `GpuLight::params.w`
+// carries the cast-shadows flag because this buffer is separate from the clustered light buffer.
+[[nodiscard]] std::vector<GpuLight> SelectGiLights(
+    std::span<const Light> lights,
+    std::uint32_t maxCount);
 
 } // namespace mukki

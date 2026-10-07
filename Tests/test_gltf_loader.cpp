@@ -47,6 +47,138 @@ TEST(GltfLoader, LoadsDamagedHelmet)
     }
 }
 
+TEST(GltfLoader, ParsesTransmissionMaterials)
+{
+    const std::filesystem::path modelPath =
+        SampleModelsRoot() / "TransmissionTest/glTF/TransmissionTest.gltf";
+    if (!std::filesystem::exists(modelPath))
+    {
+        GTEST_SKIP() << "glTF sample models submodule is not initialized";
+    }
+
+    mukki::GltfModel model{};
+    ASSERT_TRUE(mukki::LoadGltfModel(modelPath, model));
+
+    const bool hasTransmission = std::any_of(
+        model.materials.begin(),
+        model.materials.end(),
+        [](const mukki::GltfMaterial& material) { return material.transmissionFactor > 0.0f; });
+    EXPECT_TRUE(hasTransmission);
+
+    for (const mukki::GltfMaterial& material : model.materials)
+    {
+        EXPECT_GT(material.ior, 1.0f);
+    }
+}
+
+TEST(GltfLoader, ParsesVolumeAbsorption)
+{
+    const std::filesystem::path modelPath =
+        SampleModelsRoot() / "DragonAttenuation/glTF/DragonAttenuation.gltf";
+    if (!std::filesystem::exists(modelPath))
+    {
+        GTEST_SKIP() << "glTF sample models submodule is not initialized";
+    }
+
+    mukki::GltfModel model{};
+    ASSERT_TRUE(mukki::LoadGltfModel(modelPath, model));
+
+    const bool hasVolume = std::any_of(
+        model.materials.begin(),
+        model.materials.end(),
+        [](const mukki::GltfMaterial& material) {
+            return material.attenuationDistance > 0.0f &&
+                   (material.attenuationColor.r < 1.0f || material.attenuationColor.g < 1.0f ||
+                    material.attenuationColor.b < 1.0f);
+        });
+    EXPECT_TRUE(hasVolume);
+}
+
+TEST(GltfLoader, ParsesAlphaBlendMaterials)
+{
+    const std::filesystem::path modelPath =
+        SampleModelsRoot() / "AlphaBlendModeTest/glTF/AlphaBlendModeTest.gltf";
+    if (!std::filesystem::exists(modelPath))
+    {
+        GTEST_SKIP() << "glTF sample models submodule is not initialized";
+    }
+
+    mukki::GltfModel model{};
+    ASSERT_TRUE(mukki::LoadGltfModel(modelPath, model));
+
+    const bool hasBlend = std::any_of(
+        model.materials.begin(),
+        model.materials.end(),
+        [](const mukki::GltfMaterial& material) { return material.alphaBlend; });
+    EXPECT_TRUE(hasBlend);
+}
+
+TEST(GltfLoader, ParsesEmissiveMaterials)
+{
+    const std::filesystem::path modelPath = SampleModelsRoot() / "Lantern/glTF/Lantern.gltf";
+    if (!std::filesystem::exists(modelPath))
+    {
+        GTEST_SKIP() << "glTF sample models submodule is not initialized";
+    }
+
+    mukki::GltfModel model{};
+    ASSERT_TRUE(mukki::LoadGltfModel(modelPath, model));
+
+    const bool hasEmissive = std::any_of(
+        model.materials.begin(),
+        model.materials.end(),
+        [](const mukki::GltfMaterial& material) { return material.emissiveTexture >= 0; });
+    EXPECT_TRUE(hasEmissive);
+
+    for (const mukki::GltfMaterial& material : model.materials)
+    {
+        EXPECT_GE(material.emissiveFactor.r, 0.0f);
+        EXPECT_GE(material.emissiveFactor.g, 0.0f);
+        EXPECT_GE(material.emissiveFactor.b, 0.0f);
+    }
+}
+
+TEST(GltfLoader, AppliesEmissiveStrength)
+{
+    const std::filesystem::path modelPath =
+        SampleModelsRoot() / "EmissiveStrengthTest/glTF/EmissiveStrengthTest.gltf";
+    if (!std::filesystem::exists(modelPath))
+    {
+        GTEST_SKIP() << "glTF sample models submodule is not initialized";
+    }
+
+    mukki::GltfModel model{};
+    ASSERT_TRUE(mukki::LoadGltfModel(modelPath, model));
+    ASSERT_FALSE(model.materials.empty());
+
+    // The first material scales (0.1, 0.5, 0.9) by an emissive strength of 4.
+    EXPECT_NEAR(model.materials[0].emissiveFactor.r, 0.4f, 1e-4f);
+    EXPECT_NEAR(model.materials[0].emissiveFactor.g, 2.0f, 1e-4f);
+    EXPECT_NEAR(model.materials[0].emissiveFactor.b, 3.6f, 1e-4f);
+}
+
+TEST(GltfLoader, ParsesSheenMaterials)
+{
+    const std::filesystem::path modelPath =
+        SampleModelsRoot() / "SheenChair/glTF/SheenChair.gltf";
+    if (!std::filesystem::exists(modelPath))
+    {
+        GTEST_SKIP() << "glTF sample models submodule is not initialized";
+    }
+
+    mukki::GltfModel model{};
+    ASSERT_TRUE(mukki::LoadGltfModel(modelPath, model));
+
+    const bool hasSheen = std::any_of(
+        model.materials.begin(),
+        model.materials.end(),
+        [](const mukki::GltfMaterial& material) {
+            return material.sheenColorFactor.r > 0.0f || material.sheenColorFactor.g > 0.0f ||
+                   material.sheenColorFactor.b > 0.0f;
+        });
+    EXPECT_TRUE(hasSheen);
+}
+
 TEST(GltfLoader, LoadsNonAsciiPath)
 {
     const std::filesystem::path modelsRoot = SampleModelsRoot();

@@ -44,6 +44,10 @@ rhi::DescriptorType FromSpvDescriptorType(SpvReflectDescriptorType type)
         return rhi::DescriptorType::UniformBuffer;
     case SPV_REFLECT_DESCRIPTOR_TYPE_STORAGE_BUFFER:
         return rhi::DescriptorType::StorageBuffer;
+    case SPV_REFLECT_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+        return rhi::DescriptorType::StorageImage;
+    case SPV_REFLECT_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:
+        return rhi::DescriptorType::AccelerationStructure;
     default:
         MRE_ASSERT(false, "Unsupported descriptor type {} in shader reflection", static_cast<int>(type));
         return rhi::DescriptorType::UniformBuffer;

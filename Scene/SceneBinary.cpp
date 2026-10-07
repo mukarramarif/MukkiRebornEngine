@@ -14,6 +14,7 @@ namespace
 constexpr std::uint32_t kMaxStringLength = 4096;
 constexpr std::uint32_t kMaxObjectCount = 100000;
 constexpr std::uint32_t kMaxLightCount = 65536;
+constexpr std::uint32_t kMaxProbeCount = 65536;
 
 class Writer
 {
@@ -138,6 +139,15 @@ std::vector<std::byte> SceneBinary::Encode(const SceneDescription& scene)
         writer.Vec3(object.scale);
     }
 
+    writer.U32(static_cast<std::uint32_t>(scene.probes.size()));
+    for (const SceneProbe& probe : scene.probes)
+    {
+        writer.String(probe.name);
+        writer.Vec3(probe.position);
+        writer.F32(probe.radius);
+        writer.U32(probe.enabled ? 1u : 0u);
+    }
+
     writer.U32(static_cast<std::uint32_t>(scene.lights.size()));
     for (const SceneLight& sceneLight : scene.lights)
     {
@@ -210,6 +220,28 @@ bool SceneBinary::Decode(std::span<const std::byte> data, SceneDescription& scen
             return false;
         }
         result.objects.push_back(std::move(object));
+    }
+
+    std::uint32_t probeCount = 0;
+    if (!reader.U32(probeCount) || probeCount > kMaxProbeCount)
+    {
+        error = "scene binary has an invalid probe count";
+        return false;
+    }
+
+    result.probes.reserve(probeCount);
+    for (std::uint32_t index = 0; index < probeCount; ++index)
+    {
+        SceneProbe probe{};
+        std::uint32_t enabled = 1;
+        if (!reader.String(probe.name) || !reader.Vec3(probe.position) || !reader.F32(probe.radius) ||
+            !reader.U32(enabled))
+        {
+            error = "scene binary is truncated while reading probes";
+            return false;
+        }
+        probe.enabled = enabled != 0;
+        result.probes.push_back(std::move(probe));
     }
 
     std::uint32_t lightCount = 0;

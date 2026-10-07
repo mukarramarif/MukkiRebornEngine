@@ -53,6 +53,12 @@ public:
     virtual void End() = 0;
 
     virtual void BeginSwapchainRendering(const ClearColor& clearColor, bool clear = true) = 0;
+    // Same as above with a depth attachment for depth testing (write mask is pipeline state). The
+    // depth texture is transitioned to a depth attachment and back to shader read on scope end.
+    virtual void BeginSwapchainRendering(
+        const ClearColor& clearColor,
+        const DepthAttachment& depthAttachment,
+        bool clear = true) = 0;
     virtual void EndSwapchainRendering() = 0;
     virtual void BeginRendering(const RenderingDesc& desc) = 0;
     virtual void EndRendering() = 0;
@@ -73,6 +79,13 @@ public:
     // Dynamic depth bias for the currently bound graphics pipeline. Pipelines must be created with
     // depthBiasEnable for the values to take effect.
     virtual void SetDepthBias(float constantFactor, float slopeFactor, float clamp = 0.0f) = 0;
+
+    // Records an acceleration structure build (ray tracing). Must be followed by
+    // AccelerationStructureBarrier before the structure is traced.
+    virtual void BuildAccelerationStructure(const AccelerationStructure& accelerationStructure) = 0;
+
+    // Memory dependency between acceleration structure builds and ray tracing reads.
+    virtual void AccelerationStructureBarrier() = 0;
 
     // GPU timestamp zone markers, used by profilers such as Tracy. Zone names must remain
     // valid for the duration of the recording scope and zones must be balanced pairs.

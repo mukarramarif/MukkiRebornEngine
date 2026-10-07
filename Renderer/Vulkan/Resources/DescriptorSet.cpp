@@ -1,6 +1,9 @@
 #include "Renderer/Vulkan/Resources/DescriptorSet.h"
 
+#include <array>
+
 #include "Renderer/Vulkan/Core/VkConversions.h"
+#include "Renderer/Vulkan/Resources/AccelerationStructure.h"
 #include "Renderer/Vulkan/Resources/Buffer.h"
 #include "Renderer/Vulkan/Resources/Sampler.h"
 #include "Renderer/Vulkan/Resources/Texture.h"
@@ -127,13 +130,14 @@ void VkDescriptorSet::BindTexture(
     const auto& vkTexture = static_cast<const VkTexture&>(texture);
     const auto& vkSampler = static_cast<const VkSampler&>(sampler);
     MRE_ASSERT(
-        vkTexture.GetLayout() == vk::ImageLayout::eShaderReadOnlyOptimal,
+        vkTexture.GetLayout() == vk::ImageLayout::eShaderReadOnlyOptimal ||
+            vkTexture.GetLayout() == vk::ImageLayout::eGeneral,
         "Textures must be in a shader readable layout before binding");
 
     const vk::DescriptorImageInfo imageInfo = vk::DescriptorImageInfo{}
                                                   .setSampler(vkSampler.GetHandle())
                                                   .setImageView(vkTexture.GetImageView())
-                                                  .setImageLayout(vk::ImageLayout::eShaderReadOnlyOptimal);
+                                                  .setImageLayout(vkTexture.GetLayout());
 
     const vk::WriteDescriptorSet write = vk::WriteDescriptorSet{}
                                              .setDstSet(*m_set)
@@ -151,18 +155,42 @@ void VkDescriptorSet::BindTexture(std::uint32_t binding, const rhi::Texture& tex
 
     const auto& vkTexture = static_cast<const VkTexture&>(texture);
     MRE_ASSERT(
-        vkTexture.GetLayout() == vk::ImageLayout::eShaderReadOnlyOptimal,
+        vkTexture.GetLayout() == vk::ImageLayout::eShaderReadOnlyOptimal ||
+            vkTexture.GetLayout() == vk::ImageLayout::eGeneral,
         "Textures must be in a shader readable layout before binding");
 
     const vk::DescriptorImageInfo imageInfo = vk::DescriptorImageInfo{}
                                                   .setImageView(vkTexture.GetImageView())
-                                                  .setImageLayout(vk::ImageLayout::eShaderReadOnlyOptimal);
+                                                  .setImageLayout(vkTexture.GetLayout());
 
     const vk::WriteDescriptorSet write = vk::WriteDescriptorSet{}
                                              .setDstSet(*m_set)
                                              .setDstBinding(binding)
                                              .setDstArrayElement(arrayIndex)
                                              .setDescriptorType(vk::DescriptorType::eSampledImage)
+                                             .setImageInfo(imageInfo);
+
+    m_device->updateDescriptorSets(write, {});
+}
+
+void VkDescriptorSet::BindStorageImage(std::uint32_t binding, const rhi::Texture& texture)
+{
+    MRE_ASSERT(m_device != nullptr, "VkDescriptorSet requires a valid device");
+    MRE_ASSERT(m_set != nullptr, "VkDescriptorSet requires a valid descriptor set");
+
+    const auto& vkTexture = static_cast<const VkTexture&>(texture);
+    MRE_ASSERT(
+        vkTexture.GetLayout() == vk::ImageLayout::eGeneral,
+        "Storage images must be in the general layout before binding");
+
+    const vk::DescriptorImageInfo imageInfo = vk::DescriptorImageInfo{}
+                                                  .setImageView(vkTexture.GetImageView())
+                                                  .setImageLayout(vk::ImageLayout::eGeneral);
+
+    const vk::WriteDescriptorSet write = vk::WriteDescriptorSet{}
+                                             .setDstSet(*m_set)
+                                             .setDstBinding(binding)
+                                             .setDescriptorType(vk::DescriptorType::eStorageImage)
                                              .setImageInfo(imageInfo);
 
     m_device->updateDescriptorSets(write, {});
@@ -181,6 +209,52 @@ void VkDescriptorSet::BindSampler(std::uint32_t binding, const rhi::Sampler& sam
                                              .setDstBinding(binding)
                                              .setDescriptorType(vk::DescriptorType::eSampler)
                                              .setImageInfo(imageInfo);
+
+    m_device->updateDescriptorSets(write, {});
+}
+
+void VkDescriptorSet::BindStorageBuffer(
+    std::uint32_t binding,
+    const rhi::Buffer& buffer,
+    std::uint32_t arrayIndex)
+{
+    MRE_ASSERT(m_device != nullptr, "VkDescriptorSet requires a valid device");
+    MRE_ASSERT(m_set != nullptr, "VkDescriptorSet requires a valid descriptor set");
+
+    const auto& vkBuffer = static_cast<const VkBuffer&>(buffer);
+    const vk::DescriptorBufferInfo bufferInfo = vk::DescriptorBufferInfo{}
+                                                    .setBuffer(vkBuffer.GetHandle())
+                                                    .setOffset(0)
+                                                    .setRange(VK_WHOLE_SIZE);
+
+    const vk::WriteDescriptorSet write = vk::WriteDescriptorSet{}
+                                             .setDstSet(*m_set)
+                                             .setDstBinding(binding)
+                                             .setDstArrayElement(arrayIndex)
+                                             .setDescriptorType(vk::DescriptorType::eStorageBuffer)
+                                             .setBufferInfo(bufferInfo);
+
+    m_device->updateDescriptorSets(write, {});
+}
+
+void VkDescriptorSet::BindAccelerationStructure(
+    std::uint32_t binding,
+    const rhi::AccelerationStructure& accelerationStructure)
+{
+    MRE_ASSERT(m_device != nullptr, "VkDescriptorSet requires a valid device");
+    MRE_ASSERT(m_set != nullptr, "VkDescriptorSet requires a valid descriptor set");
+
+    const auto& vkAccelerationStructure = static_cast<const VkAccelerationStructure&>(accelerationStructure);
+    const std::array<vk::AccelerationStructureKHR, 1> structures{vkAccelerationStructure.GetStructure()};
+    const vk::WriteDescriptorSetAccelerationStructureKHR accelerationStructureInfo =
+        vk::WriteDescriptorSetAccelerationStructureKHR{}.setAccelerationStructures(structures);
+
+    const vk::WriteDescriptorSet write = vk::WriteDescriptorSet{}
+                                             .setDstSet(*m_set)
+                                             .setDstBinding(binding)
+                                             .setDescriptorType(vk::DescriptorType::eAccelerationStructureKHR)
+                                             .setDescriptorCount(1)
+                                             .setPNext(&accelerationStructureInfo);
 
     m_device->updateDescriptorSets(write, {});
 }

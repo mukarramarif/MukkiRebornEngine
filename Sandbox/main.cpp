@@ -17,6 +17,7 @@
 #include "Utilities/PathUtils.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -69,11 +70,13 @@ public:
         int maxFrames,
         std::filesystem::path shaderDirectory,
         std::filesystem::path requestedModel,
-        std::filesystem::path requestedScene)
+        std::filesystem::path requestedScene,
+        std::filesystem::path requestedEnvironment)
         : m_maxFrames(maxFrames)
         , m_shaderDirectory(std::move(shaderDirectory))
         , m_requestedModel(std::move(requestedModel))
         , m_requestedScene(std::move(requestedScene))
+        , m_requestedEnvironment(std::move(requestedEnvironment))
     {
     }
 
@@ -130,11 +133,57 @@ protected:
             return;
         }
 
+        if (!m_requestedEnvironment.empty())
+        {
+            mukki::EnvironmentSettings environment = m_renderer->GetEnvironmentSettings();
+            environment.environmentMap = m_requestedEnvironment;
+            m_renderer->SetEnvironmentSettings(environment);
+        }
+
         ScanSceneFiles();
+        ScanEnvironmentMaps();
 
         if (!m_requestedModel.empty())
         {
             m_pendingModelPath = m_requestedModel;
+
+            // Standalone models get a small default light rig and one probe so they are visible.
+            m_scene.lights.clear();
+            m_scene.probes.clear();
+
+            mukki::SceneLight key{};
+            key.name = "Key";
+            key.light.type = mukki::LightType::Directional;
+            key.light.direction = glm::vec3{-0.4f, -1.0f, -0.3f};
+            key.light.color = glm::vec3{1.0f, 0.98f, 0.95f};
+            key.light.intensity = 3.0f;
+            m_scene.lights.push_back(key);
+
+            mukki::SceneLight fill{};
+            fill.name = "Fill";
+            fill.light.type = mukki::LightType::Point;
+            fill.light.position = glm::vec3{1.5f, 1.5f, 1.5f};
+            fill.light.color = glm::vec3{0.6f, 0.8f, 1.0f};
+            fill.light.intensity = 3.0f;
+            fill.light.range = 8.0f;
+            m_scene.lights.push_back(fill);
+
+            mukki::SceneLight rim{};
+            rim.name = "Rim";
+            rim.light.type = mukki::LightType::Point;
+            rim.light.position = glm::vec3{-1.5f, 1.0f, -1.5f};
+            rim.light.color = glm::vec3{1.0f, 0.7f, 0.4f};
+            rim.light.intensity = 2.0f;
+            rim.light.range = 8.0f;
+            m_scene.lights.push_back(rim);
+
+            mukki::SceneProbe probe{};
+            probe.name = "Probe";
+            probe.position = glm::vec3{0.0f, 1.0f, 0.0f};
+            probe.radius = 0.4f;
+            m_scene.probes.push_back(probe);
+
+            ApplySceneLights();
         }
         else
         {
@@ -205,6 +254,7 @@ protected:
             m_albedoTextureId = m_ui.AddTexture(m_renderer->GetAlbedoTexture());
             m_normalTextureId = m_ui.AddTexture(m_renderer->GetNormalTexture());
             m_positionTextureId = m_ui.AddTexture(m_renderer->GetPositionTexture());
+            m_motionTextureId = m_ui.AddTexture(m_renderer->GetMotionTexture());
             m_debugTexturesRegistered = true;
         }
 
@@ -248,11 +298,13 @@ protected:
         }
 
         m_renderer->PollModelLoad();
+        ApplySceneProbes();
 
         mukki::FrameView view{};
         view.view = m_camera.GetViewMatrix();
         view.projection = m_camera.GetProjectionMatrix();
         view.viewProjection = m_camera.GetViewProjectionMatrix();
+        view.previousViewProjection = m_previousViewProjection;
         view.position = m_camera.GetPosition();
         view.fovYRadians = m_camera.GetFovY();
         view.aspectRatio = m_camera.GetAspectRatio();
@@ -260,6 +312,7 @@ protected:
         view.farPlane = m_camera.GetFarPlane();
 
         m_renderer->Render(commandList, view);
+        m_previousViewProjection = view.viewProjection;
 
         commandList.BeginGpuZone("ImGui");
         commandList.BeginSwapchainRendering(mukki::rhi::ClearColor{0.0f, 0.0f, 0.0f, 1.0f}, false);
@@ -319,6 +372,47 @@ private:
         MRE_INFO("Found {} scene files in '{}'", m_sceneFiles.size(), mukki::PathToUtf8(m_scenesRoot));
 #else
         MRE_WARN("Scenes directory was not configured at build time");
+#endif
+    }
+
+    void ScanEnvironmentMaps()
+    {
+#ifdef MRE_ASSET_LIBRARY_DIR
+        m_assetLibraryRoot = std::filesystem::path{MRE_ASSET_LIBRARY_DIR};
+        if (!std::filesystem::exists(m_assetLibraryRoot))
+        {
+            MRE_WARN(
+                "Asset library directory '{}' does not exist",
+                mukki::PathToUtf8(m_assetLibraryRoot));
+            return;
+        }
+
+        std::error_code error{};
+        for (const std::filesystem::directory_entry& entry :
+             std::filesystem::recursive_directory_iterator(m_assetLibraryRoot, error))
+        {
+            if (error || !entry.is_regular_file())
+            {
+                continue;
+            }
+
+            std::string extension = mukki::PathToUtf8(entry.path().extension());
+            std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char character) {
+                return static_cast<char>(std::tolower(character));
+            });
+            if (extension == ".hdr")
+            {
+                m_environmentMaps.push_back(entry.path());
+            }
+        }
+
+        std::sort(m_environmentMaps.begin(), m_environmentMaps.end());
+        MRE_INFO(
+            "Found {} HDR environment map(s) in '{}'",
+            m_environmentMaps.size(),
+            mukki::PathToUtf8(m_assetLibraryRoot));
+#else
+        MRE_WARN("Asset library directory was not configured at build time");
 #endif
     }
 
@@ -551,6 +645,25 @@ private:
         m_renderer->SetLights(lights);
     }
 
+    void ApplySceneProbes()
+    {
+        std::vector<mukki::GiProbe> probes{};
+        probes.reserve(m_scene.probes.size());
+        for (const mukki::SceneProbe& sceneProbe : m_scene.probes)
+        {
+            if (!sceneProbe.enabled)
+            {
+                continue;
+            }
+
+            mukki::GiProbe probe{};
+            probe.position = sceneProbe.position;
+            probe.radius = std::max(0.05f, sceneProbe.radius);
+            probes.push_back(probe);
+        }
+        m_renderer->SetGiProbes(probes);
+    }
+
     void DrawSceneWindow()
     {
         ImGui::Begin("Scene");
@@ -588,6 +701,18 @@ private:
             m_renderer->SetClusterDebugView(debugClusters);
         }
 
+        bool showLightGizmos = m_renderer->AreLightGizmosEnabled();
+        bool showProbeGizmos = m_renderer->AreProbeGizmosEnabled();
+        if (ImGui::Checkbox("Show light gizmos", &showLightGizmos))
+        {
+            m_renderer->SetGizmoView(showLightGizmos, showProbeGizmos);
+        }
+        ImGui::SameLine();
+        if (ImGui::Checkbox("Show probe gizmos", &showProbeGizmos))
+        {
+            m_renderer->SetGizmoView(showLightGizmos, showProbeGizmos);
+        }
+
         ImGui::SeparatorText("Objects");
         if (ImGui::BeginChild("##object_list", ImVec2(0.0f, 90.0f), ImGuiChildFlags_Borders))
         {
@@ -613,6 +738,8 @@ private:
         {
             DrawObjectEditor(m_scene.objects[static_cast<std::size_t>(m_selectedObject)]);
         }
+
+        DrawProbeSection();
 
         ImGui::SeparatorText("Lights");
         if (ImGui::BeginChild("##light_list", ImVec2(0.0f, 110.0f), ImGuiChildFlags_Borders))
@@ -669,8 +796,392 @@ private:
         }
 
         DrawShadowSettings();
+        DrawEnvironmentSettings();
+        DrawCloudSettings();
+        DrawGiSettings();
+        DrawReflectionSettings();
 
         ImGui::End();
+    }
+
+    void DrawReflectionSettings()
+    {
+        ImGui::SeparatorText("Ray traced reflections");
+
+        mukki::ReflectionSettings settings = m_renderer->GetReflectionSettings();
+        bool changed = ImGui::Checkbox("Reflections", &settings.enabled);
+        if (!m_device->IsRayTracingSupported())
+        {
+            ImGui::SameLine();
+            ImGui::TextDisabled("(ray tracing unavailable)");
+        }
+
+        changed |= ImGui::SliderFloat(
+            "Reflection intensity",
+            &settings.intensity,
+            0.0f,
+            4.0f,
+            "%.2f");
+        changed |= ImGui::SliderFloat(
+            "Reflection max roughness",
+            &settings.maxRoughness,
+            0.0f,
+            1.0f,
+            "%.2f");
+        changed |= ImGui::SliderFloat(
+            "Reflection distance",
+            &settings.maxDistance,
+            1.0f,
+            300.0f,
+            "%.0f");
+        int samples = static_cast<int>(settings.samples);
+        if (ImGui::SliderInt("Reflection samples", &samples, 1, 8))
+        {
+            settings.samples = static_cast<std::uint32_t>(samples);
+            changed = true;
+        }
+        if (ImGui::SliderFloat(
+                "Reflection trace scale",
+                &settings.resolutionScale,
+                0.25f,
+                1.0f,
+                "%.2f"))
+        {
+            changed = true;
+        }
+        ImGui::SetItemTooltip(
+            "Fraction of the swapchain resolution used for the reflection trace.\n"
+            "1.0 keeps mirror reflections sharp, lower values trade sharpness for performance.");
+
+        ImGui::SeparatorText("Glass");
+        changed |= ImGui::Checkbox("Dispersion", &settings.dispersion);
+        int bounces = static_cast<int>(settings.refractionBounces);
+        if (ImGui::SliderInt("Refraction bounces", &bounces, 1, 8))
+        {
+            settings.refractionBounces = static_cast<std::uint32_t>(bounces);
+            changed = true;
+        }
+        changed |= ImGui::SliderFloat(
+            "Volume absorption",
+            &settings.volumeAbsorptionScale,
+            0.0f,
+            3.0f,
+            "%.2f");
+
+        if (changed)
+        {
+            m_renderer->SetReflectionSettings(settings);
+        }
+    }
+
+    static float RadicalInverse(int index, int base)
+    {
+        float result = 0.0f;
+        float fraction = 1.0f;
+        while (index > 0)
+        {
+            fraction /= static_cast<float>(base);
+            result += fraction * static_cast<float>(index % base);
+            index /= base;
+        }
+        return result;
+    }
+
+    void FillSceneProbes(int count)
+    {
+        glm::vec3 boundsMin{0.0f};
+        glm::vec3 boundsMax{0.0f};
+        if (!m_renderer->GetSceneBounds(boundsMin, boundsMax))
+        {
+            m_sceneStatus = "probe fill needs a loaded scene";
+            return;
+        }
+
+        const int probeCount = std::clamp(count, 1, static_cast<int>(mukki::kMaxGiProbes));
+        const glm::vec3 inset{0.05f};
+        m_scene.probes.clear();
+        for (int index = 1; index <= probeCount; ++index)
+        {
+            const glm::vec3 t{
+                RadicalInverse(index, 2),
+                RadicalInverse(index, 3),
+                RadicalInverse(index, 5)};
+            mukki::SceneProbe probe{};
+            probe.name = "Auto " + std::to_string(index);
+            probe.position =
+                glm::mix(boundsMin, boundsMax, inset + t * (glm::vec3{1.0f} - inset * 2.0f));
+            probe.radius = 0.35f;
+            m_scene.probes.push_back(probe);
+        }
+
+        m_selectedProbe = m_scene.probes.empty() ? -1 : 0;
+        ApplySceneProbes();
+        m_sceneStatus = "scene probes: " + std::to_string(m_scene.probes.size());
+    }
+
+    void DrawEnvironmentSettings()
+    {
+        ImGui::SeparatorText("Environment (IBL)");
+
+        mukki::EnvironmentSettings settings = m_renderer->GetEnvironmentSettings();
+        bool changed = ImGui::Checkbox("Image based lighting", &settings.enabled);
+        ImGui::SetItemTooltip(
+            "Procedural sky providing diffuse SH irradiance, prefiltered specular reflections,\n"
+            "the visible background and the sky term of the ray traced GI.");
+        changed |= ImGui::SliderFloat("Sky intensity", &settings.intensity, 0.0f, 4.0f, "%.2f");
+
+        // Radiance maps discovered in AssetLibrary/ at startup.
+        const std::string currentMap = settings.environmentMap.empty()
+                                           ? std::string{"(gradient sky)"}
+                                           : mukki::PathToUtf8(settings.environmentMap.filename());
+        if (ImGui::BeginCombo("HDR map", currentMap.c_str()))
+        {
+            if (ImGui::Selectable("(gradient sky)", settings.environmentMap.empty()))
+            {
+                settings.environmentMap.clear();
+                changed = true;
+            }
+
+            for (const std::filesystem::path& map : m_environmentMaps)
+            {
+                const bool selected = map == settings.environmentMap;
+                if (ImGui::Selectable(mukki::PathToUtf8(map.filename()).c_str(), selected))
+                {
+                    settings.environmentMap = map;
+                    changed = true;
+                }
+                if (selected)
+                {
+                    ImGui::SetItemDefaultFocus();
+                }
+            }
+
+            // Keep a map selected through --env selectable even when it is outside the library.
+            const bool currentInList = std::any_of(
+                m_environmentMaps.begin(),
+                m_environmentMaps.end(),
+                [&settings](const std::filesystem::path& map) { return map == settings.environmentMap; });
+            if (!settings.environmentMap.empty() && !currentInList &&
+                ImGui::Selectable(currentMap.c_str(), true))
+            {
+            }
+
+            ImGui::EndCombo();
+        }
+        ImGui::SetItemTooltip(
+            "Radiance .hdr equirectangular maps found in AssetLibrary.\n"
+            "The gradient colors below are ignored while a map is selected.");
+
+        changed |= ImGui::ColorEdit3("Sky zenith", &settings.zenithColor.x);
+        changed |= ImGui::ColorEdit3("Sky horizon", &settings.horizonColor.x);
+        changed |= ImGui::ColorEdit3("Sky ground", &settings.groundColor.x);
+        changed |= ImGui::SliderFloat("Sun disc", &settings.sunDiscIntensity, 0.0f, 50.0f, "%.0f");
+
+        if (changed)
+        {
+            m_renderer->SetEnvironmentSettings(settings);
+        }
+    }
+
+    void DrawCloudSettings()
+    {
+        ImGui::SeparatorText("Volumetric clouds (Nubis)");
+
+        mukki::CloudSettings settings = m_renderer->GetCloudSettings();
+        bool changed = ImGui::Checkbox("Clouds", &settings.enabled);
+        ImGui::SetItemTooltip(
+            "Ray marched volumetric clouds over the sky (inflight generated noise + weather).");
+
+        changed |= ImGui::SliderFloat("Coverage", &settings.coverage, 0.0f, 1.0f, "%.2f");
+        changed |= ImGui::SliderFloat("Cloud type", &settings.cloudType, 0.0f, 1.0f, "%.2f");
+        ImGui::SetItemTooltip("0 stratus, 0.33 cumulus, 0.66 cumulonimbus, 1 cirrus");
+        changed |= ImGui::SliderFloat("Density", &settings.density, 0.002f, 0.08f, "%.3f");
+        changed |= ImGui::SliderFloat("Detail erosion", &settings.detailStrength, 0.0f, 1.0f, "%.2f");
+        changed |= ImGui::SliderFloat("Coverage variation", &settings.coverageVariation, 0.0f, 1.0f, "%.2f");
+        changed |= ImGui::SliderFloat("Layer bottom (km)", &settings.layerBottomKm, 0.5f, 4.0f, "%.2f");
+        changed |= ImGui::SliderFloat("Layer top (km)", &settings.layerTopKm, 1.0f, 8.0f, "%.2f");
+        changed |= ImGui::SliderFloat("Altitude variation (km)", &settings.altitudeVariationKm, 0.0f, 2.0f, "%.2f");
+        changed |= ImGui::SliderFloat("Wind speed (m/s)", &settings.windSpeed, 0.0f, 80.0f, "%.0f");
+        changed |= ImGui::SliderAngle("Wind direction", &settings.windDirectionRadians);
+        changed |= ImGui::SliderFloat("Curl strength", &settings.curlStrength, 0.0f, 3.0f, "%.2f");
+
+        int steps = static_cast<int>(settings.primarySteps);
+        if (ImGui::SliderInt("Primary steps", &steps, 16, 128))
+        {
+            settings.primarySteps = static_cast<std::uint32_t>(steps);
+            changed = true;
+        }
+        int lightSteps = static_cast<int>(settings.lightSteps);
+        if (ImGui::SliderInt("Light steps", &lightSteps, 1, 8))
+        {
+            settings.lightSteps = static_cast<std::uint32_t>(lightSteps);
+            changed = true;
+        }
+        changed |= ImGui::SliderFloat("Cloud trace scale", &settings.resolutionScale, 0.25f, 1.0f, "%.2f");
+        changed |= ImGui::SliderFloat("Cloud temporal blend", &settings.temporalBlend, 0.0f, 0.98f, "%.2f");
+        changed |= ImGui::SliderFloat("God rays", &settings.godRayIntensity, 0.0f, 3.0f, "%.2f");
+
+        if (changed)
+        {
+            m_renderer->SetCloudSettings(settings);
+        }
+    }
+
+    void DrawProbeSection()
+    {
+        ImGui::SeparatorText("Probes");
+
+        int enabledCount = 0;
+        for (const mukki::SceneProbe& probe : m_scene.probes)
+        {
+            if (probe.enabled)
+            {
+                ++enabledCount;
+            }
+        }
+        ImGui::Text(
+            "%zu placed, %d enabled (max %u on the GPU)",
+            m_scene.probes.size(),
+            enabledCount,
+            mukki::kMaxGiProbes);
+
+        if (ImGui::BeginChild("##probe_list", ImVec2(0.0f, 100.0f), ImGuiChildFlags_Borders))
+        {
+            for (std::size_t index = 0; index < m_scene.probes.size(); ++index)
+            {
+                const mukki::SceneProbe& probe = m_scene.probes[index];
+                char label[192];
+                std::snprintf(
+                    label,
+                    sizeof(label),
+                    "%s%s (%.1f, %.1f, %.1f)",
+                    probe.enabled ? "" : "[off] ",
+                    probe.name.c_str(),
+                    probe.position.x,
+                    probe.position.y,
+                    probe.position.z);
+                if (ImGui::Selectable(label, m_selectedProbe == static_cast<int>(index)))
+                {
+                    m_selectedProbe = static_cast<int>(index);
+                }
+            }
+        }
+        ImGui::EndChild();
+
+        if (ImGui::Button("Add probe"))
+        {
+            mukki::SceneProbe probe{};
+            probe.name = "Probe " + std::to_string(m_scene.probes.size());
+            const glm::mat4 view = m_camera.GetViewMatrix();
+            const glm::vec3 forward = -glm::vec3{view[2]};
+            probe.position = m_camera.GetPosition() + forward * 4.0f;
+            probe.radius = 0.4f;
+            m_scene.probes.push_back(probe);
+            m_selectedProbe = static_cast<int>(m_scene.probes.size()) - 1;
+            ApplySceneProbes();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Add grid"))
+        {
+            constexpr int kColumns = 3;
+            constexpr int kRows = 2;
+            constexpr int kLayers = 3;
+            constexpr float kSpacing = 4.0f;
+            for (int layer = 0; layer < kLayers; ++layer)
+            {
+                for (int row = 0; row < kRows; ++row)
+                {
+                    for (int column = 0; column < kColumns; ++column)
+                    {
+                        mukki::SceneProbe probe{};
+                        probe.name = "Grid " + std::to_string(layer) + "," + std::to_string(row) +
+                                     "," + std::to_string(column);
+                        probe.position = glm::vec3{
+                            (static_cast<float>(column) - 1.0f) * kSpacing,
+                            1.5f + static_cast<float>(row) * 2.5f,
+                            (static_cast<float>(layer) - 1.0f) * kSpacing};
+                        probe.radius = 0.35f;
+                        m_scene.probes.push_back(probe);
+                    }
+                }
+            }
+            ApplySceneProbes();
+            m_sceneStatus = "probe grid added";
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Remove probe") && !m_scene.probes.empty())
+        {
+            const std::size_t index = static_cast<std::size_t>(
+                std::clamp(m_selectedProbe, 0, static_cast<int>(m_scene.probes.size()) - 1));
+            m_scene.probes.erase(m_scene.probes.begin() + static_cast<std::ptrdiff_t>(index));
+            m_selectedProbe = std::min(m_selectedProbe, static_cast<int>(m_scene.probes.size()) - 1);
+            ApplySceneProbes();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Clear probes") && !m_scene.probes.empty())
+        {
+            m_scene.probes.clear();
+            m_selectedProbe = -1;
+            ApplySceneProbes();
+        }
+
+        // Scene fill: distributes probes over the loaded scene bounds (Halton sequence) so the
+        // whole scene can be covered without placing probes by hand. "Maximize" places the GPU
+        // limit in one click.
+        glm::vec3 boundsMin{0.0f};
+        glm::vec3 boundsMax{0.0f};
+        if (m_renderer->GetSceneBounds(boundsMin, boundsMax))
+        {
+            const glm::vec3 extent = boundsMax - boundsMin;
+            ImGui::Text("Scene extent %.1f x %.1f x %.1f", extent.x, extent.y, extent.z);
+        }
+        else
+        {
+            ImGui::TextDisabled("Scene extent: no loaded objects");
+        }
+        ImGui::SetNextItemWidth(130.0f);
+        ImGui::SliderInt(
+            "##probe_fill_count",
+            &m_probeFillCount,
+            1,
+            static_cast<int>(mukki::kMaxGiProbes),
+            "Probes: %d");
+        ImGui::SameLine();
+        if (ImGui::Button("Fill scene"))
+        {
+            FillSceneProbes(m_probeFillCount);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Maximize probes"))
+        {
+            m_probeFillCount = static_cast<int>(mukki::kMaxGiProbes);
+            FillSceneProbes(m_probeFillCount);
+        }
+        ImGui::SetItemTooltip(
+            "Replaces the probe list with probes distributed across the loaded scene bounds,\n"
+            "up to the GPU limit (max %u).",
+            mukki::kMaxGiProbes);
+
+        if (m_selectedProbe >= 0 && m_selectedProbe < static_cast<int>(m_scene.probes.size()))
+        {
+            mukki::SceneProbe& probe = m_scene.probes[static_cast<std::size_t>(m_selectedProbe)];
+
+            char nameBuffer[128];
+            std::snprintf(nameBuffer, sizeof(nameBuffer), "%s", probe.name.c_str());
+            if (ImGui::InputText("Probe name", nameBuffer, sizeof(nameBuffer)))
+            {
+                probe.name = nameBuffer;
+            }
+
+            bool changed = false;
+            changed |= ImGui::DragFloat3("Probe position", &probe.position.x, 0.05f, -200.0f, 200.0f);
+            changed |= ImGui::SliderFloat("Probe radius", &probe.radius, 0.05f, 2.0f, "%.2f");
+            changed |= ImGui::Checkbox("Probe enabled", &probe.enabled);
+            if (changed)
+            {
+                ApplySceneProbes();
+            }
+        }
     }
 
     void DrawShadowSettings()
@@ -684,6 +1195,25 @@ private:
         changed |= ImGui::SliderFloat("Depth bias", &settings.depthBias, 0.0f, 5.0f, "%.2f");
         changed |= ImGui::SliderFloat("Normal bias", &settings.normalBias, 0.0f, 1.0f, "%.3f");
 
+        changed |= ImGui::Checkbox("Ray traced sun shadows", &settings.rtSunShadows);
+        if (settings.rtSunShadows && !m_device->IsRayTracingSupported())
+        {
+            ImGui::SameLine();
+            ImGui::TextDisabled("(ray tracing unavailable)");
+        }
+        int rtSamples = static_cast<int>(settings.rtShadowSamples);
+        if (ImGui::SliderInt("RT shadow samples", &rtSamples, 1, 16))
+        {
+            settings.rtShadowSamples = static_cast<std::uint32_t>(rtSamples);
+            changed = true;
+        }
+        changed |= ImGui::SliderFloat(
+            "RT sun angular radius (deg)",
+            &settings.rtSunAngularRadiusDegrees,
+            0.0f,
+            3.0f,
+            "%.2f");
+
         ImGui::Text(
             "%u cascades at %u, %u spot maps, %u point atlases",
             static_cast<unsigned>(settings.cascadeCount),
@@ -694,6 +1224,100 @@ private:
         if (changed)
         {
             m_renderer->SetShadowSettings(settings);
+        }
+    }
+
+    void DrawGiSettings()
+    {
+        ImGui::SeparatorText("Global illumination");
+
+        mukki::GiSettings settings = m_renderer->GetGiSettings();
+        bool changed = ImGui::Checkbox("Ray traced GI", &settings.enabled);
+
+        if (!m_device->IsRayTracingSupported())
+        {
+            ImGui::SameLine();
+            ImGui::TextDisabled("(ray tracing unavailable)");
+        }
+
+        changed |= ImGui::SliderFloat("Trace scale", &settings.resolutionScale, 0.25f, 1.0f, "%.2f");
+        int traceSamples = static_cast<int>(settings.traceSamples);
+        if (ImGui::SliderInt("Trace samples", &traceSamples, 1, 4))
+        {
+            settings.traceSamples = static_cast<std::uint32_t>(traceSamples);
+            changed = true;
+        }
+        changed |= ImGui::SliderFloat("GI intensity", &settings.intensity, 0.0f, 4.0f, "%.2f");
+
+        changed |= ImGui::Checkbox("Use probes for GI", &settings.useProbes);
+        ImGui::SameLine();
+        ImGui::TextDisabled("(probe objects)");
+        int probeRays = static_cast<int>(settings.probeRays);
+        if (ImGui::SliderInt("Probe rays", &probeRays, 16, 256))
+        {
+            settings.probeRays = static_cast<std::uint32_t>(probeRays);
+            changed = true;
+        }
+        changed |= ImGui::SliderFloat(
+            "Probe hysteresis",
+            &settings.probeHysteresis,
+            0.0f,
+            0.98f,
+            "%.2f");
+        changed |= ImGui::SliderFloat("Max ray distance", &settings.maxDistance, 1.0f, 200.0f, "%.0f");
+        changed |= ImGui::SliderFloat("Bounce feedback", &settings.feedbackIntensity, 0.0f, 1.5f, "%.2f");
+        changed |= ImGui::SliderFloat(
+            "Specular min roughness",
+            &settings.specularMinRoughness,
+            0.0f,
+            0.5f,
+            "%.3f");
+        changed |= ImGui::SliderFloat("Temporal alpha min", &settings.temporalAlphaMin, 0.005f, 0.5f, "%.3f");
+        changed |= ImGui::SliderFloat("Phi depth", &settings.phiDepth, 0.1f, 10.0f, "%.2f");
+        changed |= ImGui::SliderFloat("Phi normal", &settings.phiNormal, 1.0f, 128.0f, "%.1f");
+        changed |= ImGui::SliderFloat("Phi luminance", &settings.phiLuminance, 0.5f, 16.0f, "%.2f");
+        changed |= ImGui::SliderFloat("Phi hit distance", &settings.phiHitDistance, 0.5f, 16.0f, "%.2f");
+
+        int iterations = static_cast<int>(settings.atrousIterations);
+        if (ImGui::SliderInt("À-trous iterations", &iterations, 1, 8))
+        {
+            settings.atrousIterations = static_cast<std::uint32_t>(iterations);
+            changed = true;
+        }
+        changed |= ImGui::Checkbox("Sun shadow ray", &settings.sunShadowRay);
+
+        ImGui::SeparatorText("GI punctual lights");
+        changed |= ImGui::Checkbox("Point/spot lights in GI", &settings.pointLights);
+        int giLights = static_cast<int>(settings.maxGiLights);
+        if (ImGui::SliderInt("GI light count", &giLights, 1, static_cast<int>(mukki::kMaxGiLights)))
+        {
+            settings.maxGiLights = static_cast<std::uint32_t>(giLights);
+            changed = true;
+        }
+        changed |= ImGui::Checkbox("GI light shadows", &settings.pointLightShadows);
+        changed |= ImGui::SliderFloat(
+            "GI light shadow bias",
+            &settings.pointLightShadowBias,
+            0.0f,
+            0.2f,
+            "%.3f");
+
+        int sunSamples = static_cast<int>(settings.sunShadowSamples);
+        if (ImGui::SliderInt("Sun shadow samples", &sunSamples, 1, 16))
+        {
+            settings.sunShadowSamples = static_cast<std::uint32_t>(sunSamples);
+            changed = true;
+        }
+        changed |= ImGui::SliderFloat(
+            "Sun angular radius (deg)",
+            &settings.sunAngularRadiusDegrees,
+            0.0f,
+            3.0f,
+            "%.2f");
+
+        if (changed)
+        {
+            m_renderer->SetGiSettings(settings);
         }
     }
 
@@ -719,6 +1343,7 @@ private:
                 m_sceneStatus = "object is not instantiated in the renderer";
             }
         }
+
     }
 
     void DrawLightEditor(mukki::SceneLight& sceneLight)
@@ -751,11 +1376,10 @@ private:
 
         if (light.type != mukki::LightType::Point)
         {
-            glm::vec3 direction = light.direction;
-            if (ImGui::DragFloat3("Direction", &direction.x, 0.01f, -1.0f, 1.0f))
+            // Keep the raw vector so dragging one component does not renormalize the others; the
+            // renderer normalizes directions when it uploads lights and builds shadow matrices.
+            if (ImGui::DragFloat3("Direction", &light.direction.x, 0.01f, -1.0f, 1.0f))
             {
-                const float length = glm::length(direction);
-                light.direction = length > 1e-4f ? direction / length : glm::vec3{0.0f, -1.0f, 0.0f};
                 m_sceneLightsDirty = true;
             }
         }
@@ -830,6 +1454,7 @@ private:
         DrawTexturePreview("Albedo (metalness in A)", m_albedoTextureId, previewWidth, aspect);
         DrawTexturePreview("Normal (roughness in A)", m_normalTextureId, previewWidth, aspect);
         DrawTexturePreview("Position", m_positionTextureId, previewWidth, aspect);
+        DrawTexturePreview("Motion vectors (pixels)", m_motionTextureId, previewWidth, aspect);
         ImGui::End();
     }
 
@@ -843,14 +1468,17 @@ private:
         m_ui.RemoveTexture(m_albedoTextureId);
         m_ui.RemoveTexture(m_normalTextureId);
         m_ui.RemoveTexture(m_positionTextureId);
+        m_ui.RemoveTexture(m_motionTextureId);
         m_albedoTextureId = 0;
         m_normalTextureId = 0;
         m_positionTextureId = 0;
+        m_motionTextureId = 0;
         m_debugTexturesRegistered = false;
     }
 
     mukki::Camera m_camera{};
     mukki::FlyCameraController m_controller{};
+    glm::mat4 m_previousViewProjection{1.0f};
     mukki::JobSystem m_jobSystem{};
     std::unique_ptr<mukki::rhi::Device> m_device{};
     std::unique_ptr<mukki::DeferredRenderer> m_renderer{};
@@ -862,15 +1490,21 @@ private:
     ImTextureID m_albedoTextureId = 0;
     ImTextureID m_normalTextureId = 0;
     ImTextureID m_positionTextureId = 0;
+    ImTextureID m_motionTextureId = 0;
     std::filesystem::path m_shaderDirectory{};
     std::filesystem::path m_sceneBinaryDirectory{};
     std::filesystem::path m_sceneSourcePath{};
     std::filesystem::path m_requestedModel{};
     std::filesystem::path m_requestedScene{};
+    std::filesystem::path m_requestedEnvironment{};
+    std::filesystem::path m_assetLibraryRoot{};
+    std::vector<std::filesystem::path> m_environmentMaps{};
     std::string m_sceneStatus{};
     float m_frameTimeMs = 0.0f;
     int m_selectedLight = 0;
     int m_selectedObject = 0;
+    int m_selectedProbe = -1;
+    int m_probeFillCount = static_cast<int>(mukki::kMaxGiProbes);
     int m_sceneFileIndex = 0;
     int m_maxFrames = 0;
     int m_frameCount = 0;
@@ -889,6 +1523,7 @@ int main(int argc, char** argv)
     int maxFrames = 0;
     std::filesystem::path requestedModel{};
     std::filesystem::path requestedScene{};
+    std::filesystem::path requestedEnvironment{};
     for (int i = 1; i < argc; ++i)
     {
         if (std::strcmp(argv[i], "--frames") == 0 && i + 1 < argc)
@@ -903,6 +1538,17 @@ int main(int argc, char** argv)
         {
             requestedScene = argv[i + 1];
         }
+        else if (std::strcmp(argv[i], "--env") == 0 && i + 1 < argc)
+        {
+            // Absolute so the environment dropdown can match the scanned library entries.
+            std::error_code absoluteError{};
+            const std::filesystem::path requested = argv[i + 1];
+            requestedEnvironment = std::filesystem::absolute(requested, absoluteError);
+            if (absoluteError)
+            {
+                requestedEnvironment = requested;
+            }
+        }
     }
 
     mukki::Log::Init(mukki::LogConfig{});
@@ -913,7 +1559,7 @@ int main(int argc, char** argv)
         const std::filesystem::path shaderDirectory =
             std::filesystem::absolute(argv[0]).parent_path() / "shaders";
 
-        SandboxApp app{maxFrames, shaderDirectory, requestedModel, requestedScene};
+        SandboxApp app{maxFrames, shaderDirectory, requestedModel, requestedScene, requestedEnvironment};
         if (!app.Init(mukki::WindowDesc{}))
         {
             MRE_CRITICAL("Failed to initialize the application");

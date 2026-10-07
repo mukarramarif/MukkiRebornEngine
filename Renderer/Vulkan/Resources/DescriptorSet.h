@@ -41,6 +41,14 @@ public:
     void BindTexture(std::uint32_t binding, const rhi::Texture& texture, std::uint32_t arrayIndex) override;
     void BindSampler(std::uint32_t binding, const rhi::Sampler& sampler) override;
     void BindSampler(std::uint32_t binding, const rhi::Sampler& sampler, std::uint32_t arrayIndex) override;
+    void BindStorageImage(std::uint32_t binding, const rhi::Texture& texture) override;
+    void BindStorageBuffer(
+        std::uint32_t binding,
+        const rhi::Buffer& buffer,
+        std::uint32_t arrayIndex) override;
+    void BindAccelerationStructure(
+        std::uint32_t binding,
+        const rhi::AccelerationStructure& accelerationStructure) override;
 
     [[nodiscard]] vk::DescriptorSet GetHandle() const { return *m_set; }
 

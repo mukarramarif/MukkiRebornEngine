@@ -13,9 +13,11 @@
 #include "Renderer/Vulkan/Core/VkCommandList.h"
 #include "Renderer/Vulkan/Core/VkInstance.h"
 #include "Renderer/Vulkan/Core/VkPipeline.h"
+#include "Renderer/Vulkan/Core/VkRayTracingDispatch.h"
 #include "Renderer/Vulkan/Core/VkShader.h"
 #include "Renderer/Vulkan/Core/VkSwapchain.h"
 #include "Renderer/Vulkan/Resources/ResourceAllocator.h"
+#include "Renderer/Vulkan/Resources/AccelerationStructure.h"
 #include "Renderer/Vulkan/Resources/DescriptorSet.h"
 #include "Renderer/Vulkan/Resources/Sampler.h"
 #include "Renderer/Vulkan/Resources/Texture.h"
@@ -47,6 +49,7 @@ public:
     [[nodiscard]] std::uint32_t GetFrameIndex() const override { return m_frameIndex; }
     [[nodiscard]] std::uint32_t GetFramesInFlight() const override { return m_framesInFlight; }
     [[nodiscard]] bool IsBindlessSupported() const override { return m_descriptorIndexingSupported; }
+    [[nodiscard]] bool IsRayTracingSupported() const override { return m_rayTracingSupported; }
 
     [[nodiscard]] std::unique_ptr<rhi::Buffer> CreateBuffer(
         const rhi::BufferDesc& desc,
@@ -63,6 +66,14 @@ public:
     [[nodiscard]] std::unique_ptr<rhi::DescriptorSet> CreateDescriptorSet(const rhi::DescriptorSetLayout& layout)
         override;
 
+    [[nodiscard]] std::unique_ptr<rhi::AccelerationStructure> CreateBottomLevelAccelerationStructure(
+        const rhi::BottomLevelAccelerationStructureDesc& desc) override;
+    [[nodiscard]] std::unique_ptr<rhi::AccelerationStructure> CreateTopLevelAccelerationStructure(
+        const rhi::TopLevelAccelerationStructureDesc& desc) override;
+    void UpdateTopLevelAccelerationStructure(
+        rhi::AccelerationStructure& accelerationStructure,
+        std::span<const rhi::AccelerationStructureInstance> instances) override;
+
     [[nodiscard]] bool IsInitialized() const { return m_initialized; }
     [[nodiscard]] const VkInstance& GetVkInstance() const { return m_instance; }
     [[nodiscard]] const vk::raii::PhysicalDevice& GetPhysicalDevice() const { return m_physicalDevice; }
@@ -70,6 +81,10 @@ public:
     [[nodiscard]] const vk::raii::Queue& GetGraphicsQueue() const { return m_graphicsQueue; }
     [[nodiscard]] std::uint32_t GetGraphicsQueueFamily() const { return m_graphicsQueueFamily; }
     [[nodiscard]] VmaAllocator GetAllocator() const { return m_allocator; }
+    [[nodiscard]] const RayTracingDispatch* GetRayTracingDispatch() const
+    {
+        return m_rayTracingSupported ? &m_rayTracingDispatch : nullptr;
+    }
     [[nodiscard]] const vk::PhysicalDeviceDescriptorIndexingFeatures& GetDescriptorIndexingFeatures() const
     {
         return m_descriptorIndexingFeatures;
@@ -88,6 +103,7 @@ private:
     bool CreateFrameResources();
     void RecreateSwapchain();
     void WaitForFrame(std::uint32_t frame);
+    void LogDeviceFault();
 
     VkInstance m_instance{};
     vk::raii::PhysicalDevice m_physicalDevice{nullptr};
@@ -103,6 +119,8 @@ private:
     rhi::Extent2D m_requestedExtent{};
     vk::PhysicalDeviceDescriptorIndexingFeatures m_descriptorIndexingFeatures{};
     vk::PhysicalDeviceDescriptorIndexingProperties m_descriptorIndexingProperties{};
+    vk::PhysicalDeviceAccelerationStructureFeaturesKHR m_accelerationStructureFeatures{};
+    vk::PhysicalDeviceRayQueryFeaturesKHR m_rayQueryFeatures{};
 #ifdef MRE_ENABLE_TRACY
     tracy::VkCtx* m_tracyContext = nullptr;
 #endif
@@ -113,8 +131,11 @@ private:
     std::uint32_t m_currentImageIndex = 0;
     std::uint32_t m_nextBindlessIndex = 0;
     bool m_descriptorIndexingSupported = false;
+    RayTracingDispatch m_rayTracingDispatch{};
+    bool m_rayTracingSupported = false;
     bool m_swapchainDirty = false;
     bool m_initialized = false;
+    bool m_deviceFaultSupported = false;
 };
 
 [[nodiscard]] std::unique_ptr<rhi::Device> CreateVulkanDevice(const rhi::DeviceDesc& desc);

@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -47,6 +48,7 @@ public:
     [[nodiscard]] virtual std::uint32_t GetFrameIndex() const = 0;
     [[nodiscard]] virtual std::uint32_t GetFramesInFlight() const = 0;
     [[nodiscard]] virtual bool IsBindlessSupported() const = 0;
+    [[nodiscard]] virtual bool IsRayTracingSupported() const = 0;
 
     [[nodiscard]] virtual std::unique_ptr<Buffer> CreateBuffer(
         const BufferDesc& desc,
@@ -61,6 +63,14 @@ public:
     [[nodiscard]] virtual std::unique_ptr<DescriptorSetLayout> CreateDescriptorSetLayout(
         const std::vector<DescriptorBinding>& bindings) = 0;
     [[nodiscard]] virtual std::unique_ptr<DescriptorSet> CreateDescriptorSet(const DescriptorSetLayout& layout) = 0;
+
+    [[nodiscard]] virtual std::unique_ptr<AccelerationStructure> CreateBottomLevelAccelerationStructure(
+        const BottomLevelAccelerationStructureDesc& desc) = 0;
+    [[nodiscard]] virtual std::unique_ptr<AccelerationStructure> CreateTopLevelAccelerationStructure(
+        const TopLevelAccelerationStructureDesc& desc) = 0;
+    virtual void UpdateTopLevelAccelerationStructure(
+        AccelerationStructure& accelerationStructure,
+        std::span<const AccelerationStructureInstance> instances) = 0;
 
 protected:
     Device() = default;
