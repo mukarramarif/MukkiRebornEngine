@@ -417,7 +417,11 @@ void DeferredRenderer::Shutdown()
     m_giTraceSetLayout.reset();
     m_shadowMap.reset();
     m_spotShadowMap.reset();
-    m_pointShadowMap.reset();
+    m_pointShadowMaps.clear();
+    for (PointShadowSlotState& state : m_pointShadowSlotStates)
+    {
+        state = PointShadowSlotState{};
+    }
     m_shadowSampler.reset();
     m_shadowUniformBuffers.clear();
     m_shadowViews.clear();
@@ -1151,6 +1155,7 @@ void DeferredRenderer::AddModelInstance(std::size_t modelIndex, const glm::mat4&
 
     sceneObject.drawItemCount = m_modelDrawItems.size() - sceneObject.firstDrawItem;
     m_objectInstances.push_back(sceneObject);
+    ++m_geometryRevision;
 }
 
 void DeferredRenderer::UpdateSceneObjectTransform(std::size_t objectIndex, const glm::mat4& transform)
@@ -1176,6 +1181,7 @@ void DeferredRenderer::UpdateSceneObjectTransform(std::size_t objectIndex, const
         m_modelDrawItems[drawIndex].pushConstants.model = scaleMatrix * baseTransform;
         m_modelBaseTransforms[drawIndex] = baseTransform;
     }
+    ++m_geometryRevision;
 }
 
 bool DeferredRenderer::GetSceneBounds(glm::vec3& outMin, glm::vec3& outMax) const
@@ -1205,6 +1211,7 @@ void DeferredRenderer::ClearModelInstances()
     m_modelDrawItems.clear();
     m_modelBaseTransforms.clear();
     m_objectInstances.clear();
+    ++m_geometryRevision;
 }
 
 void DeferredRenderer::ClearModels()
@@ -1212,6 +1219,7 @@ void DeferredRenderer::ClearModels()
     m_modelCache.clear();
     m_models.clear();
     m_blasDirty = true;
+    ++m_geometryRevision;
 }
 
 void DeferredRenderer::UnloadModel()
@@ -1233,6 +1241,7 @@ void DeferredRenderer::SetModelScale(float scale)
     MRE_ASSERT(scale > 0.0f, "Model scale must be greater than zero");
     m_modelScale = std::clamp(scale, 0.01f, 100.0f);
     ApplyModelScale();
+    ++m_geometryRevision;
 }
 
 void DeferredRenderer::UpdateObjectData(std::uint32_t frameIndex)
@@ -3006,39 +3015,43 @@ void DeferredRenderer::BuildShadowViews()
         }
     }
 
-    if (m_pointShadowMap != nullptr)
+    if (!m_pointShadowMaps.empty())
     {
-        // Each point light owns a 3x2 tile block in the atlas; the six faces are rendered into the
-        // tiles with a sub-rect render area.
-        constexpr std::uint32_t kFaceRows = kPointShadowAtlasRows / kMaxPointShadowLights;
-
-        for (std::size_t slot = 0; slot < m_pointShadowLights.size(); ++slot)
+        // Every point shadow slot owns its own six-layer map. With dynamic updates a map is only
+        // re-rendered when the light moved/changed or the scene geometry changed, so static lights
+        // keep their cached shadow map; moving lights still refresh every frame.
+        for (std::size_t slot = 0; slot < m_pointShadowLights.size() &&
+                                   slot < m_pointShadowMaps.size() &&
+                                   slot < m_pointShadowSlotStates.size();
+             ++slot)
         {
             const Light& light = m_pointShadowLights[slot];
-            std::vector<const DrawItem*> items = CollectShadowItems(light.position, light.range);
-            if (items.empty())
+            PointShadowSlotState& state = m_pointShadowSlotStates[slot];
+            const bool needsUpdate =
+                !m_shadowSettings.dynamicPointShadows ||
+                PointShadowNeedsUpdate(state, light.position, light.range, m_geometryRevision);
+            if (!needsUpdate)
             {
                 continue;
             }
 
+            std::vector<const DrawItem*> items = CollectShadowItems(light.position, light.range);
             for (std::uint32_t face = 0; face < kPointShadowFaceCount; ++face)
             {
-                const std::uint32_t column = face % kPointShadowAtlasColumns;
-                const std::uint32_t row =
-                    static_cast<std::uint32_t>(slot) * kFaceRows + face / kPointShadowAtlasColumns;
-
                 ShadowView view{};
                 view.viewIndex = kPointShadowOffset +
                                  static_cast<std::uint32_t>(slot) * kPointShadowFaceCount + face;
-                view.texture = m_pointShadowMap.get();
-                view.area = rhi::RenderArea{
-                    column * kPointShadowTileSize,
-                    row * kPointShadowTileSize,
-                    kPointShadowTileSize,
-                    kPointShadowTileSize};
+                view.texture = m_pointShadowMaps[slot].get();
+                view.layer = face;
                 view.items = items;
                 m_shadowViews.push_back(std::move(view));
             }
+
+            // The views clear to 1.0 even when nothing is culled, so a cached map is always defined.
+            state.position = light.position;
+            state.range = light.range;
+            state.geometryRevision = m_geometryRevision;
+            state.valid = true;
         }
     }
 }
@@ -3481,7 +3494,13 @@ void DeferredRenderer::CreateLightingSets(rhi::Device& device)
         lightingSet->BindTexture(8, *m_shadowMap, 0u);
         lightingSet->BindSampler(9, *m_shadowSampler);
         lightingSet->BindTexture(10, *m_spotShadowMap, 0u);
-        lightingSet->BindTexture(11, *m_pointShadowMap, 0u);
+        // Binding 11 is the descriptor array of per-light point shadow maps.
+        for (std::uint32_t slot = 0;
+             slot < kMaxPointShadowLights && slot < m_pointShadowMaps.size();
+             ++slot)
+        {
+            lightingSet->BindTexture(11, *m_pointShadowMaps[slot], slot);
+        }
         MRE_ASSERT(!m_gi.empty(), "GI resources must exist before creating the lighting sets");
         lightingSet->BindTexture(12, *m_gi[frame].indirect, 0u);
         lightingSet->BindTexture(
@@ -3558,16 +3577,29 @@ bool DeferredRenderer::CreateShadowResources(rhi::Device& device)
         return false;
     }
 
-    const rhi::TextureDesc pointShadowDesc{
-        kPointShadowAtlasWidth,
-        kPointShadowAtlasHeight,
-        rhi::Format::D32Sfloat,
-        rhi::TextureUsage::DepthAttachment};
-    m_pointShadowMap = device.CreateTexture(pointShadowDesc);
-    if (m_pointShadowMap == nullptr)
+    // One depth array per point shadow slot: the six cube faces are layers, updated independently.
+    m_pointShadowMaps.clear();
+    m_pointShadowMaps.reserve(kMaxPointShadowLights);
+    for (std::uint32_t slot = 0; slot < kMaxPointShadowLights; ++slot)
     {
-        MRE_CRITICAL("Failed to create the point shadow atlas");
-        return false;
+        const rhi::TextureDesc pointShadowDesc{
+            kPointShadowResolution,
+            kPointShadowResolution,
+            rhi::Format::D32Sfloat,
+            rhi::TextureUsage::DepthAttachment,
+            nullptr,
+            0,
+            kPointShadowFaceCount};
+        m_pointShadowMaps.push_back(device.CreateTexture(pointShadowDesc));
+        if (m_pointShadowMaps.back() == nullptr)
+        {
+            MRE_CRITICAL("Failed to create point shadow map {}", slot);
+            return false;
+        }
+    }
+    for (PointShadowSlotState& state : m_pointShadowSlotStates)
+    {
+        state = PointShadowSlotState{};
     }
 
     rhi::SamplerDesc samplerDesc{};
@@ -3601,16 +3633,16 @@ bool DeferredRenderer::CreateShadowResources(rhi::Device& device)
     }
 
     MRE_INFO(
-        "Shadow maps created ({}x{} x{} cascades, {}x{} x{} spots, {}x{} atlas for {} point lights)",
+        "Shadow maps created ({}x{} x{} cascades, {}x{} x{} spots, {}x{}x{} per point light)",
         kShadowResolution,
         kShadowResolution,
         kShadowCascadeCount,
         kSpotShadowResolution,
         kSpotShadowResolution,
         kMaxSpotShadowLights,
-        kPointShadowAtlasWidth,
-        kPointShadowAtlasHeight,
-        kMaxPointShadowLights);
+        kPointShadowResolution,
+        kPointShadowResolution,
+        kPointShadowFaceCount);
     return true;
 }
 

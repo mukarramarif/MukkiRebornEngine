@@ -28,9 +28,13 @@ struct GpuLight
     float4 params; // x: type, y: inner cone cosine, z: outer cone cosine
 };
 
+// Must match mukki::kMaxShadowViews (4 cascades + 4 spots + 4 point lights * 6 faces).
+static const uint kMaxShadowViews = 32;
+static const uint kMaxPointShadowLights = 4;
+
 struct ShadowUniform
 {
-    float4x4 viewProjections[20]; // 4 cascades + 4 spots + 2 point lights * 6 faces
+    float4x4 viewProjections[kMaxShadowViews];
     float4 cascadeSplits;
     float4 params;   // x: depthBias, y: normalBias, z: distance, w: enabled
     float4 rtParams; // x: ray traced sun shadows enabled, y/z/w: unused
@@ -76,7 +80,8 @@ struct GpuObjectData
 [[vk::binding(8, 0)]] Texture2DArray gShadowMap;
 [[vk::binding(9, 0)]] SamplerComparisonState gShadowSampler;
 [[vk::binding(10, 0)]] Texture2DArray gSpotShadowMap;
-[[vk::binding(11, 0)]] Texture2D gPointShadowMap;
+// One six-layer shadow map per point shadow slot (descriptor array).
+[[vk::binding(11, 0)]] Texture2DArray gPointShadowMaps[kMaxPointShadowLights];
 [[vk::binding(12, 0)]] Texture2D gIndirect;
 [[vk::binding(13, 0)]] Texture2D<float> gRtSunShadow;
 [[vk::binding(14, 0)]] StructuredBuffer<GpuGiProbe> gGiProbes;
@@ -112,10 +117,7 @@ static const uint kMaxSpotShadowLights = 4;
 static const uint kSpotShadowOffset = kShadowCascadeCount;
 static const uint kPointShadowOffset = kSpotShadowOffset + kMaxSpotShadowLights;
 static const uint kPointShadowFaceCount = 6;
-static const float kPointShadowTileSize = 512.0;
-static const float kPointShadowAtlasColumns = 3.0;
-static const float kPointShadowAtlasWidth = 1536.0;  // 3 tiles wide
-static const float kPointShadowAtlasHeight = 2048.0; // 2 point lights * 2 tile rows
+static const uint kPointShadowResolution = 512;
 
 float3 acesTonemap(float3 color)
 {
@@ -289,17 +291,8 @@ float samplePointShadowFactor(
         return 1.0;
     }
 
-    // Map the face UV into its atlas tile and clamp each PCF tap inside the tile so neighbouring
-    // faces never bleed into the filter.
-    const uint tileColumn = face % uint(kPointShadowAtlasColumns);
-    const uint tileRow = shadowIndex * 2u + face / uint(kPointShadowAtlasColumns);
-    const float2 atlasSize = float2(kPointShadowAtlasWidth, kPointShadowAtlasHeight);
-    const float2 tileOrigin = float2(float(tileColumn), float(tileRow)) * kPointShadowTileSize;
-    const float2 tileMinUv = (tileOrigin + 0.5) / atlasSize;
-    const float2 tileMaxUv = (tileOrigin + kPointShadowTileSize - 0.5) / atlasSize;
-    const float2 atlasUv = (tileOrigin + uv * kPointShadowTileSize) / atlasSize;
-    const float2 texel = 1.0 / atlasSize;
-
+    // Each point light owns its own map; the cube face is selected by the array layer.
+    const float2 texel = 1.0 / float(kPointShadowResolution);
     const float compareDepth = ndc.z - gShadow.params.x * kPerspectiveCompareBiasScale;
 
     float shadow = 0.0;
@@ -309,11 +302,13 @@ float samplePointShadowFactor(
         [unroll]
         for (int x = -1; x <= 1; ++x)
         {
+            // Clamp the PCF taps inside the face so neighbouring cube faces never bleed in.
             const float2 tapUv = clamp(
-                atlasUv + float2(float(x), float(y)) * texel,
-                tileMinUv,
-                tileMaxUv);
-            shadow += gPointShadowMap.SampleCmpLevelZero(gShadowSampler, tapUv, compareDepth);
+                uv + float2(float(x), float(y)) * texel,
+                float2(0.0, 0.0),
+                float2(1.0, 1.0));
+            shadow += gPointShadowMaps[NonUniformResourceIndex(shadowIndex)]
+                          .SampleCmpLevelZero(gShadowSampler, float3(tapUv, float(face)), compareDepth);
         }
     }
 
