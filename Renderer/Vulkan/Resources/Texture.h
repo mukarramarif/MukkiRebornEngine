@@ -31,6 +31,7 @@ public:
     [[nodiscard]] rhi::Format GetFormat() const override { return m_desc.format; }
     [[nodiscard]] rhi::TextureUsage GetUsage() const override { return m_desc.usage; }
     [[nodiscard]] std::uint32_t GetArrayLayers() const override { return m_desc.arrayLayers; }
+    [[nodiscard]] std::uint32_t GetDepth() const override { return m_desc.depth; }
     [[nodiscard]] std::uint32_t GetBindlessIndex() const override { return m_bindlessIndex; }
 
     void SetBindlessIndex(std::uint32_t index) { m_bindlessIndex = index; }

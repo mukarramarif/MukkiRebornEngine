@@ -91,11 +91,12 @@ GBufferOutput fragmentMain(VertexOutput input)
         input.uv);
 
     // Motion vectors in pixels: current pixel position minus the position where this surface was
-    // on the previous frame (uv y grows downward, matching the framebuffer).
+    // on the previous frame. The camera projection flips y so negative NDC y is the top of the
+    // framebuffer (Vulkan); NDC -> pixel must therefore not negate y.
     const float2 previousNdc = input.previousClip.xy / input.previousClip.w;
     const float2 previousPixel = float2(
         (previousNdc.x * 0.5 + 0.5) * gScene.screenSize.x,
-        (0.5 - previousNdc.y * 0.5) * gScene.screenSize.y);
+        (previousNdc.y * 0.5 + 0.5) * gScene.screenSize.y);
 
     GBufferOutput output;
     output.albedo = float4(baseColorSample.rgb * gObject.baseColorFactor.rgb, gObject.params.y * metalRoughness.b);

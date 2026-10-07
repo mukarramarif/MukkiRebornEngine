@@ -106,6 +106,22 @@ must not expose backend types, and Vulkan types may only appear under `Renderer/
   `reflectionSize`), and `reflection_upsample.comp.slang` bilaterally upsamples to full res
   (roughness-aware). The lighting pass adds binding 15 scaled by `SceneUniform.reflectionParams.x`.
   `GiUniform.params6` carries the reflection parameters and `params5.w` the history reset flag.
+- Volumetric clouds: Nubis/Decima-style ray marched layer (`Renderer/Clouds/`). `CloudNoise.h/.cpp`
+  generates tileable noise on the JobSystem at init (no authored assets): 128^3 RGBA8 base
+  (r Perlin-Worley, g/b/a Worley octaves), 32^3 detail, 128^2 curl and a 256^2 weather map holding
+  regional variation around 0.5 (the sliders offset coverage/type/altitude in the shader).
+  `clouds.comp.slang` traces the half-resolution layer (`CloudSettings::resolutionScale`, default
+  0.5, sky pixels only so geometry occludes clouds), applies curl distortion and per-cloud-type
+  height gradients, then light-marches toward the sun (cone samples, dual-lobe Henyey-Greenstein,
+  double Beer-Lambert and powder) and writes scattering/transmittance, a sun-occlusion mask and an
+  estimated distance. `cloud_reproject.comp.slang` accumulates per frame slot (world reprojection
+  at the estimated distance with previous view-projection, depth/distance validation, history
+  invalidated by setting changes), `cloud_upsample.comp.slang` resolves to full res, and
+  `cloud_godrays.comp.slang` radially blurs the mask toward the sun's screen position.
+  `lighting.frag` composites `sky * transmittance + scattering + godRays` on sky pixels (bindings
+  23-25). `CloudSettings`/`CloudUniform` (`Renderer/Clouds/CloudSettings.h`) mirror the shaders;
+  noise generation costs ~4 s Debug (<1 s Release) at startup. `.hdr` environment maps, the
+  gradient sky, GI and reflections are unaffected (clouds are sky-only).
 - Image based lighting: `Renderer/Lighting/Environment.h/.cpp` defines a parametric gradient sky
   (`EnvironmentSettings`); `ComputeEnvironmentSh` numerically projects it onto SH L2 with the
   Lambert band factors folded in (diffuse = `albedo * EvaluateSkySh`), and `BuildEnvironmentBrdfLut`

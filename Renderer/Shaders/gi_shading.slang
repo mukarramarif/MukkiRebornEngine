@@ -195,7 +195,8 @@ bool SampleRtSunVisibility(float3 position, float3 normal, out float visibility)
         return false;
     }
 
-    const float2 uv = float2(clip.x / clip.w * 0.5 + 0.5, 0.5 - clip.y / clip.w * 0.5);
+    // Camera projection flips y: negative NDC y is the top of the framebuffer.
+    const float2 uv = float2(clip.x / clip.w * 0.5 + 0.5, clip.y / clip.w * 0.5 + 0.5);
     if (any(uv < 0.0) || any(uv > 1.0))
     {
         return false;
@@ -567,9 +568,10 @@ float3 ShadeOpaqueSurface(
     const float4 previousClip = mul(gGi.previousViewProjection, float4(hitPosition, 1.0));
     if (previousClip.w > 0.0)
     {
+        // Camera projection flips y: negative NDC y is the top of the framebuffer.
         const float2 previousUv = float2(
             previousClip.x / previousClip.w * 0.5 + 0.5,
-            0.5 - previousClip.y / previousClip.w * 0.5);
+            previousClip.y / previousClip.w * 0.5 + 0.5);
         if (all(previousUv >= 0.0) && all(previousUv <= 1.0))
         {
             const float3 feedback = SampleBilinear(feedbackTexture, previousUv);

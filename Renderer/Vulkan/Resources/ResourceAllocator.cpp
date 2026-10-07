@@ -219,7 +219,12 @@ std::unique_ptr<rhi::Texture> VkResourceAllocator::CreateTexture(const rhi::Text
     MRE_ASSERT(desc.width > 0 && desc.height > 0, "Texture dimensions must be greater than zero");
     MRE_ASSERT(desc.format != rhi::Format::Undefined, "Texture format must be defined");
     MRE_ASSERT(desc.arrayLayers > 0, "Texture layer count must be greater than zero");
+    MRE_ASSERT(desc.depth > 0, "Texture depth must be greater than zero");
+    MRE_ASSERT(
+        desc.depth == 1 || desc.arrayLayers == 1,
+        "3D textures cannot have array layers");
 
+    const bool is3D = desc.depth > 1;
     const bool hasData = desc.initialData != nullptr && desc.initialDataSize > 0;
     MRE_ASSERT(!hasData || desc.arrayLayers == 1, "Initial data is only supported for single-layer textures");
     const bool isDepth = desc.usage == rhi::TextureUsage::DepthAttachment;
@@ -228,10 +233,12 @@ std::unique_ptr<rhi::Texture> VkResourceAllocator::CreateTexture(const rhi::Text
     if (hasData)
     {
         MRE_ASSERT(desc.usage == rhi::TextureUsage::Sampled, "Initial data is only supported for sampled textures");
-        // The copy uses tightly packed rows, so any format works as long as the data fills whole
-        // pixels.
+        // The copy uses tightly packed rows and slices, so any format works as long as the data
+        // fills whole pixels.
         MRE_ASSERT(
-            desc.initialDataSize % (static_cast<std::uint64_t>(desc.width) * desc.height) == 0,
+            desc.initialDataSize %
+                    (static_cast<std::uint64_t>(desc.width) * desc.height * desc.depth) ==
+                0,
             "Initial data size must be a whole number of pixels");
     }
 
@@ -242,9 +249,9 @@ std::unique_ptr<rhi::Texture> VkResourceAllocator::CreateTexture(const rhi::Text
     }
 
     vk::ImageCreateInfo imageInfo{};
-    imageInfo.imageType = vk::ImageType::e2D;
+    imageInfo.imageType = is3D ? vk::ImageType::e3D : vk::ImageType::e2D;
     imageInfo.format = ToVkFormat(desc.format);
-    imageInfo.extent = vk::Extent3D{desc.width, desc.height, 1};
+    imageInfo.extent = vk::Extent3D{desc.width, desc.height, desc.depth};
     imageInfo.mipLevels = 1;
     imageInfo.arrayLayers = desc.arrayLayers;
     imageInfo.samples = vk::SampleCountFlagBits::e1;
@@ -336,7 +343,7 @@ std::unique_ptr<rhi::Texture> VkResourceAllocator::CreateTexture(const rhi::Text
                                                                                 .setBaseArrayLayer(0)
                                                                                 .setLayerCount(1))
                                                        .setImageOffset(vk::Offset3D{0, 0, 0})
-                                                       .setImageExtent(vk::Extent3D{desc.width, desc.height, 1});
+                                                       .setImageExtent(vk::Extent3D{desc.width, desc.height, desc.depth});
             commandBuffer.copyBufferToImage(
                 stagingBuffer,
                 image,
@@ -399,8 +406,9 @@ std::unique_ptr<rhi::Texture> VkResourceAllocator::CreateTexture(const rhi::Text
     const vk::ImageViewCreateInfo viewInfo = vk::ImageViewCreateInfo{}
                                                  .setImage(image)
                                                  .setViewType(
-                                                     desc.arrayLayers > 1 ? vk::ImageViewType::e2DArray
-                                                                          : vk::ImageViewType::e2D)
+                                                     is3D        ? vk::ImageViewType::e3D
+                                                     : desc.arrayLayers > 1 ? vk::ImageViewType::e2DArray
+                                                                            : vk::ImageViewType::e2D)
                                                  .setFormat(ToVkFormat(desc.format))
                                                  .setSubresourceRange(vk::ImageSubresourceRange{}
                                                                           .setAspectMask(aspect)

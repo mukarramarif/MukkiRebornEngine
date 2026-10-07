@@ -2,6 +2,7 @@
 
 #include "Assets/GltfLoader.h"
 #include "Assets/HdrLoader.h"
+#include "Renderer/Clouds/CloudNoise.h"
 #include "Core/JobSystem.h"
 #include "Renderer/GlobalIllumination/GiAtrousSchedule.h"
 #include "Renderer/RHI/Device.h"
@@ -13,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstddef>
@@ -257,6 +259,19 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
             device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(reflectionUpsampleStages, 0));
     }
 
+    const std::array<const rhi::Shader*, 1> cloudStages{m_cloudShader.get()};
+    m_cloudSetLayout =
+        device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(cloudStages, 0));
+    const std::array<const rhi::Shader*, 1> cloudUpsampleStages{m_cloudUpsampleShader.get()};
+    m_cloudUpsampleSetLayout =
+        device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(cloudUpsampleStages, 0));
+    const std::array<const rhi::Shader*, 1> cloudReprojectStages{m_cloudReprojectShader.get()};
+    m_cloudReprojectSetLayout =
+        device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(cloudReprojectStages, 0));
+    const std::array<const rhi::Shader*, 1> cloudGodRayStages{m_cloudGodRayShader.get()};
+    m_cloudGodRaySetLayout =
+        device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(cloudGodRayStages, 0));
+
     MRE_ASSERT(
         m_sceneSetLayout != nullptr && m_bindlessSetLayout != nullptr &&
             m_lightingSetLayout != nullptr && m_clusterSetLayout != nullptr && m_shadowSetLayout != nullptr,
@@ -300,6 +315,12 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
     }
 
     if (!CreateGiResources(device))
+    {
+        Shutdown();
+        return false;
+    }
+
+    if (!CreateCloudResources(device))
     {
         Shutdown();
         return false;
@@ -423,6 +444,41 @@ void DeferredRenderer::Shutdown()
     m_environmentMap.reset();
     m_environmentMapBound = false;
     m_loadedEnvironmentMapPath.clear();
+    m_cloudPipeline.reset();
+    m_cloudUpsamplePipeline.reset();
+    m_cloudReprojectPipeline.reset();
+    m_cloudGodRayPipeline.reset();
+    m_cloudSetLayout.reset();
+    m_cloudUpsampleSetLayout.reset();
+    m_cloudReprojectSetLayout.reset();
+    m_cloudGodRaySetLayout.reset();
+    m_cloudShader.reset();
+    m_cloudUpsampleShader.reset();
+    m_cloudReprojectShader.reset();
+    m_cloudGodRayShader.reset();
+    m_cloudBaseNoise.reset();
+    m_cloudDetailNoise.reset();
+    m_cloudCurlNoise.reset();
+    m_cloudWeatherMap.reset();
+    m_cloudSampler.reset();
+    m_cloudEmpty.reset();
+    m_cloudUniformBuffers.clear();
+    m_cloudSets.clear();
+    m_cloudUpsampleSets.clear();
+    m_cloudReprojectSets.clear();
+    m_cloudGodRaySets.clear();
+    m_cloudCurrent.clear();
+    m_cloudDistance.clear();
+    m_cloudMask.clear();
+    m_cloudFull.clear();
+    m_cloudHistory.clear();
+    m_cloudHistoryDistance.clear();
+    m_cloudHistoryMask.clear();
+    m_cloudGodRays.clear();
+    m_cloudHistoryParity.clear();
+    m_cloudHistoryValid.clear();
+    m_cloudNoiseReady = false;
+    m_cloudFrameCounter = 0;
     m_bindlessSamplers.clear();
     m_samplerCache.clear();
     m_gbufferSampler.reset();
@@ -474,6 +530,11 @@ void DeferredRenderer::Resize(std::uint32_t width, std::uint32_t height)
     if (!CreateGiResources(*m_device))
     {
         MRE_CRITICAL("Failed to recreate the global illumination resources");
+    }
+
+    if (!CreateCloudResources(*m_device))
+    {
+        MRE_CRITICAL("Failed to recreate the cloud resources");
     }
 
     if (!CreateRtShadowResources(*m_device))
@@ -1660,6 +1721,424 @@ bool DeferredRenderer::IsReflectionActive() const
            !m_gi.empty();
 }
 
+bool DeferredRenderer::IsCloudActive() const
+{
+    return m_cloudSettings.enabled && m_device != nullptr && m_cloudPipeline != nullptr &&
+           m_cloudUpsamplePipeline != nullptr && !m_cloudSets.empty();
+}
+
+void DeferredRenderer::SetCloudSettings(const CloudSettings& settings)
+{
+    const bool scaleChanged =
+        std::abs(settings.resolutionScale - m_cloudSettings.resolutionScale) > 1e-4f;
+    const bool enabledChanged = settings.enabled != m_cloudSettings.enabled;
+    m_cloudSettings = settings;
+    m_cloudSettings.resolutionScale = std::clamp(m_cloudSettings.resolutionScale, 0.25f, 1.0f);
+
+    if (scaleChanged && m_initialized && m_device != nullptr)
+    {
+        m_device->WaitIdle();
+        if (!CreateCloudResources(*m_device))
+        {
+            MRE_CRITICAL("Failed to recreate the cloud resources");
+        }
+    }
+    if (enabledChanged)
+    {
+        m_lightingSetsDirty = true;
+    }
+    // Setting changes invalidate the cloud history so the previous weather/layers do not ghost.
+    for (std::size_t index = 0; index < m_cloudHistoryValid.size(); ++index)
+    {
+        m_cloudHistoryValid[index] = false;
+    }
+}
+
+void DeferredRenderer::GenerateCloudNoiseTextures()
+{
+    const auto start = std::chrono::steady_clock::now();
+
+    constexpr std::uint32_t kBaseResolution = 128;
+    constexpr std::uint32_t kDetailResolution = 32;
+    constexpr std::uint32_t kCurlResolution = 128;
+    constexpr std::uint32_t kWeatherResolution = 256;
+    constexpr std::uint32_t kNoiseSeed = 1337u;
+    constexpr float kWeatherVariation = 0.5f;
+
+    std::vector<std::uint8_t> basePixels(
+        static_cast<std::size_t>(kBaseResolution) * kBaseResolution * kBaseResolution * 4);
+    std::vector<std::uint8_t> detailPixels(
+        static_cast<std::size_t>(kDetailResolution) * kDetailResolution * kDetailResolution * 4);
+    std::vector<std::uint8_t> curlPixels(
+        static_cast<std::size_t>(kCurlResolution) * kCurlResolution * 4);
+    std::vector<std::uint8_t> weatherPixels(
+        static_cast<std::size_t>(kWeatherResolution) * kWeatherResolution * 4);
+
+    const auto dispatchSlices = [this](
+                                    std::uint32_t slices,
+                                    const auto& generate) {
+        const std::uint32_t jobCount =
+            m_jobSystem != nullptr ? std::max(1u, m_jobSystem->GetThreadCount()) : 1u;
+        for (std::uint32_t job = 0; job < jobCount; ++job)
+        {
+            const std::uint32_t begin = slices * job / jobCount;
+            const std::uint32_t end = slices * (job + 1) / jobCount;
+            if (begin >= end)
+            {
+                continue;
+            }
+            if (m_jobSystem != nullptr)
+            {
+                m_jobSystem->Submit([&generate, begin, end]() { generate(begin, end); });
+            }
+            else
+            {
+                generate(begin, end);
+            }
+        }
+        if (m_jobSystem != nullptr)
+        {
+            m_jobSystem->WaitIdle();
+        }
+    };
+
+    dispatchSlices(kBaseResolution, [&](std::uint32_t begin, std::uint32_t end) {
+        GenerateCloudBaseShape(kBaseResolution, kNoiseSeed, begin, end, basePixels);
+    });
+    dispatchSlices(kDetailResolution, [&](std::uint32_t begin, std::uint32_t end) {
+        GenerateCloudDetail(kDetailResolution, kNoiseSeed + 17u, begin, end, detailPixels);
+    });
+    dispatchSlices(kCurlResolution, [&](std::uint32_t begin, std::uint32_t end) {
+        GenerateCloudCurl(kCurlResolution, kNoiseSeed + 29u, begin, end, curlPixels);
+    });
+    dispatchSlices(kWeatherResolution, [&](std::uint32_t begin, std::uint32_t end) {
+        GenerateCloudWeather(
+            kWeatherResolution,
+            kWeatherVariation,
+            kNoiseSeed + 41u,
+            begin,
+            end,
+            weatherPixels);
+    });
+
+    const auto createNoise = [this](
+                                 std::uint32_t width,
+                                 std::uint32_t height,
+                                 std::uint32_t depth,
+                                 const std::vector<std::uint8_t>& pixels) {
+        const rhi::TextureDesc desc{
+            width,
+            height,
+            rhi::Format::R8G8B8A8Unorm,
+            rhi::TextureUsage::Sampled,
+            pixels.data(),
+            pixels.size(),
+            1,
+            depth};
+        return m_device->CreateTexture(desc);
+    };
+
+    m_cloudBaseNoise = createNoise(kBaseResolution, kBaseResolution, kBaseResolution, basePixels);
+    m_cloudDetailNoise = createNoise(kDetailResolution, kDetailResolution, kDetailResolution, detailPixels);
+    m_cloudCurlNoise = createNoise(kCurlResolution, kCurlResolution, 1, curlPixels);
+    m_cloudWeatherMap = createNoise(kWeatherResolution, kWeatherResolution, 1, weatherPixels);
+
+    m_cloudNoiseReady = m_cloudBaseNoise != nullptr && m_cloudDetailNoise != nullptr &&
+                        m_cloudCurlNoise != nullptr && m_cloudWeatherMap != nullptr;
+
+    const float milliseconds =
+        std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - start).count();
+    MRE_INFO("Generated cloud noise textures in {:.0f} ms", static_cast<double>(milliseconds));
+}
+
+bool DeferredRenderer::CreateCloudResources(rhi::Device& device)
+{
+    MRE_ASSERT(m_cloudSetLayout != nullptr, "Cloud set layouts must exist before the resources");
+
+    if (!m_cloudNoiseReady)
+    {
+        GenerateCloudNoiseTextures();
+        if (!m_cloudNoiseReady)
+        {
+            MRE_CRITICAL("Failed to generate the cloud noise textures");
+            return false;
+        }
+    }
+
+    if (m_cloudSampler == nullptr)
+    {
+        rhi::SamplerDesc samplerDesc{};
+        samplerDesc.addressModeU = rhi::AddressMode::Repeat;
+        samplerDesc.addressModeV = rhi::AddressMode::Repeat;
+        m_cloudSampler = device.CreateSampler(samplerDesc);
+        if (m_cloudSampler == nullptr)
+        {
+            MRE_CRITICAL("Failed to create the cloud sampler");
+            return false;
+        }
+    }
+
+    const auto createEmpty = [&device]() {
+        const std::array<std::uint16_t, 4> emptyPixel{0u, 0u, 0u, 0x3C00u}; // 0,0,0,1 in half
+        const rhi::TextureDesc desc{
+            1,
+            1,
+            rhi::Format::R16G16B16A16Sfloat,
+            rhi::TextureUsage::Sampled,
+            emptyPixel.data(),
+            emptyPixel.size() * sizeof(std::uint16_t)};
+        return device.CreateTexture(desc);
+    };
+    if (m_cloudEmpty == nullptr)
+    {
+        m_cloudEmpty = createEmpty();
+        if (m_cloudEmpty == nullptr)
+        {
+            MRE_CRITICAL("Failed to create the empty cloud texture");
+            return false;
+        }
+    }
+
+    const std::uint32_t framesInFlight = device.GetFramesInFlight();
+    const std::uint32_t fullWidth = m_gbuffer.GetWidth();
+    const std::uint32_t fullHeight = m_gbuffer.GetHeight();
+    m_cloudWidth = std::max(
+        1u,
+        static_cast<std::uint32_t>(
+            std::lround(static_cast<double>(fullWidth) * m_cloudSettings.resolutionScale)));
+    m_cloudHeight = std::max(
+        1u,
+        static_cast<std::uint32_t>(
+            std::lround(static_cast<double>(fullHeight) * m_cloudSettings.resolutionScale)));
+
+    const auto createStorage = [&device](std::uint32_t width, std::uint32_t height, rhi::Format format) {
+        return device.CreateTexture(rhi::TextureDesc{width, height, format, rhi::TextureUsage::Storage});
+    };
+
+    m_cloudUniformBuffers.clear();
+    m_cloudSets.clear();
+    m_cloudUpsampleSets.clear();
+    m_cloudReprojectSets.clear();
+    m_cloudGodRaySets.clear();
+    m_cloudCurrent.clear();
+    m_cloudDistance.clear();
+    m_cloudMask.clear();
+    m_cloudFull.clear();
+    m_cloudHistory.clear();
+    m_cloudHistoryDistance.clear();
+    m_cloudHistoryMask.clear();
+    m_cloudGodRays.clear();
+    m_cloudHistoryParity.clear();
+    m_cloudHistoryValid.clear();
+    m_cloudUniformBuffers.reserve(framesInFlight);
+    m_cloudSets.reserve(framesInFlight);
+    m_cloudUpsampleSets.reserve(framesInFlight);
+    m_cloudReprojectSets.reserve(framesInFlight);
+    m_cloudGodRaySets.reserve(framesInFlight);
+    m_cloudCurrent.reserve(framesInFlight);
+    m_cloudDistance.reserve(framesInFlight);
+    m_cloudMask.reserve(framesInFlight);
+    m_cloudFull.reserve(framesInFlight);
+
+    for (std::uint32_t frame = 0; frame < framesInFlight; ++frame)
+    {
+        m_cloudUniformBuffers.push_back(
+            device.CreateBuffer(rhi::BufferDesc{sizeof(CloudUniform), rhi::BufferUsage::Uniform, true}));
+        m_cloudSets.push_back(device.CreateDescriptorSet(*m_cloudSetLayout));
+        m_cloudUpsampleSets.push_back(device.CreateDescriptorSet(*m_cloudUpsampleSetLayout));
+        m_cloudReprojectSets.push_back(device.CreateDescriptorSet(*m_cloudReprojectSetLayout));
+        m_cloudGodRaySets.push_back(device.CreateDescriptorSet(*m_cloudGodRaySetLayout));
+        m_cloudCurrent.push_back(createStorage(m_cloudWidth, m_cloudHeight, rhi::Format::R16G16B16A16Sfloat));
+        m_cloudDistance.push_back(createStorage(m_cloudWidth, m_cloudHeight, rhi::Format::R16Sfloat));
+        m_cloudMask.push_back(createStorage(m_cloudWidth, m_cloudHeight, rhi::Format::R16Sfloat));
+        m_cloudFull.push_back(createStorage(fullWidth, fullHeight, rhi::Format::R16G16B16A16Sfloat));
+        m_cloudGodRays.push_back(createStorage(m_cloudWidth, m_cloudHeight, rhi::Format::R16G16B16A16Sfloat));
+
+        std::array<std::unique_ptr<rhi::Texture>, 2> history{};
+        std::array<std::unique_ptr<rhi::Texture>, 2> historyDistance{};
+        std::array<std::unique_ptr<rhi::Texture>, 2> historyMask{};
+        for (std::uint32_t parity = 0; parity < 2; ++parity)
+        {
+            history[parity] = createStorage(m_cloudWidth, m_cloudHeight, rhi::Format::R16G16B16A16Sfloat);
+            historyDistance[parity] = createStorage(m_cloudWidth, m_cloudHeight, rhi::Format::R16Sfloat);
+            historyMask[parity] = createStorage(m_cloudWidth, m_cloudHeight, rhi::Format::R16Sfloat);
+        }
+        m_cloudHistory.push_back(std::move(history));
+        m_cloudHistoryDistance.push_back(std::move(historyDistance));
+        m_cloudHistoryMask.push_back(std::move(historyMask));
+        m_cloudHistoryParity.push_back(0u);
+        m_cloudHistoryValid.push_back(false);
+
+        const bool frameReady =
+            m_cloudUniformBuffers.back() != nullptr && m_cloudSets.back() != nullptr &&
+            m_cloudUpsampleSets.back() != nullptr && m_cloudReprojectSets.back() != nullptr &&
+            m_cloudGodRaySets.back() != nullptr && m_cloudCurrent.back() != nullptr &&
+            m_cloudDistance.back() != nullptr && m_cloudMask.back() != nullptr &&
+            m_cloudFull.back() != nullptr && m_cloudGodRays.back() != nullptr &&
+            m_cloudHistory.back()[0] != nullptr && m_cloudHistory.back()[1] != nullptr &&
+            m_cloudHistoryDistance.back()[0] != nullptr &&
+            m_cloudHistoryDistance.back()[1] != nullptr &&
+            m_cloudHistoryMask.back()[0] != nullptr && m_cloudHistoryMask.back()[1] != nullptr;
+        if (!frameReady)
+        {
+            MRE_CRITICAL("Failed to create the cloud resources");
+            return false;
+        }
+    }
+
+    m_lightingSetsDirty = true;
+    MRE_INFO("Cloud resources created ({}x{} trace, {}x{} full)", m_cloudWidth, m_cloudHeight, fullWidth, fullHeight);
+    return true;
+}
+
+void DeferredRenderer::UpdateCloudUniform(std::uint32_t frameIndex, const FrameView& view)
+{
+    if (frameIndex >= m_cloudUniformBuffers.size() || m_cloudUniformBuffers[frameIndex] == nullptr)
+    {
+        return;
+    }
+
+    m_cloudUniform.inverseViewProjection = glm::inverse(view.viewProjection);
+    m_cloudUniform.previousViewProjection = view.previousViewProjection;
+    m_cloudUniform.viewProjection = view.viewProjection;
+    m_cloudUniform.cameraPosition = glm::vec4{view.position, 1.0f};
+    m_cloudUniform.screenSize = glm::vec4{
+        static_cast<float>(m_gbuffer.GetWidth()),
+        static_cast<float>(m_gbuffer.GetHeight()),
+        static_cast<float>(m_cloudWidth),
+        static_cast<float>(m_cloudHeight)};
+    m_cloudUniform.sunDirectionIntensity =
+        glm::vec4{glm::vec3{m_sceneUniform.sunDirection}, 1.0f};
+    m_cloudUniform.sunColor = m_sceneUniform.sunColor;
+    m_cloudUniform.cloudParams = glm::vec4{
+        m_cloudSettings.coverage,
+        m_cloudSettings.cloudType,
+        m_cloudSettings.density,
+        m_cloudSettings.detailStrength};
+    m_cloudUniform.cloudParams2 = glm::vec4{
+        m_cloudSettings.layerBottomKm,
+        m_cloudSettings.layerTopKm,
+        m_cloudSettings.altitudeVariationKm,
+        m_cloudSettings.curlStrength};
+    m_cloudUniform.cloudParams3 = glm::vec4{
+        m_cloudSettings.windDirectionRadians,
+        m_cloudSettings.windSpeed,
+        static_cast<float>(m_cloudFrameCounter) / 60.0f,
+        0.0f};
+    for (std::size_t band = 0; band < 9; ++band)
+    {
+        m_cloudUniform.skySh[band] = m_environmentSh.bands[band];
+    }
+    m_cloudUniform.skyParams = glm::vec4{
+        1.0f,
+        m_cloudSettings.coverageVariation,
+        m_cloudSettings.godRayIntensity,
+        0.0f};
+    // Noise scales in 1 / metres: base features are kilometres wide, detail a few hundred metres.
+    m_cloudUniform.noiseScales = glm::vec4{
+        1.0f / 8000.0f,
+        1.0f / 900.0f,
+        1.0f / 3000.0f,
+        1.0f / 60000.0f};
+    const bool historyValid =
+        frameIndex < m_cloudHistoryValid.size() && m_cloudHistoryValid[frameIndex];
+    m_cloudUniform.temporalParams = glm::vec4{
+        std::clamp(m_cloudSettings.temporalBlend, 0.0f, 0.98f),
+        historyValid ? 0.0f : 1.0f,
+        0.0f,
+        0.0f};
+    m_cloudUniform.cloudParams4 = glm::vec4{
+        static_cast<float>(std::clamp(m_cloudSettings.primarySteps, 1u, 128u)),
+        static_cast<float>(std::clamp(m_cloudSettings.lightSteps, 1u, 8u)),
+        static_cast<float>(m_cloudFrameCounter),
+        0.0f};
+
+    m_cloudUniformBuffers[frameIndex]->Write(&m_cloudUniform, sizeof(CloudUniform));
+    ++m_cloudFrameCounter;
+}
+
+void DeferredRenderer::RecordCloudPasses(rhi::CommandList& commandList, std::uint32_t frameIndex)
+{
+    if (!IsCloudActive() || frameIndex >= m_cloudSets.size() ||
+        frameIndex >= m_cloudReprojectSets.size() || frameIndex >= m_cloudGodRaySets.size() ||
+        frameIndex >= m_cloudHistory.size() || frameIndex >= m_cloudHistoryParity.size() ||
+        m_cloudCurrent[frameIndex] == nullptr || m_cloudUpsampleSets[frameIndex] == nullptr ||
+        m_cloudGodRays[frameIndex] == nullptr)
+    {
+        return;
+    }
+
+    rhi::DescriptorSet& set = *m_cloudSets[frameIndex];
+    set.BindBuffer(0, *m_cloudUniformBuffers[frameIndex]);
+    set.BindTexture(1, m_gbuffer.GetDepth(), 0u);
+    set.BindTexture(2, *m_cloudBaseNoise, 0u);
+    set.BindTexture(3, *m_cloudDetailNoise, 0u);
+    set.BindTexture(4, *m_cloudCurlNoise, 0u);
+    set.BindTexture(5, *m_cloudWeatherMap, 0u);
+    set.BindStorageImage(6, *m_cloudCurrent[frameIndex]);
+    set.BindStorageImage(7, *m_cloudMask[frameIndex]);
+    set.BindStorageImage(8, *m_cloudDistance[frameIndex]);
+    set.BindSampler(9, *m_cloudSampler);
+
+    commandList.BeginGpuZone("CloudMarch");
+    commandList.BindPipeline(*m_cloudPipeline);
+    commandList.BindDescriptorSet(0, set);
+    commandList.Dispatch((m_cloudWidth + 7) / 8, (m_cloudHeight + 7) / 8, 1);
+    commandList.ShaderMemoryBarrier(rhi::ShaderStageMask::Compute, rhi::ShaderStageMask::Compute);
+
+    const std::uint32_t parity = m_cloudHistoryParity[frameIndex];
+    const std::uint32_t nextParity = parity ^ 1u;
+
+    // Temporal reprojection: read the history for this slot, write the other parity.
+    rhi::DescriptorSet& reproject = *m_cloudReprojectSets[frameIndex];
+    reproject.BindBuffer(0, *m_cloudUniformBuffers[frameIndex]);
+    reproject.BindTexture(1, *m_cloudCurrent[frameIndex], 0u);
+    reproject.BindTexture(2, *m_cloudDistance[frameIndex], 0u);
+    reproject.BindTexture(3, *m_cloudMask[frameIndex], 0u);
+    reproject.BindTexture(4, *m_cloudHistory[frameIndex][parity], 0u);
+    reproject.BindTexture(5, *m_cloudHistoryDistance[frameIndex][parity], 0u);
+    reproject.BindTexture(6, *m_cloudHistoryMask[frameIndex][parity], 0u);
+    reproject.BindStorageImage(7, *m_cloudHistory[frameIndex][nextParity]);
+    reproject.BindStorageImage(8, *m_cloudHistoryDistance[frameIndex][nextParity]);
+    reproject.BindStorageImage(9, *m_cloudHistoryMask[frameIndex][nextParity]);
+
+    commandList.BindPipeline(*m_cloudReprojectPipeline);
+    commandList.BindDescriptorSet(0, reproject);
+    commandList.Dispatch((m_cloudWidth + 7) / 8, (m_cloudHeight + 7) / 8, 1);
+    commandList.ShaderMemoryBarrier(rhi::ShaderStageMask::Compute, rhi::ShaderStageMask::Compute);
+
+    // God rays: radial blur of the (temporally resolved) sun occlusion mask.
+    rhi::DescriptorSet& godRay = *m_cloudGodRaySets[frameIndex];
+    godRay.BindBuffer(0, *m_cloudUniformBuffers[frameIndex]);
+    godRay.BindTexture(1, *m_cloudMask[frameIndex], 0u);
+    godRay.BindTexture(2, *m_cloudHistoryMask[frameIndex][nextParity], 0u);
+    godRay.BindStorageImage(3, *m_cloudGodRays[frameIndex]);
+
+    commandList.BindPipeline(*m_cloudGodRayPipeline);
+    commandList.BindDescriptorSet(0, godRay);
+    commandList.Dispatch((m_cloudWidth + 7) / 8, (m_cloudHeight + 7) / 8, 1);
+    commandList.ShaderMemoryBarrier(rhi::ShaderStageMask::Compute, rhi::ShaderStageMask::Compute);
+
+    rhi::DescriptorSet& upsample = *m_cloudUpsampleSets[frameIndex];
+    upsample.BindBuffer(0, *m_cloudUniformBuffers[frameIndex]);
+    upsample.BindTexture(1, *m_cloudHistory[frameIndex][nextParity], 0u);
+    upsample.BindTexture(2, *m_cloudHistoryDistance[frameIndex][nextParity], 0u);
+    upsample.BindTexture(3, m_gbuffer.GetDepth(), 0u);
+    upsample.BindStorageImage(4, *m_cloudFull[frameIndex]);
+
+    commandList.BindPipeline(*m_cloudUpsamplePipeline);
+    commandList.BindDescriptorSet(0, upsample);
+    commandList.Dispatch(
+        (m_gbuffer.GetWidth() + 7) / 8,
+        (m_gbuffer.GetHeight() + 7) / 8,
+        1);
+    commandList.ShaderMemoryBarrier(rhi::ShaderStageMask::Compute, rhi::ShaderStageMask::Fragment);
+    commandList.EndGpuZone();
+
+    m_cloudHistoryParity[frameIndex] = nextParity;
+    m_cloudHistoryValid[frameIndex] = true;
+}
+
 void DeferredRenderer::UpdateGiUniform(std::uint32_t frameIndex, const FrameView& view)
 {
     if (m_gi.size() <= frameIndex)
@@ -2217,6 +2696,7 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
 
     RecordGiPasses(commandList, frameIndex);
     RecordReflectionPasses(commandList, frameIndex);
+    RecordCloudPasses(commandList, frameIndex);
 
     commandList.BeginGpuZone("Lighting");
     commandList.BeginSwapchainRendering(
@@ -2694,6 +3174,18 @@ bool DeferredRenderer::LoadShaders(rhi::Device& device, const std::filesystem::p
     m_debugLineFragmentShader = device.CreateShader(
         rhi::ShaderStage::Fragment,
         shaderDirectory / "debug_line.frag.spv");
+    m_cloudShader = device.CreateShader(
+        rhi::ShaderStage::Compute,
+        shaderDirectory / "clouds.comp.spv");
+    m_cloudUpsampleShader = device.CreateShader(
+        rhi::ShaderStage::Compute,
+        shaderDirectory / "cloud_upsample.comp.spv");
+    m_cloudReprojectShader = device.CreateShader(
+        rhi::ShaderStage::Compute,
+        shaderDirectory / "cloud_reproject.comp.spv");
+    m_cloudGodRayShader = device.CreateShader(
+        rhi::ShaderStage::Compute,
+        shaderDirectory / "cloud_godrays.comp.spv");
 
     if (m_gbufferVertexShader == nullptr || m_gbufferFragmentShader == nullptr ||
         m_transparentFragmentShader == nullptr ||
@@ -2704,7 +3196,9 @@ bool DeferredRenderer::LoadShaders(rhi::Device& device, const std::filesystem::p
         m_giUpsampleShader == nullptr || m_rtShadowShader == nullptr ||
         m_giProbeShader == nullptr || m_rtReflectionShader == nullptr ||
         m_reflectionTemporalShader == nullptr || m_reflectionUpsampleShader == nullptr ||
-        m_debugLineVertexShader == nullptr || m_debugLineFragmentShader == nullptr)
+        m_debugLineVertexShader == nullptr || m_debugLineFragmentShader == nullptr ||
+        m_cloudShader == nullptr || m_cloudUpsampleShader == nullptr ||
+        m_cloudReprojectShader == nullptr || m_cloudGodRayShader == nullptr)
     {
         MRE_CRITICAL("Failed to load the deferred shaders from '{}'", PathToUtf8(shaderDirectory));
         return false;
@@ -2847,6 +3341,33 @@ bool DeferredRenderer::CreatePipelines(rhi::Device& device)
             createGiPipeline(*m_reflectionUpsampleShader, *m_reflectionUpsampleSetLayout, 0);
     }
 
+    if (m_cloudSetLayout != nullptr)
+    {
+        rhi::PipelineDesc cloudDesc{};
+        cloudDesc.computeShader = m_cloudShader.get();
+        cloudDesc.descriptorSetLayouts = {m_cloudSetLayout.get()};
+        cloudDesc.pushConstantStages = rhi::ShaderStageMask::Compute;
+        m_cloudPipeline = device.CreatePipeline(cloudDesc);
+
+        rhi::PipelineDesc cloudUpsampleDesc{};
+        cloudUpsampleDesc.computeShader = m_cloudUpsampleShader.get();
+        cloudUpsampleDesc.descriptorSetLayouts = {m_cloudUpsampleSetLayout.get()};
+        cloudUpsampleDesc.pushConstantStages = rhi::ShaderStageMask::Compute;
+        m_cloudUpsamplePipeline = device.CreatePipeline(cloudUpsampleDesc);
+
+        rhi::PipelineDesc cloudReprojectDesc{};
+        cloudReprojectDesc.computeShader = m_cloudReprojectShader.get();
+        cloudReprojectDesc.descriptorSetLayouts = {m_cloudReprojectSetLayout.get()};
+        cloudReprojectDesc.pushConstantStages = rhi::ShaderStageMask::Compute;
+        m_cloudReprojectPipeline = device.CreatePipeline(cloudReprojectDesc);
+
+        rhi::PipelineDesc cloudGodRayDesc{};
+        cloudGodRayDesc.computeShader = m_cloudGodRayShader.get();
+        cloudGodRayDesc.descriptorSetLayouts = {m_cloudGodRaySetLayout.get()};
+        cloudGodRayDesc.pushConstantStages = rhi::ShaderStageMask::Compute;
+        m_cloudGodRayPipeline = device.CreatePipeline(cloudGodRayDesc);
+    }
+
     const std::array<const rhi::Shader*, 2> debugLineStages{
         m_debugLineVertexShader.get(),
         m_debugLineFragmentShader.get()};
@@ -2864,7 +3385,9 @@ bool DeferredRenderer::CreatePipelines(rhi::Device& device)
     m_debugLinePipeline = device.CreatePipeline(debugLinePipelineDesc);
 
     return m_gbufferPipeline != nullptr && m_transparentPipeline != nullptr &&
-           m_lightingPipeline != nullptr &&
+           m_lightingPipeline != nullptr && m_cloudPipeline != nullptr &&
+           m_cloudUpsamplePipeline != nullptr && m_cloudReprojectPipeline != nullptr &&
+           m_cloudGodRayPipeline != nullptr &&
            m_clusterCullingPipeline != nullptr && m_shadowPipeline != nullptr &&
            m_giTracePipeline != nullptr && m_giTemporalPipeline != nullptr &&
            m_giAtrousPipeline != nullptr && m_giUpsamplePipeline != nullptr &&
@@ -2981,6 +3504,21 @@ void DeferredRenderer::CreateLightingSets(rhi::Device& device)
         lightingSet->BindTexture(20, m_gbuffer.GetMotion(), 0u);
         lightingSet->BindTexture(21, *m_brdfLut, 0u);
         lightingSet->BindSampler(22, *m_brdfLutSampler);
+        // Clouds: the sky branch samples the full-res scattering/transmittance texture.
+        const bool cloudReady = IsCloudActive() && frame < m_cloudFull.size() &&
+                                m_cloudFull[frame] != nullptr && m_cloudEmpty != nullptr &&
+                                m_cloudSampler != nullptr;
+        lightingSet->BindTexture(
+            23,
+            cloudReady ? *m_cloudFull[frame] : *m_cloudEmpty,
+            0u);
+        lightingSet->BindSampler(24, *m_cloudSampler);
+        const bool godRayReady = cloudReady && frame < m_cloudGodRays.size() &&
+                                 m_cloudGodRays[frame] != nullptr;
+        lightingSet->BindTexture(
+            25,
+            godRayReady ? *m_cloudGodRays[frame] : *m_cloudEmpty,
+            0u);
         m_lightingSets.push_back(std::move(lightingSet));
     }
 }
@@ -3327,6 +3865,7 @@ void DeferredRenderer::UpdateUniforms(std::uint32_t frameIndex, const FrameView&
 
     UpdateShadowUniforms(frameIndex, view);
     UpdateGiUniform(frameIndex, view);
+    UpdateCloudUniform(frameIndex, view);
     UpdateRtShadowUniform(frameIndex);
 }
 

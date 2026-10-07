@@ -205,6 +205,8 @@ struct TextureDesc
     const void* initialData = nullptr;
     std::uint64_t initialDataSize = 0;
     std::uint32_t arrayLayers = 1;
+    // depth > 1 creates a 3D texture (arrayLayers must stay 1).
+    std::uint32_t depth = 1;
 };
 
 class Texture
@@ -220,6 +222,8 @@ public:
     [[nodiscard]] virtual Format GetFormat() const = 0;
     [[nodiscard]] virtual TextureUsage GetUsage() const = 0;
     [[nodiscard]] virtual std::uint32_t GetArrayLayers() const = 0;
+    // 1 for 2D textures, the slice count for 3D textures.
+    [[nodiscard]] virtual std::uint32_t GetDepth() const = 0;
     [[nodiscard]] virtual std::uint32_t GetBindlessIndex() const = 0;
 
 protected:

@@ -3,6 +3,7 @@ find_package(GTest CONFIG REQUIRED)
 add_executable(mukki_tests
     test_async_gltf_loader.cpp
     test_camera.cpp
+    test_cloud_noise.cpp
     test_cluster_grid.cpp
     test_engine.cpp
     test_environment.cpp

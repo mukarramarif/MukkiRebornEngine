@@ -109,6 +109,7 @@ add_library(mukki_engine STATIC
     Core/JobSystem.cpp
     Core/Time.cpp
     Renderer/BufferManager.cpp
+    Renderer/Clouds/CloudNoise.cpp
     Renderer/Debug/DebugLines.cpp
     Renderer/Deferred/DeferredRenderer.cpp
     Renderer/Deferred/GBuffer.cpp
@@ -213,6 +214,10 @@ if(MRE_BUILD_SANDBOX)
         Renderer/Shaders/reflection_temporal.comp.slang
         Renderer/Shaders/reflection_upsample.comp.slang
         Renderer/Shaders/rt_shadows.comp.slang
+        Renderer/Shaders/clouds.comp.slang
+        Renderer/Shaders/cloud_reproject.comp.slang
+        Renderer/Shaders/cloud_godrays.comp.slang
+        Renderer/Shaders/cloud_upsample.comp.slang
         Renderer/Shaders/debug_line.vert.slang
         Renderer/Shaders/debug_line.frag.slang
     )

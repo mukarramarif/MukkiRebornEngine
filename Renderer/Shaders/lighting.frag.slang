@@ -88,6 +88,9 @@ struct GpuObjectData
 [[vk::binding(20, 0)]] Texture2D gMotion; // xy: motion, zw: object UV
 [[vk::binding(21, 0)]] Texture2D gBrdfLut; // r: scale, g: bias (split-sum)
 [[vk::binding(22, 0)]] SamplerState gBrdfLutSampler;
+[[vk::binding(23, 0)]] Texture2D gClouds; // rgb: scattering, a: transmittance
+[[vk::binding(24, 0)]] SamplerState gCloudSampler;
+[[vk::binding(25, 0)]] Texture2D gGodRays; // rgb: sun-tinted god rays
 
 [[vk::binding(0, 1)]] Texture2D gTextures[];
 [[vk::binding(1, 1)]] SamplerState gSamplers[16];
@@ -345,28 +348,32 @@ float4 fragmentMain(VertexOutput input) : SV_Target
 
     if (worldPosition.w < 0.5)
     {
+        float3 sky = gScene.ambientColor.rgb;
         if (gScene.skyParams.x > 0.5)
         {
             const float2 ndc = input.uv * 2.0 - 1.0;
             const float4 clip = mul(gScene.inverseViewProjection, float4(ndc, 1.0, 1.0));
             const float3 direction =
                 normalize(clip.xyz / max(clip.w, 1e-6) - gScene.cameraPosition.xyz);
-            return float4(
-                acesTonemap(EnvironmentBackground(
-                    direction,
-                    gScene.skyZenith.rgb,
-                    gScene.skyHorizon.rgb,
-                    gScene.skyGround.rgb,
-                    gScene.skyParams.y,
-                    gScene.sunDirection.xyz,
-                    gScene.sunColor.rgb,
-                    gScene.skyParams.z,
-                    uint(gScene.skyMap.x + 0.5),
-                    uint(gScene.skyMap.y + 0.5),
-                    gScene.skyMap.z > 0.5)),
-                1.0);
+            sky = EnvironmentBackground(
+                direction,
+                gScene.skyZenith.rgb,
+                gScene.skyHorizon.rgb,
+                gScene.skyGround.rgb,
+                gScene.skyParams.y,
+                gScene.sunDirection.xyz,
+                gScene.sunColor.rgb,
+                gScene.skyParams.z,
+                uint(gScene.skyMap.x + 0.5),
+                uint(gScene.skyMap.y + 0.5),
+                gScene.skyMap.z > 0.5);
         }
-        return float4(acesTonemap(gScene.ambientColor.rgb), 1.0);
+
+        // Nubis-style clouds composite over the sky: coverage attenuates the background and adds
+        // the in-scattered light.
+        const float4 clouds = gClouds.Sample(gCloudSampler, input.uv);
+        sky = sky * clouds.a + clouds.rgb + gGodRays.Sample(gCloudSampler, input.uv).rgb;
+        return float4(acesTonemap(sky), 1.0);
     }
 
     const float3 albedo = albedoMetalness.rgb;

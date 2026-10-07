@@ -165,6 +165,19 @@ flowchart TB
     AS --> RTRACE
     RTSHADOW --> RTRACE
 
+    subgraph CLOUDS ["Volumetric clouds (Nubis, half res)"]
+        direction TB
+        CMARCH["clouds.comp<br/>density model + sun light march"]
+        CTEMP["cloud_reproject.comp<br/>temporal history"]
+        CUP["cloud_upsample.comp<br/>depth/distance aware"]
+        CGOD["cloud_godrays.comp<br/>radial mask blur"]
+        CMARCH --> CTEMP --> CUP
+        CTEMP --> CGOD
+    end
+    GBUFFER --> CMARCH
+    CUP --> LIGHTING
+    CGOD --> LIGHTING
+
     LIGHTING["lighting.frag (fullscreen)<br/>clustered Cook-Torrance + sheen<br/>+ indirect GI / probes + reflections<br/>ACES tonemap"]
     LISTS --> LIGHTING
     UPSAMPLE --> LIGHTING
@@ -343,6 +356,17 @@ clustered lights:
   Cook-Torrance BRDF (`GI light count` caps them at `kMaxGiLights`) and one ray traced shadow ray
   per light, so lamps bleed their color into indirect lighting, probes and reflections consistently
   with the analytic lighting pass.
+- **Volumetric clouds (Nubis)**: a Decima-style ray marched cloud layer fills the sky with
+  stratus/cumulus/cumulonimbus/cirrus types. The Perlin-Worley 3D noise, detail and curl textures
+  plus a procedural weather map are generated in-engine on the JobSystem at startup (no authored
+  assets; ~4 s Debug, <1 s Release). The half-resolution trace (0.25x-1x) reads the G-buffer
+  depth, applies curl distortion and height gradients per cloud type, light-marches toward the sun
+  (cone sampling, dual-lobe HG, double Beer-Lambert and powder), temporally reprojects per frame
+  and upsamples depth/distance-aware;
+  god rays radially blur the sun-occlusion mask. Clouds composite over the sky in the lighting
+  pass only (no cloud shadows on geometry yet). Controls: `Clouds`, `Coverage`, `Cloud type`,
+  `Density`, `Detail erosion`, `Coverage variation`, layer/altitude, `Wind speed`/`direction`,
+  `Curl strength`, `Primary/Light steps`, `Cloud trace scale`, `Cloud temporal blend`, `God rays`.
 - **Emissive materials**: glTF `emissiveFactor` (scaled by `KHR_materials_emissive_strength`) and
   `emissiveTexture` are lit into the HDR image before tonemapping, in the transparent forward pass,
   and in ray traced hits (so emissive surfaces glow in GI and reflections).
@@ -373,7 +397,9 @@ The `Scene` window exposes the GI controls: `Ray traced GI`, `Trace scale`, `GI 
 `Max ray distance`, `Bounce feedback`, `Specular min roughness`, the temporal/edge-stop
 parameters, `A-trous iterations`, `Sun shadow ray` and the punctual-light controls
 (`Point/spot lights in GI`, `GI light count`, `GI light shadows`, `GI light shadow bias`). Devices
-without ray tracing report `(ray tracing unavailable)` and render the clustered lights only.
+without ray tracing report `(ray tracing unavailable)` and render the clustered lights only. The
+`Volumetric clouds (Nubis)` section hosts the coverage/type/density, layer, wind/curl, step count,
+trace scale, temporal blend and god-ray controls.
 
 In the sandbox, the `Scenes` window browses and loads the JSON scenes found in `Sandbox/Scenes`
 (with a global transform scale). The `Scene` window lists the loaded objects and lights:

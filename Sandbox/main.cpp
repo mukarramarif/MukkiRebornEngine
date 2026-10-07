@@ -797,6 +797,7 @@ private:
 
         DrawShadowSettings();
         DrawEnvironmentSettings();
+        DrawCloudSettings();
         DrawGiSettings();
         DrawReflectionSettings();
 
@@ -979,6 +980,50 @@ private:
         if (changed)
         {
             m_renderer->SetEnvironmentSettings(settings);
+        }
+    }
+
+    void DrawCloudSettings()
+    {
+        ImGui::SeparatorText("Volumetric clouds (Nubis)");
+
+        mukki::CloudSettings settings = m_renderer->GetCloudSettings();
+        bool changed = ImGui::Checkbox("Clouds", &settings.enabled);
+        ImGui::SetItemTooltip(
+            "Ray marched volumetric clouds over the sky (inflight generated noise + weather).");
+
+        changed |= ImGui::SliderFloat("Coverage", &settings.coverage, 0.0f, 1.0f, "%.2f");
+        changed |= ImGui::SliderFloat("Cloud type", &settings.cloudType, 0.0f, 1.0f, "%.2f");
+        ImGui::SetItemTooltip("0 stratus, 0.33 cumulus, 0.66 cumulonimbus, 1 cirrus");
+        changed |= ImGui::SliderFloat("Density", &settings.density, 0.002f, 0.08f, "%.3f");
+        changed |= ImGui::SliderFloat("Detail erosion", &settings.detailStrength, 0.0f, 1.0f, "%.2f");
+        changed |= ImGui::SliderFloat("Coverage variation", &settings.coverageVariation, 0.0f, 1.0f, "%.2f");
+        changed |= ImGui::SliderFloat("Layer bottom (km)", &settings.layerBottomKm, 0.5f, 4.0f, "%.2f");
+        changed |= ImGui::SliderFloat("Layer top (km)", &settings.layerTopKm, 1.0f, 8.0f, "%.2f");
+        changed |= ImGui::SliderFloat("Altitude variation (km)", &settings.altitudeVariationKm, 0.0f, 2.0f, "%.2f");
+        changed |= ImGui::SliderFloat("Wind speed (m/s)", &settings.windSpeed, 0.0f, 80.0f, "%.0f");
+        changed |= ImGui::SliderAngle("Wind direction", &settings.windDirectionRadians);
+        changed |= ImGui::SliderFloat("Curl strength", &settings.curlStrength, 0.0f, 3.0f, "%.2f");
+
+        int steps = static_cast<int>(settings.primarySteps);
+        if (ImGui::SliderInt("Primary steps", &steps, 16, 128))
+        {
+            settings.primarySteps = static_cast<std::uint32_t>(steps);
+            changed = true;
+        }
+        int lightSteps = static_cast<int>(settings.lightSteps);
+        if (ImGui::SliderInt("Light steps", &lightSteps, 1, 8))
+        {
+            settings.lightSteps = static_cast<std::uint32_t>(lightSteps);
+            changed = true;
+        }
+        changed |= ImGui::SliderFloat("Cloud trace scale", &settings.resolutionScale, 0.25f, 1.0f, "%.2f");
+        changed |= ImGui::SliderFloat("Cloud temporal blend", &settings.temporalBlend, 0.0f, 0.98f, "%.2f");
+        changed |= ImGui::SliderFloat("God rays", &settings.godRayIntensity, 0.0f, 3.0f, "%.2f");
+
+        if (changed)
+        {
+            m_renderer->SetCloudSettings(settings);
         }
     }
 

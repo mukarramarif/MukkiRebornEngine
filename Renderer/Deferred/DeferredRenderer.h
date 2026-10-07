@@ -20,6 +20,7 @@
 #include "Renderer/Debug/DebugLines.h"
 #include "Renderer/Deferred/GBuffer.h"
 #include "Renderer/FrameView.h"
+#include "Renderer/Clouds/CloudSettings.h"
 #include "Renderer/GlobalIllumination/GiTypes.h"
 #include "Renderer/Lighting/ClusterGrid.h"
 #include "Renderer/Lighting/Environment.h"
@@ -171,6 +172,11 @@ public:
     {
         return m_environmentSettings;
     }
+
+    // Nubis-style volumetric clouds rendered over the sky.
+    void SetCloudSettings(const CloudSettings& settings);
+    [[nodiscard]] const CloudSettings& GetCloudSettings() const { return m_cloudSettings; }
+    [[nodiscard]] bool IsCloudActive() const;
 
     bool LoadModel(const std::filesystem::path& path);
     void RequestModelLoad(const std::filesystem::path& path);
@@ -403,6 +409,10 @@ private:
     void UpdateGiUniform(std::uint32_t frameIndex, const FrameView& view);
     void BindGiDescriptors(std::uint32_t frameIndex);
     void ReloadEnvironmentMap();
+    bool CreateCloudResources(rhi::Device& device);
+    void GenerateCloudNoiseTextures();
+    void UpdateCloudUniform(std::uint32_t frameIndex, const FrameView& view);
+    void RecordCloudPasses(rhi::CommandList& commandList, std::uint32_t frameIndex);
     void RecordGiPasses(rhi::CommandList& commandList, std::uint32_t frameIndex);
     bool CreateRtShadowResources(rhi::Device& device);
     void UpdateRtShadowUniform(std::uint32_t frameIndex);
@@ -514,6 +524,45 @@ private:
     bool m_environmentMapBound = false;
     std::unique_ptr<rhi::Texture> m_brdfLut{};
     std::unique_ptr<rhi::Sampler> m_brdfLutSampler{};
+    CloudSettings m_cloudSettings{};
+    CloudUniform m_cloudUniform{};
+    std::unique_ptr<rhi::Shader> m_cloudShader{};
+    std::unique_ptr<rhi::Shader> m_cloudUpsampleShader{};
+    std::unique_ptr<rhi::Shader> m_cloudReprojectShader{};
+    std::unique_ptr<rhi::Shader> m_cloudGodRayShader{};
+    std::unique_ptr<rhi::DescriptorSetLayout> m_cloudSetLayout{};
+    std::unique_ptr<rhi::DescriptorSetLayout> m_cloudUpsampleSetLayout{};
+    std::unique_ptr<rhi::DescriptorSetLayout> m_cloudReprojectSetLayout{};
+    std::unique_ptr<rhi::DescriptorSetLayout> m_cloudGodRaySetLayout{};
+    std::unique_ptr<rhi::Pipeline> m_cloudPipeline{};
+    std::unique_ptr<rhi::Pipeline> m_cloudUpsamplePipeline{};
+    std::unique_ptr<rhi::Pipeline> m_cloudReprojectPipeline{};
+    std::unique_ptr<rhi::Pipeline> m_cloudGodRayPipeline{};
+    std::unique_ptr<rhi::Texture> m_cloudBaseNoise{};
+    std::unique_ptr<rhi::Texture> m_cloudDetailNoise{};
+    std::unique_ptr<rhi::Texture> m_cloudCurlNoise{};
+    std::unique_ptr<rhi::Texture> m_cloudWeatherMap{};
+    std::unique_ptr<rhi::Sampler> m_cloudSampler{};
+    std::unique_ptr<rhi::Texture> m_cloudEmpty{};
+    std::vector<std::unique_ptr<rhi::Buffer>> m_cloudUniformBuffers{};
+    std::vector<std::unique_ptr<rhi::DescriptorSet>> m_cloudSets{};
+    std::vector<std::unique_ptr<rhi::DescriptorSet>> m_cloudUpsampleSets{};
+    std::vector<std::unique_ptr<rhi::DescriptorSet>> m_cloudReprojectSets{};
+    std::vector<std::unique_ptr<rhi::DescriptorSet>> m_cloudGodRaySets{};
+    std::vector<std::unique_ptr<rhi::Texture>> m_cloudCurrent{};
+    std::vector<std::unique_ptr<rhi::Texture>> m_cloudDistance{};
+    std::vector<std::unique_ptr<rhi::Texture>> m_cloudMask{};
+    std::vector<std::unique_ptr<rhi::Texture>> m_cloudFull{};
+    std::vector<std::array<std::unique_ptr<rhi::Texture>, 2>> m_cloudHistory{};
+    std::vector<std::array<std::unique_ptr<rhi::Texture>, 2>> m_cloudHistoryDistance{};
+    std::vector<std::array<std::unique_ptr<rhi::Texture>, 2>> m_cloudHistoryMask{};
+    std::vector<std::unique_ptr<rhi::Texture>> m_cloudGodRays{};
+    std::vector<std::uint32_t> m_cloudHistoryParity{};
+    std::vector<bool> m_cloudHistoryValid{};
+    std::uint32_t m_cloudWidth = 0;
+    std::uint32_t m_cloudHeight = 0;
+    std::uint32_t m_cloudFrameCounter = 0;
+    bool m_cloudNoiseReady = false;
     std::uint32_t m_giFrameCounter = 0;
     std::unique_ptr<rhi::Texture> m_blackTexture{};
     std::unique_ptr<rhi::DescriptorSetLayout> m_reflectionTraceSetLayout{};
