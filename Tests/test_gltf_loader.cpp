@@ -16,6 +16,64 @@ std::filesystem::path SampleModelsRoot()
     return std::filesystem::path{MRE_SOURCE_DIR} / "ThirdParty/glTF-Sample-Models/2.0";
 }
 
+std::filesystem::path AssetLibraryRoot()
+{
+    return std::filesystem::path{MRE_SOURCE_DIR} / "AssetLibrary";
+}
+
+TEST(GltfLoader, LoadsFlightDemoAirplane)
+{
+    const std::filesystem::path modelPath =
+        AssetLibraryRoot() / "aviation_aircraft_airplane_model/scene.gltf";
+    if (!std::filesystem::exists(modelPath))
+    {
+        GTEST_SKIP() << "flight demo airplane asset is not present";
+    }
+
+    mukki::GltfModel model{};
+    ASSERT_TRUE(mukki::LoadGltfModel(modelPath, model));
+
+    EXPECT_GT(model.vertexCount, 10000u);
+    EXPECT_GT(model.triangleCount, 10000u);
+    ASSERT_FALSE(model.materials.empty());
+
+    // The cockpit glass is an alphaMode = BLEND material, so it goes through the transparent pass.
+    const bool hasBlendGlass = std::any_of(
+        model.materials.begin(),
+        model.materials.end(),
+        [](const mukki::GltfMaterial& material) {
+            return material.alphaBlend && material.baseColorFactor.a < 1.0f;
+        });
+    EXPECT_TRUE(hasBlendGlass);
+
+    // The model must be usable from the flight corridor: forward -Z, up +Y.
+    const glm::vec3 size = model.maxBounds - model.minBounds;
+    EXPECT_GT(size.x, size.z);
+}
+
+TEST(GltfLoader, LoadsFlightDemoSkyscraper)
+{
+    const std::filesystem::path modelPath =
+        AssetLibraryRoot() / "skyscraper_with_interior_with_animation_video/scene.gltf";
+    if (!std::filesystem::exists(modelPath))
+    {
+        GTEST_SKIP() << "flight demo skyscraper asset is not present";
+    }
+
+    mukki::GltfModel model{};
+    ASSERT_TRUE(mukki::LoadGltfModel(modelPath, model));
+
+    EXPECT_GT(model.vertexCount, 100000u);
+    EXPECT_GT(model.triangleCount, 100000u);
+    EXPECT_GE(model.materials.size(), 6u);
+    EXPECT_FALSE(model.primitives.empty());
+
+    // The tower is much taller than it is wide.
+    const glm::vec3 size = model.maxBounds - model.minBounds;
+    EXPECT_GT(size.y, size.x * 2.0f);
+    EXPECT_GT(size.y, size.z * 2.0f);
+}
+
 TEST(GltfLoader, LoadsDamagedHelmet)
 {
     const std::filesystem::path modelPath = SampleModelsRoot() / "DamagedHelmet/glTF/DamagedHelmet.gltf";

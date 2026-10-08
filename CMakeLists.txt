@@ -21,6 +21,7 @@ option(MRE_BUILD_TESTS "Build the unit tests" ON)
 option(MRE_ENABLE_TRACY "Enable Tracy profiler instrumentation" OFF)
 
 find_package(Vulkan REQUIRED)
+find_package(box3d CONFIG REQUIRED)
 find_package(glfw3 CONFIG REQUIRED)
 find_package(glm CONFIG REQUIRED)
 find_package(VulkanMemoryAllocator CONFIG REQUIRED)
@@ -100,6 +101,7 @@ add_library(mukki_engine STATIC
     Application/Camera.cpp
     Application/Input.cpp
     Application/Keybinds.cpp
+    Application/PlaneController.cpp
     Application/UI/UiStyles.cpp
     Application/Window.cpp
     Assets/AsyncGltfLoader.cpp
@@ -108,6 +110,7 @@ add_library(mukki_engine STATIC
     Core/Engine.cpp
     Core/JobSystem.cpp
     Core/Time.cpp
+    Physics/PhysicsWorld.cpp
     Renderer/BufferManager.cpp
     Renderer/Clouds/CloudNoise.cpp
     Renderer/Debug/DebugLines.cpp
@@ -160,7 +163,7 @@ target_compile_definitions(mukki_engine PRIVATE
     VMA_STATIC_VULKAN_FUNCTIONS=1
     VMA_DYNAMIC_VULKAN_FUNCTIONS=0
 )
-target_link_libraries(mukki_engine PRIVATE nlohmann_json::nlohmann_json unofficial::spirv-reflect)
+target_link_libraries(mukki_engine PRIVATE nlohmann_json::nlohmann_json unofficial::spirv-reflect box3d::box3d)
 target_link_libraries(mukki_engine
     PUBLIC
         Vulkan::Vulkan

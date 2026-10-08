@@ -22,12 +22,38 @@ mukki::SceneDescription MakeScene()
     box.position = glm::vec3{1.0f, 2.0f, 3.0f};
     box.rotation = glm::vec3{10.0f, 20.0f, 30.0f};
     box.scale = glm::vec3{2.0f, 2.0f, 2.0f};
+    box.physics.body = mukki::ScenePhysicsBody::Dynamic;
+    box.physics.shape = mukki::ScenePhysicsShape::Capsule;
+    box.physics.halfExtents = glm::vec3{0.4f, 0.8f, 0.4f};
+    box.physics.radius = 0.4f;
+    box.physics.height = 1.6f;
+    box.physics.offset = glm::vec3{0.0f, 0.8f, 0.0f};
+    box.physics.density = 450.0f;
+    box.physics.friction = 0.7f;
+    box.physics.restitution = 0.2f;
     scene.objects.push_back(box);
 
     mukki::SceneObject duck{};
     duck.name = "Duck";
     duck.modelPath = "Duck.gltf";
+    duck.physics.body = mukki::ScenePhysicsBody::Static;
     scene.objects.push_back(duck);
+
+    scene.physics.gravity = glm::vec3{0.0f, -3.7f, 0.0f};
+    scene.physics.stepHz = 90.0f;
+    scene.physics.subSteps = 2;
+
+    scene.hasEnvironment = true;
+    scene.environment.map = std::filesystem::path{"env/sunrise.hdr"};
+    scene.environment.intensity = 0.8f;
+    scene.hasClouds = true;
+    scene.clouds.coverage = 0.62f;
+    scene.clouds.cloudType = 0.4f;
+    scene.clouds.layerBottomKm = 0.9f;
+    scene.clouds.layerTopKm = 2.8f;
+    scene.clouds.windSpeed = 25.0f;
+    scene.clouds.temporalBlend = 0.85f;
+    scene.playerPlane = "Box";
 
     mukki::SceneProbe probe{};
     probe.name = "Probe";
@@ -78,6 +104,31 @@ TEST(SceneBinary, RoundTrips)
     EXPECT_FLOAT_EQ(decoded.objects[0].position.y, scene.objects[0].position.y);
     EXPECT_FLOAT_EQ(decoded.objects[0].rotation.z, scene.objects[0].rotation.z);
     EXPECT_FLOAT_EQ(decoded.objects[0].scale.x, scene.objects[0].scale.x);
+    EXPECT_EQ(decoded.objects[0].physics.body, mukki::ScenePhysicsBody::Dynamic);
+    EXPECT_EQ(decoded.objects[0].physics.shape, mukki::ScenePhysicsShape::Capsule);
+    EXPECT_FLOAT_EQ(decoded.objects[0].physics.radius, scene.objects[0].physics.radius);
+    EXPECT_FLOAT_EQ(decoded.objects[0].physics.height, scene.objects[0].physics.height);
+    EXPECT_FLOAT_EQ(decoded.objects[0].physics.offset.y, scene.objects[0].physics.offset.y);
+    EXPECT_FLOAT_EQ(decoded.objects[0].physics.density, scene.objects[0].physics.density);
+    EXPECT_FLOAT_EQ(decoded.objects[0].physics.friction, scene.objects[0].physics.friction);
+    EXPECT_FLOAT_EQ(decoded.objects[0].physics.restitution, scene.objects[0].physics.restitution);
+    EXPECT_EQ(decoded.objects[1].physics.body, mukki::ScenePhysicsBody::Static);
+    EXPECT_FLOAT_EQ(decoded.physics.gravity.y, scene.physics.gravity.y);
+    EXPECT_FLOAT_EQ(decoded.physics.stepHz, scene.physics.stepHz);
+    EXPECT_EQ(decoded.physics.subSteps, scene.physics.subSteps);
+
+    EXPECT_TRUE(decoded.hasEnvironment);
+    EXPECT_EQ(decoded.environment.map, scene.environment.map);
+    EXPECT_FLOAT_EQ(decoded.environment.intensity, scene.environment.intensity);
+    EXPECT_TRUE(decoded.hasClouds);
+    EXPECT_TRUE(decoded.clouds.enabled);
+    EXPECT_FLOAT_EQ(decoded.clouds.coverage, scene.clouds.coverage);
+    EXPECT_FLOAT_EQ(decoded.clouds.cloudType, scene.clouds.cloudType);
+    EXPECT_FLOAT_EQ(decoded.clouds.layerBottomKm, scene.clouds.layerBottomKm);
+    EXPECT_FLOAT_EQ(decoded.clouds.layerTopKm, scene.clouds.layerTopKm);
+    EXPECT_FLOAT_EQ(decoded.clouds.windSpeed, scene.clouds.windSpeed);
+    EXPECT_FLOAT_EQ(decoded.clouds.temporalBlend, scene.clouds.temporalBlend);
+    EXPECT_EQ(decoded.playerPlane, "Box");
 
     ASSERT_EQ(decoded.probes.size(), scene.probes.size());
     EXPECT_EQ(decoded.probes[0].name, scene.probes[0].name);
@@ -119,6 +170,121 @@ TEST(SceneBinary, RejectsCorruptedData)
     badVersion[4] = std::byte{0xFF};
     EXPECT_FALSE(mukki::SceneBinary::Decode(badVersion, decoded, error));
     EXPECT_NE(error.find("version"), std::string::npos);
+}
+
+// Writes the little endian layout used by the legacy (pre-v6) scene binary versions.
+class LegacyWriter
+{
+public:
+    void U32(std::uint32_t value)
+    {
+        for (std::uint32_t byte = 0; byte < 4; ++byte)
+        {
+            m_data.push_back(static_cast<std::byte>((value >> (byte * 8)) & 0xFFu));
+        }
+    }
+
+    void F32(float value)
+    {
+        std::uint32_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(bits));
+        U32(bits);
+    }
+
+    void String(std::string_view value)
+    {
+        U32(static_cast<std::uint32_t>(value.size()));
+        for (const char character : value)
+        {
+            m_data.push_back(static_cast<std::byte>(static_cast<unsigned char>(character)));
+        }
+    }
+
+    void Vec3(const glm::vec3& value)
+    {
+        F32(value.x);
+        F32(value.y);
+        F32(value.z);
+    }
+
+    [[nodiscard]] const std::vector<std::byte>& Data() const { return m_data; }
+
+private:
+    std::vector<std::byte> m_data{};
+};
+
+TEST(SceneBinary, DecodesLegacyVersionFourWithoutPhysics)
+{
+    LegacyWriter writer{};
+    // v4 layout: header, name, assetRoot, objects (no physics), probes, lights.
+    writer.U32(mukki::SceneBinary::kMagic);
+    writer.U32(mukki::SceneBinary::kLegacyVersion);
+    writer.String("Legacy Scene");
+    writer.String("");
+    writer.U32(1);
+    writer.String("LegacyBox");
+    writer.String("Box.gltf");
+    writer.Vec3(glm::vec3{1.0f, 2.0f, 3.0f});
+    writer.Vec3(glm::vec3{0.0f});
+    writer.Vec3(glm::vec3{1.0f});
+    writer.U32(0);
+    writer.U32(0);
+
+    mukki::SceneDescription decoded{};
+    std::string error{};
+    ASSERT_TRUE(mukki::SceneBinary::Decode(writer.Data(), decoded, error)) << error;
+    ASSERT_EQ(decoded.objects.size(), 1u);
+    EXPECT_EQ(decoded.objects[0].name, "LegacyBox");
+    EXPECT_EQ(decoded.objects[0].physics.body, mukki::ScenePhysicsBody::None);
+    EXPECT_FLOAT_EQ(decoded.physics.gravity.y, -9.81f);
+    EXPECT_FLOAT_EQ(decoded.physics.stepHz, 60.0f);
+    EXPECT_EQ(decoded.physics.subSteps, 4u);
+    EXPECT_FALSE(decoded.hasEnvironment);
+    EXPECT_FALSE(decoded.hasClouds);
+    EXPECT_TRUE(decoded.playerPlane.empty());
+}
+
+TEST(SceneBinary, DecodesLegacyVersionFiveWithoutSceneSettings)
+{
+    LegacyWriter writer{};
+    // v5 layout: v4 plus per-object physics and the scene root physics block.
+    writer.U32(mukki::SceneBinary::kMagic);
+    writer.U32(5);
+    writer.String("Physics Scene");
+    writer.String("");
+    writer.U32(1);
+    writer.String("Crate");
+    writer.String("Box.gltf");
+    writer.Vec3(glm::vec3{0.0f, 4.0f, 0.0f});
+    writer.Vec3(glm::vec3{0.0f});
+    writer.Vec3(glm::vec3{1.0f});
+    writer.U32(2); // dynamic
+    writer.U32(1); // sphere
+    writer.Vec3(glm::vec3{0.0f});
+    writer.F32(0.5f);
+    writer.F32(1.0f);
+    writer.Vec3(glm::vec3{0.0f});
+    writer.F32(400.0f);
+    writer.F32(0.6f);
+    writer.F32(0.1f);
+    writer.U32(0); // probes
+    writer.U32(0); // lights
+    writer.Vec3(glm::vec3{0.0f, -12.0f, 0.0f});
+    writer.F32(120.0f);
+    writer.U32(3);
+
+    mukki::SceneDescription decoded{};
+    std::string error{};
+    ASSERT_TRUE(mukki::SceneBinary::Decode(writer.Data(), decoded, error)) << error;
+    ASSERT_EQ(decoded.objects.size(), 1u);
+    EXPECT_EQ(decoded.objects[0].physics.body, mukki::ScenePhysicsBody::Dynamic);
+    EXPECT_EQ(decoded.objects[0].physics.shape, mukki::ScenePhysicsShape::Sphere);
+    EXPECT_FLOAT_EQ(decoded.objects[0].physics.radius, 0.5f);
+    EXPECT_FLOAT_EQ(decoded.physics.gravity.y, -12.0f);
+    EXPECT_FLOAT_EQ(decoded.physics.stepHz, 120.0f);
+    EXPECT_EQ(decoded.physics.subSteps, 3u);
+    EXPECT_FALSE(decoded.hasEnvironment);
+    EXPECT_FALSE(decoded.hasClouds);
 }
 
 TEST(SceneBinary, WriteAndReadFile)

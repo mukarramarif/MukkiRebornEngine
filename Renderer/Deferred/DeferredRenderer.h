@@ -126,6 +126,14 @@ public:
     void SetModelScale(float scale);
     [[nodiscard]] float GetModelScale() const { return m_modelScale; }
 
+    // Built-in ground plane (20x20 world units around the origin when the extent is 10) used as
+    // the default floor. The extent scales it uniformly about the origin and follows into the
+    // shadow culling radius and the ray traced instance transform.
+    void SetGroundPlaneExtent(float halfExtent);
+    [[nodiscard]] float GetGroundPlaneExtent() const { return m_groundPlaneExtent; }
+    void SetGroundVisible(bool visible);
+    [[nodiscard]] bool IsGroundVisible() const { return m_groundVisible; }
+
     // Updates the transform of a scene object instantiated by LoadScene. Object indices follow the
     // order of SceneDescription::objects.
     void UpdateSceneObjectTransform(std::size_t objectIndex, const glm::mat4& transform);
@@ -133,6 +141,20 @@ public:
 
     // World space bounds of the instantiated scene objects. Returns false when no object is loaded.
     [[nodiscard]] bool GetSceneBounds(glm::vec3& outMin, glm::vec3& outMax) const;
+
+    // World space axis aligned bounds of one instantiated scene object (fitted model bounds,
+    // including the object transform and the uniform model scale but not the object rotation).
+    // Used to fit physics colliders. Returns false when the index is not instantiated.
+    [[nodiscard]] bool GetSceneObjectFittedBounds(
+        std::size_t objectIndex,
+        glm::vec3& outMin,
+        glm::vec3& outMax) const;
+
+    // Extra world space debug lines appended to the gizmo pass after lights and probes (physics
+    // colliders). The lines are only drawn while SetPhysicsGizmoView(true) is set.
+    void SetPhysicsDebugLines(DebugLines lines) { m_physicsDebugLines = std::move(lines); }
+    void SetPhysicsGizmoView(bool enabled) { m_showPhysicsGizmos = enabled; }
+    [[nodiscard]] bool ArePhysicsGizmosEnabled() const { return m_showPhysicsGizmos; }
 
     // Replaces the lit image with a heatmap of the clustered light counts for debugging.
     void SetClusterDebugView(bool enabled) { m_clusterDebugView = enabled; }
@@ -284,6 +306,8 @@ private:
         std::vector<std::unique_ptr<rhi::AccelerationStructure>> accelerationStructures{};
         std::vector<DrawItem> drawItems{};
         SceneObjectBounds fittedBounds{};
+        glm::vec3 fittedMin{0.0f};
+        glm::vec3 fittedMax{0.0f};
         std::uint64_t vertexCount = 0;
         std::uint64_t triangleCount = 0;
     };
@@ -454,6 +478,10 @@ private:
     std::vector<std::unique_ptr<rhi::Buffer>> m_uniformBuffers{};
     rhi::Buffer* m_planeVertexBuffer = nullptr;
     rhi::Buffer* m_planeIndexBuffer = nullptr;
+    DrawItem m_groundDrawItem{};
+    bool m_groundDrawItemValid = false;
+    float m_groundPlaneExtent = 10.0f;
+    bool m_groundVisible = true;
     std::unique_ptr<rhi::Sampler> m_gbufferSampler{};
     std::vector<std::unique_ptr<rhi::Sampler>> m_bindlessSamplers{};
     std::unordered_map<std::uint32_t, std::uint32_t> m_samplerCache{};
@@ -606,6 +634,8 @@ private:
     std::vector<GiProbe> m_giProbes{};
     bool m_showLightGizmos = true;
     bool m_showProbeGizmos = true;
+    bool m_showPhysicsGizmos = false;
+    DebugLines m_physicsDebugLines{};
     glm::mat4 m_inverseViewProjection{1.0f};
     std::vector<std::unique_ptr<rhi::AccelerationStructure>> m_tlas{};
     std::vector<std::unique_ptr<rhi::Buffer>> m_geometryDataBuffers{};

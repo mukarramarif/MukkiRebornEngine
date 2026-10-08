@@ -39,7 +39,12 @@ float3 EvaluateCookTorrance(
         return 0.0;
     }
 
-    const float3 halfVector = normalize(viewDirection + lightDirection);
+    // viewDirection and lightDirection cancel in the retroreflection configuration; normalizing
+    // the zero vector would inject NaNs into the traced signal (probes accumulate every ray).
+    const float3 halfSum = viewDirection + lightDirection;
+    const float halfSumLengthSquared = dot(halfSum, halfSum);
+    const float3 halfVector =
+        halfSumLengthSquared > 1e-8 ? halfSum * rsqrt(halfSumLengthSquared) : normal;
     const float nDotV = max(dot(normal, viewDirection), 1e-4);
     const float nDotH = max(dot(normal, halfVector), 0.0);
     const float vDotH = max(dot(viewDirection, halfVector), 0.0);

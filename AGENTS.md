@@ -30,6 +30,44 @@ must not expose backend types, and Vulkan types may only appear under `Renderer/
   [scene.mres]`; the sandbox compiles and loads `Sandbox/Scenes/demo.scene.json`. `DeferredRenderer
   ::LoadScene` loads/caches the referenced glTF models and instantiates them. A scene graph and
   entity-component-system architecture is still planned.
+- Physics: optional per-object Box3D rigid bodies (`ScenePhysics`: `body` none/static/dynamic,
+  `shape` box/sphere/capsule, fitted to the model bounds unless `halfExtents`/`radius`/`height` are
+  authored). `Physics/` (`PhysicsWorld`, pimpl) is the only place Box3D types appear; the port is a
+  local overlay (`overlay-ports/box3d`, static MSVC runtime line removed). The world is single
+  threaded (`workerCount=1`) and advanced by `PhysicsWorld::Step` through a fixed-step accumulator
+  (`stepHz`/`subSteps`); callers sync dynamic transforms after stepping (post-step, no render
+  interpolation) — the sandbox writes them into `SceneDescription::objects` and calls
+  `DeferredRenderer::UpdateSceneObjectTransform`. A ground box collider is created by default; scene
+  gravity/stepHz/subSteps live in the JSON root and are editable in the UI, and the `Objects &
+  Physics` `Static floor` section adjusts the runtime-only ground collider (enable, top Y, XZ
+  center/size, thickness; editing it recreates only the ground body). Colliders are built from
+  `DeferredRenderer::GetSceneObjectFittedBounds`; `PhysicsWorld::BuildDebugLines` feeds collision
+  gizmos through `DeferredRenderer::SetPhysicsDebugLines`. Scene binary v5 added the physics data
+  (v4 still decodes with defaults); v6 adds the scene settings below.
+- Scene settings (binary v6): optional root `environment` (`map` path resolved against `assetRoot`
+  plus `intensity`) and `clouds` (all `CloudSettings` fields) override the renderer on scene load;
+  absent blocks leave the current environment/clouds untouched so `--env` and UI edits survive
+  older scenes. Root `playerPlane` names the scene object that enters flight mode. `SceneJson`
+  parses/serializes both blocks and `SceneBinary` writes them after the physics block; v4/v5 still
+  decode with defaults.
+- Flight demo: `Sandbox/Scenes/flight.scene.json` spawns a glass skyscraper city with a low-poly
+  airplane as the `playerPlane` object (flight mode auto-enables on load), a 0.9-2.8 km cloud layer
+  and the sunrise HDR environment.
+  `Application/PlaneController` is the arcade flight model (body-local rates scaled by airspeed,
+  bank->turn coupling, auto-level, throttle -> target speed) with tests; the sandbox syncs the
+  plane object through `DeferredRenderer::UpdateSceneObjectTransform` and drives a banked chase
+  camera via `Camera::SetView(position, forward, up)`. Crash detection tests the plane sphere
+  against cached building AABBs (`GetSceneObjectFittedBounds`), the floor top and a 12 km boundary;
+  a crash freezes the plane, respawns after ~1.6 s and counts attempts (`R` resets). Flight near
+  plane is 1 m / 25 km at 70 degrees FOV. `DeferredRenderer::SetGroundPlaneExtent`/`SetGroundVisible`
+  scale the built-in ground plane (also updates its shadow cull radius); flight mode uses a 9 km
+  extent. Sandbox shutdown calls `Device::WaitIdle` before the UI/renderer release resources.
+- Sandbox UI: ImGui docking is enabled in `Renderer/Vulkan/UiLayer`; `Sandbox/main.cpp` builds a
+  default dock layout with the `imgui_internal.h` DockBuilder API — `Stats`/`Scenes`/`G-buffer`
+  tabbed in the left group and `GI & Lights`/`Objects & Physics`/`Volumetrics`/`Flight` tabbed in
+  the main group. The layout persists in `imgui.ini` next to the executable (`io.IniFilename`); the
+  `Stats` `View` menu toggles windows and has `Reset layout`; layouts that predate the marker
+  windows are rebuilt automatically.
 - Materials: glTF `alphaMode = MASK` is supported. The flag and `alphaCutoff` are packed into
   `ObjectPushConstants.params.z/.w` (set by `DeferredRenderer` from `GltfMaterial`), the G-buffer
   discards `baseColor.a * baseColorFactor.a < cutoff`, and the shadow fragment stage alpha-tests
@@ -57,7 +95,7 @@ must not expose backend types, and Vulkan types may only appear under `Renderer/
 - Debug gizmos: `Renderer/Debug/DebugLines.h` builds CPU line lists (`DebugLines`) for light and
   probe markers; `DeferredRenderer::RecordDebugLines` draws them at the end of the swapchain
   lighting scope with a `PrimitiveTopology::LineList` pipeline (push constant viewProjection, no
-  depth). World space GI probes are authored as `SceneDescription::probes` (JSON + scene binary v4);
+  depth). World space GI probes are authored as `SceneDescription::probes` (JSON + scene binary v4+);
   the sandbox feeds `GiProbe` markers through `SetGiProbes` and toggles them with `SetGizmoView`.
   The probe UI can `Fill scene`/`Maximize probes`, distributing a Halton set of up to
   `kMaxGiProbes` probes over `DeferredRenderer::GetSceneBounds`.

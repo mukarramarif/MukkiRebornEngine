@@ -2,8 +2,11 @@
 #include "Application/Camera.h"
 #include "Application/Input.h"
 #include "Application/Keybinds.h"
+#include "Application/PlaneController.h"
 #include "Application/Window.h"
 #include "Core/JobSystem.h"
+#include "Physics/PhysicsWorld.h"
+#include "Renderer/Debug/DebugLines.h"
 #include "Renderer/Deferred/DeferredRenderer.h"
 #include "Renderer/Lighting/Light.h"
 #include "Renderer/RHI/Device.h"
@@ -18,22 +21,29 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include <GLFW/glfw3.h>
 #include <glm/geometric.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/quaternion.hpp>
 #include <glm/trigonometric.hpp>
+#include <glm/vec2.hpp>
 #include <glm/vec3.hpp>
 #include <imgui.h>
+#include <imgui_internal.h> // DockBuilder API for the default dock layout
 
 namespace
 {
@@ -51,6 +61,10 @@ const char* LightTypeLabel(mukki::LightType type)
     }
     return "point";
 }
+
+// Chase camera offset in airplane local space (behind = +Z, above = +Y, in metres).
+constexpr glm::vec3 kChaseLocalOffset{0.0f, 3.2f, 10.5f};
+
 
 void DrawTexturePreview(const char* label, ImTextureID textureId, float width, float aspect)
 {
@@ -95,6 +109,14 @@ protected:
         keybinds.Bind("camera.toggleCursor", mukki::Binding::Key(GLFW_KEY_TAB));
         keybinds.Bind("app.quit", mukki::Binding::Key(GLFW_KEY_ESCAPE));
 
+        // Flight demo controls (active while flight mode is enabled).
+        keybinds.Bind("flight.throttleUp", mukki::Binding::Key(GLFW_KEY_W));
+        keybinds.Bind("flight.throttleDown", mukki::Binding::Key(GLFW_KEY_S));
+        keybinds.Bind("flight.yawLeft", mukki::Binding::Key(GLFW_KEY_A));
+        keybinds.Bind("flight.yawRight", mukki::Binding::Key(GLFW_KEY_D));
+        keybinds.Bind("flight.reset", mukki::Binding::Key(GLFW_KEY_R));
+        keybinds.Bind("flight.toggle", mukki::Binding::Key(GLFW_KEY_F));
+
         m_camera.SetPerspective(1.0471975512f, GetWindow().GetAspectRatio(), 0.1f, 1000.0f);
         m_camera.SetPosition(glm::vec3{4.0f, 2.5f, 5.0f});
         m_camera.SetRotation(-0.65f, -0.3f);
@@ -131,6 +153,28 @@ protected:
             MRE_CRITICAL("Failed to initialize the ImGui layer");
             RequestExit();
             return;
+        }
+
+        // Keep the dock layout next to the executable so it survives working directory changes.
+        // A layout saved by an older window set is stale; rebuild the default layout when the
+        // marker window is missing.
+        const std::filesystem::path iniPath = m_shaderDirectory.parent_path() / "imgui.ini";
+        std::string iniContents{};
+        if (std::ifstream stream{iniPath, std::ios::binary}; stream)
+        {
+            std::ostringstream buffer;
+            buffer << stream.rdbuf();
+            iniContents = buffer.str();
+        }
+        m_hasSavedLayout = iniContents.find("[Window][GI & Lights]") != std::string::npos &&
+                           iniContents.find("[Window][Flight]") != std::string::npos;
+        m_iniPath = mukki::PathToUtf8(iniPath);
+        ImGui::GetIO().IniFilename = m_iniPath.c_str();
+
+        mukki::PhysicsSettings physicsSettings{};
+        if (!m_physics.Init(physicsSettings))
+        {
+            MRE_WARN("Failed to initialize the physics world; physics is disabled");
         }
 
         if (!m_requestedEnvironment.empty())
@@ -194,6 +238,8 @@ protected:
                 LoadSceneFromJson(scenePath);
             }
         }
+
+        RebuildPhysics();
     }
 
     void OnUpdate(float deltaTime) override
@@ -225,23 +271,44 @@ protected:
             GetInput().SetCursorCaptured(lookEnabled);
         }
 
-        mukki::CameraInput cameraInput{};
-        cameraInput.move.x = keybinds.GetAxis("camera.left", "camera.right");
-        cameraInput.move.y = keybinds.GetAxis("camera.backward", "camera.forward");
-        cameraInput.vertical = keybinds.GetAxis("camera.down", "camera.up");
-        cameraInput.look = input.GetState().mouseDelta;
-        cameraInput.fast = keybinds.IsActionDown("camera.fast");
-        cameraInput.lookEnabled = lookEnabled;
+        if (keybinds.IsActionPressed("flight.toggle"))
+        {
+            SetFlightEnabled(!m_flightEnabled);
+        }
 
-        m_controller.Update(m_camera, cameraInput, deltaTime);
+        if (m_flightEnabled)
+        {
+            UpdateFlight(deltaTime, input, keybinds, lookEnabled);
+        }
+        else
+        {
+            mukki::CameraInput cameraInput{};
+            cameraInput.move.x = keybinds.GetAxis("camera.left", "camera.right");
+            cameraInput.move.y = keybinds.GetAxis("camera.backward", "camera.forward");
+            cameraInput.vertical = keybinds.GetAxis("camera.down", "camera.up");
+            cameraInput.look = input.GetState().mouseDelta;
+            cameraInput.fast = keybinds.IsActionDown("camera.fast");
+            cameraInput.lookEnabled = lookEnabled;
+
+            m_controller.Update(m_camera, cameraInput, deltaTime);
+        }
         m_frameTimeMs = deltaTime * 1000.0f;
+
+        m_physics.Step(deltaTime);
+        SyncDynamicBodies();
+        if (m_renderer->ArePhysicsGizmosEnabled())
+        {
+            mukki::DebugLines lines{};
+            m_physics.BuildDebugLines(lines);
+            m_renderer->SetPhysicsDebugLines(std::move(lines));
+        }
 
         if (GetWindow().WasResized())
         {
             const std::uint32_t width = static_cast<std::uint32_t>(GetWindow().GetWidth());
             const std::uint32_t height = static_cast<std::uint32_t>(GetWindow().GetHeight());
 
-            m_camera.SetPerspective(1.0471975512f, GetWindow().GetAspectRatio(), 0.1f, 1000.0f);
+            ApplyCameraPerspective();
             m_device->Resize(mukki::rhi::Extent2D{width, height});
             m_renderer->Resize(width, height);
             ReleaseDebugTextures();
@@ -281,10 +348,32 @@ protected:
         commandList.Begin();
 
         m_ui.BeginFrame();
+        DrawDockspace();
         DrawStatsWindow();
-        DrawSceneBrowser();
-        DrawSceneWindow();
-        DrawGBufferWindow();
+        if (m_showScenesWindow)
+        {
+            DrawSceneBrowser();
+        }
+        if (m_showGiLightsWindow)
+        {
+            DrawGiLightsWindow();
+        }
+        if (m_showObjectsPhysicsWindow)
+        {
+            DrawObjectsPhysicsWindow();
+        }
+        if (m_showVolumetricsWindow)
+        {
+            DrawVolumetricsWindow();
+        }
+        if (m_showFlightWindow)
+        {
+            DrawFlightWindow();
+        }
+        if (m_showGBuffer)
+        {
+            DrawGBufferWindow();
+        }
         if (m_showDemoWindow)
         {
             ImGui::ShowDemoWindow(&m_showDemoWindow);
@@ -327,8 +416,15 @@ protected:
 
     void OnShutdown() override
     {
+        // The GPU may still be executing the last submitted frame; wait before releasing any
+        // resources (descriptor sets, textures) that frame references.
+        if (m_device != nullptr)
+        {
+            m_device->WaitIdle();
+        }
         ReleaseDebugTextures();
         m_ui.Shutdown();
+        m_physics.Shutdown();
         m_renderer.reset();
         m_device.reset();
     }
@@ -418,15 +514,34 @@ private:
 
     void DrawStatsWindow()
     {
-        ImGui::Begin("Mukki Sandbox");
+        ImGui::Begin("Stats", nullptr, ImGuiWindowFlags_MenuBar);
+        if (ImGui::BeginMenuBar())
+        {
+            if (ImGui::BeginMenu("View"))
+            {
+                ImGui::MenuItem("Scenes", nullptr, &m_showScenesWindow);
+                ImGui::MenuItem("GI & Lights", nullptr, &m_showGiLightsWindow);
+                ImGui::MenuItem("Objects & Physics", nullptr, &m_showObjectsPhysicsWindow);
+                ImGui::MenuItem("Volumetrics", nullptr, &m_showVolumetricsWindow);
+                ImGui::MenuItem("Flight", nullptr, &m_showFlightWindow);
+                ImGui::MenuItem("G-buffer", nullptr, &m_showGBuffer);
+                ImGui::MenuItem("ImGui demo", nullptr, &m_showDemoWindow);
+                ImGui::Separator();
+                if (ImGui::MenuItem("Reset layout"))
+                {
+                    m_resetLayoutRequested = true;
+                }
+                ImGui::EndMenu();
+            }
+            ImGui::EndMenuBar();
+        }
+
         ImGui::Text("Frame time: %.2f ms", static_cast<double>(m_frameTimeMs));
         ImGui::Text(
             "Camera: %.2f, %.2f, %.2f",
             static_cast<double>(m_camera.GetPosition().x),
             static_cast<double>(m_camera.GetPosition().y),
             static_cast<double>(m_camera.GetPosition().z));
-        ImGui::Checkbox("Show G-buffer", &m_showGBuffer);
-        ImGui::Checkbox("Show demo window", &m_showDemoWindow);
         ImGui::SeparatorText("Controls");
         ImGui::TextUnformatted("WASD/QE move, Shift fast");
         ImGui::TextUnformatted("Mouse looks around");
@@ -490,9 +605,11 @@ private:
             ImGui::SameLine();
             if (ImGui::Button("Unload scene"))
             {
+                ClearFlight();
                 m_renderer->ClearScene();
                 m_scene = mukki::SceneDescription{};
                 m_sceneSourcePath.clear();
+                m_physics.ClearBodies();
                 m_sceneStatus = "scene unloaded";
             }
         }
@@ -502,11 +619,14 @@ private:
         if (ImGui::SliderFloat("Uniform scale", &modelScale, 0.1f, 10.0f, "%.2f"))
         {
             m_renderer->SetModelScale(modelScale);
+            // Colliders are fitted at build time; rebuild so they follow the new scale.
+            RebuildPhysics();
         }
         ImGui::SameLine();
         if (ImGui::SmallButton("Reset"))
         {
             m_renderer->SetModelScale(1.0f);
+            RebuildPhysics();
         }
 
         ImGui::Separator();
@@ -577,9 +697,20 @@ private:
             return false;
         }
 
+        mukki::PhysicsSettings physicsSettings = m_physics.GetSettings();
+        physicsSettings.gravity = m_scene.physics.gravity;
+        physicsSettings.stepHz = m_scene.physics.stepHz;
+        physicsSettings.subSteps = m_scene.physics.subSteps;
+        m_physics.SetSettings(physicsSettings);
+        ApplySceneEnvironment();
+        ResetFloorFromSceneBounds();
+        RebuildPhysics();
+        PrepareFlight();
+
         m_sceneLightsDirty = false;
         m_sceneStatus = "loaded '" + m_scene.name + "' (" + std::to_string(m_scene.objects.size()) +
-                        " objects, " + std::to_string(m_scene.lights.size()) + " lights)";
+                        " objects, " + std::to_string(m_scene.lights.size()) + " lights, " +
+                        std::to_string(m_physics.GetBodyCount()) + " bodies)";
         MRE_INFO("{}", m_sceneStatus);
         return true;
     }
@@ -664,82 +795,541 @@ private:
         m_renderer->SetGiProbes(probes);
     }
 
-    void DrawSceneWindow()
+    std::uint32_t FindBodyHandleForObject(std::size_t objectIndex) const
     {
-        ImGui::Begin("Scene");
+        for (const mukki::CollisionBody& body : m_physics.GetBodies())
+        {
+            if (body.handle != 0 && body.objectIndex == static_cast<std::uint32_t>(objectIndex))
+            {
+                return body.handle;
+            }
+        }
+        return 0;
+    }
 
-        ImGui::Text("Scene: %s", m_scene.name.empty() ? "(none)" : m_scene.name.c_str());
+    // Recreates the default static floor collider from the adjustable floor settings. Only the
+    // ground body is touched so dynamic bodies keep simulating while the floor is edited.
+    void UpdateFloorBody()
+    {
+        if (!m_physics.IsInitialized())
+        {
+            return;
+        }
+
+        if (m_groundBody != 0)
+        {
+            m_physics.DestroyBody(m_groundBody);
+            m_groundBody = 0;
+        }
+        if (!m_floor.enabled)
+        {
+            return;
+        }
+
+        mukki::BodyDesc ground{};
+        ground.type = mukki::BodyType::Static;
+        ground.position = glm::vec3{
+            m_floor.center.x,
+            m_floor.topY - m_floor.thickness * 0.5f,
+            m_floor.center.y};
+        ground.collider.shape = mukki::ColliderShapeType::Box;
+        ground.collider.halfExtents = glm::vec3{
+            std::max(m_floor.halfExtentX, 0.5f),
+            std::max(m_floor.thickness * 0.5f, 0.05f),
+            std::max(m_floor.halfExtentZ, 0.5f)};
+        ground.collider.friction = 0.8f;
+        m_groundBody = m_physics.CreateBody(ground);
+    }
+
+    // Fits the floor defaults to the loaded scene footprint (top surface at the scene minimum Y).
+    void ResetFloorFromSceneBounds()
+    {
+        m_floor.enabled = true;
+        m_floor.topY = 0.0f;
+        m_floor.center = glm::vec2{0.0f};
+        m_floor.halfExtentX = 50.0f;
+        m_floor.halfExtentZ = 50.0f;
+        m_floor.thickness = 1.0f;
+
+        glm::vec3 boundsMin{0.0f};
+        glm::vec3 boundsMax{0.0f};
+        if (m_renderer != nullptr && m_renderer->GetSceneBounds(boundsMin, boundsMax))
+        {
+            const glm::vec3 extent = glm::max(boundsMax - boundsMin, glm::vec3{0.0f});
+            m_floor.topY = boundsMin.y;
+            m_floor.center = glm::vec2{
+                (boundsMin.x + boundsMax.x) * 0.5f,
+                (boundsMin.z + boundsMax.z) * 0.5f};
+            m_floor.halfExtentX = std::max(extent.x * 0.5f + 1.0f, 10.0f);
+            m_floor.halfExtentZ = std::max(extent.z * 0.5f + 1.0f, 10.0f);
+        }
+    }
+
+    // Recreates every collider from the current scene description. Runs after scene loads and on
+    // demand from the physics UI; resets dynamic body poses.
+    void RebuildPhysics()
+    {
+        if (!m_physics.IsInitialized() || m_renderer == nullptr)
+        {
+            return;
+        }
+
+        m_physics.ClearBodies();
+        m_groundBody = 0;
+        UpdateFloorBody();
+
+
+        const std::size_t objectCount =
+            std::min(m_scene.objects.size(), m_renderer->GetSceneObjectCount());
+        for (std::size_t index = 0; index < objectCount; ++index)
+        {
+            const mukki::SceneObject& object = m_scene.objects[index];
+            if (object.physics.body == mukki::ScenePhysicsBody::None)
+            {
+                continue;
+            }
+
+            glm::vec3 fittedMin{0.0f};
+            glm::vec3 fittedMax{0.0f};
+            if (!m_renderer->GetSceneObjectFittedBounds(index, fittedMin, fittedMax))
+            {
+                continue;
+            }
+
+            const glm::vec3 fittedCenter = (fittedMin + fittedMax) * 0.5f;
+            const glm::vec3 fittedHalfExtents =
+                glm::max((fittedMax - fittedMin) * 0.5f, glm::vec3{0.01f});
+            const glm::quat rotation = mukki::BuildObjectRotation(object);
+
+            mukki::BodyDesc desc{};
+            desc.type = object.physics.body == mukki::ScenePhysicsBody::Dynamic
+                            ? mukki::BodyType::Dynamic
+                            : mukki::BodyType::Static;
+            desc.objectIndex = static_cast<std::uint32_t>(index);
+            desc.position = object.position;
+            desc.rotation = rotation;
+            desc.collider.density = object.physics.density;
+            desc.collider.friction = object.physics.friction;
+            desc.collider.restitution = object.physics.restitution;
+            // The auto fitted model is not necessarily centred on the authored object position;
+            // keep the difference as a body local offset so colliders track the visuals.
+            desc.collider.offset =
+                glm::inverse(rotation) * (fittedCenter - object.position) + object.physics.offset;
+
+            const bool authoredExtents = object.physics.halfExtents.x > 0.0f &&
+                                         object.physics.halfExtents.y > 0.0f &&
+                                         object.physics.halfExtents.z > 0.0f;
+
+            switch (object.physics.shape)
+            {
+            case mukki::ScenePhysicsShape::Box:
+                desc.collider.shape = mukki::ColliderShapeType::Box;
+                desc.collider.halfExtents = authoredExtents ? object.physics.halfExtents
+                                                            : fittedHalfExtents;
+                break;
+            case mukki::ScenePhysicsShape::Sphere:
+                desc.collider.shape = mukki::ColliderShapeType::Sphere;
+                desc.collider.radius = object.physics.radius > 0.0f
+                                           ? object.physics.radius
+                                           : std::max(
+                                                 fittedHalfExtents.x,
+                                                 std::max(fittedHalfExtents.y, fittedHalfExtents.z));
+                break;
+            case mukki::ScenePhysicsShape::Capsule:
+                desc.collider.shape = mukki::ColliderShapeType::Capsule;
+                desc.collider.radius = object.physics.radius > 0.0f
+                                           ? object.physics.radius
+                                           : std::max(fittedHalfExtents.x, fittedHalfExtents.z);
+                desc.collider.height = object.physics.height > 0.0f
+                                           ? object.physics.height
+                                           : std::max(
+                                                 fittedHalfExtents.y * 2.0f,
+                                                 desc.collider.radius * 2.0f + 0.05f);
+                break;
+            }
+
+            if (m_physics.CreateBody(desc) == 0)
+            {
+                MRE_WARN("Failed to create a physics body for scene object '{}'", object.name);
+            }
+        }
+    }
+
+    // Post-step transform sync: dynamic bodies drive the scene objects and the renderer.
+    void SyncDynamicBodies()
+    {
+        for (const mukki::CollisionBody& body : m_physics.GetBodies())
+        {
+            if (body.handle == 0 || body.type != mukki::BodyType::Dynamic ||
+                body.objectIndex >= m_scene.objects.size())
+            {
+                continue;
+            }
+
+            glm::vec3 position{0.0f};
+            glm::quat rotation{1.0f, 0.0f, 0.0f, 0.0f};
+            if (!m_physics.GetBodyTransform(body.handle, position, rotation))
+            {
+                continue;
+            }
+
+            mukki::SceneObject& object = m_scene.objects[body.objectIndex];
+            object.position = position;
+            object.rotation = mukki::ExtractObjectRotationEuler(rotation);
+
+            if (body.objectIndex < m_renderer->GetSceneObjectCount())
+            {
+                m_renderer->UpdateSceneObjectTransform(
+                    body.objectIndex,
+                    mukki::BuildObjectTransform(object));
+            }
+        }
+    }
+
+    std::filesystem::path ResolveSceneAssetPath(const std::filesystem::path& path) const
+    {
+        if (path.empty() || path.is_absolute() || m_scene.assetRoot.empty())
+        {
+            return path;
+        }
+        return m_scene.assetRoot / path;
+    }
+
+    // Applies the optional scene authored environment and cloud settings. Absent blocks leave the
+    // renderer's current settings alone, so --env and UI edits survive older scenes.
+    void ApplySceneEnvironment()
+    {
+        if (m_renderer == nullptr)
+        {
+            return;
+        }
+        if (m_scene.hasEnvironment)
+        {
+            mukki::EnvironmentSettings environment = m_renderer->GetEnvironmentSettings();
+            environment.environmentMap = ResolveSceneAssetPath(m_scene.environment.map);
+            environment.intensity = m_scene.environment.intensity;
+            m_renderer->SetEnvironmentSettings(environment);
+        }
+        if (m_scene.hasClouds)
+        {
+            m_renderer->SetCloudSettings(m_scene.clouds);
+        }
+    }
+
+    void ApplyCameraPerspective()
+    {
+        const float aspect = GetWindow().GetAspectRatio();
+        if (m_flightEnabled)
+        {
+            m_camera.SetPerspective(glm::radians(70.0f), aspect, 1.0f, 25000.0f);
+        }
+        else
+        {
+            m_camera.SetPerspective(1.0471975512f, aspect, 0.1f, 1000.0f);
+        }
+    }
+
+    // Recreates the plane at the authored spawn pose and snaps the chase camera behind it.
+    void ResetPlane()
+    {
+        m_plane.Reset(m_planeStartPosition, m_planeStartRotation, 140.0f, 0.6f);
+        m_flightStickX = 0.0f;
+        m_flightStickY = 0.0f;
+        m_crashed = false;
+        m_crashTimer = 0.0f;
+        m_flightStatus = "flying";
+
+        const glm::quat orientation = m_plane.GetOrientation();
+        m_chaseCameraPosition = m_plane.GetPosition() + orientation * kChaseLocalOffset;
+        SyncPlaneObject();
+    }
+
+    void SetFlightEnabled(bool enabled)
+    {
+        if (enabled && m_planeObjectIndex < 0)
+        {
+            m_sceneStatus = "flight mode needs a 'playerPlane' object in the scene";
+            return;
+        }
+
+        m_flightEnabled = enabled;
+        if (enabled)
+        {
+            ResetPlane();
+            m_renderer->SetGroundPlaneExtent(9000.0f);
+        }
+        else
+        {
+            m_crashed = false;
+            m_renderer->SetGroundPlaneExtent(10.0f);
+        }
+        ApplyCameraPerspective();
+    }
+
+    // Keeps the rendered airplane in sync with the controller state.
+    void SyncPlaneObject()
+    {
+        if (m_planeObjectIndex < 0 || m_renderer == nullptr ||
+            static_cast<std::size_t>(m_planeObjectIndex) >= m_renderer->GetSceneObjectCount())
+        {
+            return;
+        }
+
+        const glm::mat4 transform =
+            glm::translate(glm::mat4{1.0f}, m_plane.GetPosition()) *
+            glm::mat4_cast(m_plane.GetOrientation());
+        m_renderer->UpdateSceneObjectTransform(
+            static_cast<std::size_t>(m_planeObjectIndex),
+            transform);
+    }
+
+    void CacheCollisionBounds()
+    {
+        m_collisionBoundsMin.clear();
+        m_collisionBoundsMax.clear();
+        if (m_renderer == nullptr)
+        {
+            return;
+        }
+
+        const std::size_t count =
+            std::min(m_scene.objects.size(), m_renderer->GetSceneObjectCount());
+        for (std::size_t index = 0; index < count; ++index)
+        {
+            if (m_scene.objects[index].physics.body != mukki::ScenePhysicsBody::Static)
+            {
+                continue;
+            }
+
+            glm::vec3 boundsMin{0.0f};
+            glm::vec3 boundsMax{0.0f};
+            if (m_renderer->GetSceneObjectFittedBounds(index, boundsMin, boundsMax))
+            {
+                m_collisionBoundsMin.push_back(boundsMin);
+                m_collisionBoundsMax.push_back(boundsMax);
+            }
+        }
+    }
+
+    void PrepareFlight()
+    {
+        m_planeObjectIndex = -1;
+        m_flightEnabled = false;
+        m_crashed = false;
+        m_crashTimer = 0.0f;
+        m_flightStatus.clear();
+
+        if (!m_scene.playerPlane.empty())
+        {
+            for (std::size_t index = 0; index < m_scene.objects.size(); ++index)
+            {
+                if (m_scene.objects[index].name == m_scene.playerPlane)
+                {
+                    m_planeObjectIndex = static_cast<int>(index);
+                    m_planeStartPosition = m_scene.objects[index].position;
+                    m_planeStartRotation = mukki::BuildObjectRotation(m_scene.objects[index]);
+                    break;
+                }
+            }
+            if (m_planeObjectIndex < 0)
+            {
+                MRE_WARN("playerPlane '{}' was not found in the scene", m_scene.playerPlane);
+            }
+        }
+
+        CacheCollisionBounds();
+        if (m_planeObjectIndex >= 0)
+        {
+            SetFlightEnabled(true);
+        }
+    }
+
+    void ClearFlight()
+    {
+        m_flightEnabled = false;
+        m_planeObjectIndex = -1;
+        m_crashed = false;
+        m_crashTimer = 0.0f;
+        m_flightStatus.clear();
+        m_collisionBoundsMin.clear();
+        m_collisionBoundsMax.clear();
+        if (m_renderer != nullptr)
+        {
+            m_renderer->SetGroundPlaneExtent(10.0f);
+        }
+        ApplyCameraPerspective();
+    }
+
+    void CrashPlane(const char* reason)
+    {
+        if (m_crashed)
+        {
+            return;
+        }
+        m_crashed = true;
+        m_crashTimer = 1.6f;
+        ++m_crashCount;
+        m_flightStatus = std::string{reason} + " - respawning";
+        MRE_INFO("Flight: {}", m_flightStatus);
+    }
+
+    void CheckPlaneCrash()
+    {
+        const glm::vec3 position = m_plane.GetPosition();
+        if (position.y <= m_floor.topY + 3.0f)
+        {
+            CrashPlane("crashed into the ground");
+            return;
+        }
+
+        constexpr float kPlaneRadius = 3.0f;
+        for (std::size_t index = 0; index < m_collisionBoundsMin.size(); ++index)
+        {
+            const glm::vec3 min = m_collisionBoundsMin[index];
+            const glm::vec3 max = m_collisionBoundsMax[index];
+            const bool inside =
+                position.x + kPlaneRadius >= min.x && position.x - kPlaneRadius <= max.x &&
+                position.y + kPlaneRadius >= min.y && position.y - kPlaneRadius <= max.y &&
+                position.z + kPlaneRadius >= min.z && position.z - kPlaneRadius <= max.z;
+            if (inside)
+            {
+                CrashPlane("crashed into a skyscraper");
+                return;
+            }
+        }
+
+        if (glm::length(glm::vec2{position.x, position.z}) > 12000.0f)
+        {
+            CrashPlane("left the city airspace");
+        }
+    }
+
+    void UpdateChaseCamera(float deltaTime)
+    {
+        const glm::quat orientation = m_plane.GetOrientation();
+        const glm::vec3 desired = m_plane.GetPosition() + orientation * kChaseLocalOffset;
+        const float blend = 1.0f - std::exp(-6.0f * deltaTime);
+        m_chaseCameraPosition = glm::mix(m_chaseCameraPosition, desired, blend);
+
+        const glm::vec3 lookTarget =
+            m_plane.GetPosition() + orientation * glm::vec3{0.0f, 1.5f, -12.0f};
+        const glm::vec3 forward = lookTarget - m_chaseCameraPosition;
+        if (glm::length(forward) > 1.0e-3f)
+        {
+            m_camera.SetView(m_chaseCameraPosition, forward, orientation * glm::vec3{0.0f, 1.0f, 0.0f});
+        }
+    }
+
+    void UpdateFlight(
+        float deltaTime,
+        const mukki::Input& input,
+        const mukki::Keybinds& keybinds,
+        bool lookEnabled)
+    {
+        if (keybinds.IsActionPressed("flight.reset"))
+        {
+            ResetPlane();
+        }
+
+        // Mouse virtual stick: mouse deltas push the stick and it springs back toward center.
+        if (lookEnabled)
+        {
+            const glm::vec2 mouseDelta = input.GetState().mouseDelta;
+            m_flightStickX = std::clamp(m_flightStickX + mouseDelta.x * m_flightMouseGain, -1.0f, 1.0f);
+            m_flightStickY = std::clamp(m_flightStickY - mouseDelta.y * m_flightMouseGain, -1.0f, 1.0f);
+        }
+        const float returnFactor = std::exp(-m_flightStickReturn * deltaTime);
+        m_flightStickX *= returnFactor;
+        m_flightStickY *= returnFactor;
+
+        if (m_crashed)
+        {
+            m_crashTimer -= deltaTime;
+            if (m_crashTimer <= 0.0f)
+            {
+                ResetPlane();
+            }
+        }
+        else
+        {
+            mukki::FlightInput flight{};
+            flight.roll = m_flightStickX;
+            flight.pitch = m_flightStickY;
+            flight.yaw = keybinds.GetAxis("flight.yawLeft", "flight.yawRight");
+            flight.throttle = keybinds.GetAxis("flight.throttleDown", "flight.throttleUp");
+            m_plane.Update(flight, deltaTime);
+            SyncPlaneObject();
+            CheckPlaneCrash();
+        }
+
+        UpdateChaseCamera(deltaTime);
+    }
+
+    void DrawDockspace()
+    {
+        // Passthru keeps the central node transparent so the rendered scene shows through the
+        // empty dock space instead of the host window background.
+        const ImGuiID dockspaceId =
+            ImGui::DockSpaceOverViewport(0, nullptr, ImGuiDockNodeFlags_PassthruCentralNode);
+        if (!m_layoutInitialized)
+        {
+            m_layoutInitialized = true;
+            if (!m_hasSavedLayout)
+            {
+                BuildDefaultLayout(dockspaceId);
+            }
+        }
+        if (m_resetLayoutRequested)
+        {
+            m_resetLayoutRequested = false;
+            BuildDefaultLayout(dockspaceId);
+        }
+    }
+
+    // Typed tab groups: Stats/Scenes/G-buffer on the left, the lighting/objects/volumetrics
+    // editors tabbed together on the right.
+    void BuildDefaultLayout(ImGuiID dockspaceId)
+    {
+        ImGui::DockBuilderRemoveNode(dockspaceId);
+        ImGui::DockBuilderAddNode(
+            dockspaceId,
+            static_cast<ImGuiDockNodeFlags>(
+                ImGuiDockNodeFlags_DockSpace | ImGuiDockNodeFlags_PassthruCentralNode));
+        ImGui::DockBuilderSetNodeSize(dockspaceId, ImGui::GetMainViewport()->WorkSize);
+
+        ImGuiID leftNode = 0;
+        ImGuiID mainNode = 0;
+        ImGui::DockBuilderSplitNode(dockspaceId, ImGuiDir_Left, 0.28f, &leftNode, &mainNode);
+
+        ImGui::DockBuilderDockWindow("Stats", leftNode);
+        ImGui::DockBuilderDockWindow("Scenes", leftNode);
+        ImGui::DockBuilderDockWindow("G-buffer", leftNode);
+        ImGui::DockBuilderDockWindow("GI & Lights", mainNode);
+        ImGui::DockBuilderDockWindow("Objects & Physics", mainNode);
+        ImGui::DockBuilderDockWindow("Volumetrics", mainNode);
+        ImGui::DockBuilderDockWindow("Flight", mainNode);
+        ImGui::DockBuilderFinish(dockspaceId);
+    }
+
+    void DrawGiLightsWindow()
+    {
+        ImGui::Begin("GI & Lights", &m_showGiLightsWindow);
+
         ImGui::Text(
-            "Objects: %zu   Lights: %zu   In renderer: %u",
-            m_scene.objects.size(),
+            "Lights: %zu in scene, %u in renderer",
             m_scene.lights.size(),
             m_renderer->GetLightCount());
-        if (!m_sceneStatus.empty())
-        {
-            ImGui::TextWrapped("%s", m_sceneStatus.c_str());
-        }
-
-        if (ImGui::Button("Reload JSON -> bytecode"))
-        {
-            LoadSceneFromJson(
-                m_sceneSourcePath.empty() ? DefaultSceneJsonPath() : m_sceneSourcePath);
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Save JSON"))
-        {
-            SaveSceneJson();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Compile bytecode"))
-        {
-            CompileSceneBinary();
-        }
 
         bool debugClusters = m_renderer->IsClusterDebugViewEnabled();
         if (ImGui::Checkbox("Visualize cluster light counts", &debugClusters))
         {
             m_renderer->SetClusterDebugView(debugClusters);
         }
-
         bool showLightGizmos = m_renderer->AreLightGizmosEnabled();
-        bool showProbeGizmos = m_renderer->AreProbeGizmosEnabled();
         if (ImGui::Checkbox("Show light gizmos", &showLightGizmos))
         {
-            m_renderer->SetGizmoView(showLightGizmos, showProbeGizmos);
+            m_renderer->SetGizmoView(showLightGizmos, m_renderer->AreProbeGizmosEnabled());
         }
-        ImGui::SameLine();
-        if (ImGui::Checkbox("Show probe gizmos", &showProbeGizmos))
-        {
-            m_renderer->SetGizmoView(showLightGizmos, showProbeGizmos);
-        }
-
-        ImGui::SeparatorText("Objects");
-        if (ImGui::BeginChild("##object_list", ImVec2(0.0f, 90.0f), ImGuiChildFlags_Borders))
-        {
-            for (std::size_t index = 0; index < m_scene.objects.size(); ++index)
-            {
-                const mukki::SceneObject& object = m_scene.objects[index];
-                char label[256];
-                std::snprintf(
-                    label,
-                    sizeof(label),
-                    "%s (%s)",
-                    object.name.c_str(),
-                    object.modelPath.c_str());
-                if (ImGui::Selectable(label, m_selectedObject == static_cast<int>(index)))
-                {
-                    m_selectedObject = static_cast<int>(index);
-                }
-            }
-        }
-        ImGui::EndChild();
-
-        if (m_selectedObject >= 0 && m_selectedObject < static_cast<int>(m_scene.objects.size()))
-        {
-            DrawObjectEditor(m_scene.objects[static_cast<std::size_t>(m_selectedObject)]);
-        }
-
-        DrawProbeSection();
 
         ImGui::SeparatorText("Lights");
         if (ImGui::BeginChild("##light_list", ImVec2(0.0f, 110.0f), ImGuiChildFlags_Borders))
@@ -796,12 +1386,239 @@ private:
         }
 
         DrawShadowSettings();
-        DrawEnvironmentSettings();
-        DrawCloudSettings();
         DrawGiSettings();
         DrawReflectionSettings();
 
         ImGui::End();
+    }
+
+    void DrawObjectsPhysicsWindow()
+    {
+        ImGui::Begin("Objects & Physics", &m_showObjectsPhysicsWindow);
+
+        ImGui::Text("Scene: %s", m_scene.name.empty() ? "(none)" : m_scene.name.c_str());
+        ImGui::Text(
+            "Objects: %zu   Lights: %zu",
+            m_scene.objects.size(),
+            m_scene.lights.size());
+        if (!m_sceneStatus.empty())
+        {
+            ImGui::TextWrapped("%s", m_sceneStatus.c_str());
+        }
+
+        if (ImGui::Button("Reload JSON -> bytecode"))
+        {
+            LoadSceneFromJson(
+                m_sceneSourcePath.empty() ? DefaultSceneJsonPath() : m_sceneSourcePath);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Save JSON"))
+        {
+            SaveSceneJson();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Compile bytecode"))
+        {
+            CompileSceneBinary();
+        }
+
+        ImGui::Checkbox("Show G-buffer window", &m_showGBuffer);
+        ImGui::SetItemTooltip(
+            "Shows the G-buffer debug tab (albedo, normals, position, motion vectors) in the\n"
+            "Stats/Scenes group.");
+
+        ImGui::SeparatorText("Objects");
+        if (ImGui::BeginChild("##object_list", ImVec2(0.0f, 90.0f), ImGuiChildFlags_Borders))
+        {
+            for (std::size_t index = 0; index < m_scene.objects.size(); ++index)
+            {
+                const mukki::SceneObject& object = m_scene.objects[index];
+                char label[256];
+                std::snprintf(
+                    label,
+                    sizeof(label),
+                    "%s (%s)",
+                    object.name.c_str(),
+                    object.modelPath.c_str());
+                if (ImGui::Selectable(label, m_selectedObject == static_cast<int>(index)))
+                {
+                    m_selectedObject = static_cast<int>(index);
+                }
+            }
+        }
+        ImGui::EndChild();
+
+        if (m_selectedObject >= 0 && m_selectedObject < static_cast<int>(m_scene.objects.size()))
+        {
+            DrawObjectEditor(m_scene.objects[static_cast<std::size_t>(m_selectedObject)]);
+        }
+
+        DrawProbeSection();
+
+        bool showProbeGizmos = m_renderer->AreProbeGizmosEnabled();
+        if (ImGui::Checkbox("Show probe gizmos", &showProbeGizmos))
+        {
+            m_renderer->SetGizmoView(m_renderer->AreLightGizmosEnabled(), showProbeGizmos);
+        }
+
+        DrawPhysicsSettings();
+
+        ImGui::End();
+    }
+
+    void DrawVolumetricsWindow()
+    {
+        ImGui::Begin("Volumetrics", &m_showVolumetricsWindow);
+        DrawEnvironmentSettings();
+        DrawCloudSettings();
+        ImGui::End();
+    }
+
+    void DrawFlightWindow()
+    {
+        ImGui::Begin("Flight", &m_showFlightWindow);
+
+        const bool hasPlane = m_planeObjectIndex >= 0;
+        bool enabled = m_flightEnabled;
+        if (ImGui::Checkbox("Flight mode (F)", &enabled))
+        {
+            SetFlightEnabled(enabled);
+        }
+        if (!hasPlane)
+        {
+            ImGui::SameLine();
+            ImGui::TextDisabled("(author \"playerPlane\" in the scene)");
+        }
+
+        ImGui::Text("Status: %s", m_flightStatus.empty() ? "-" : m_flightStatus.c_str());
+        ImGui::Text(
+            "Speed: %.0f m/s (%.0f km/h)",
+            static_cast<double>(m_plane.GetSpeed()),
+            static_cast<double>(m_plane.GetSpeed() * 3.6f));
+        ImGui::Text("Altitude: %.0f m", static_cast<double>(m_plane.GetPosition().y));
+        ImGui::Text("Throttle: %.0f %%", static_cast<double>(m_plane.GetThrottle() * 100.0f));
+        ImGui::Text("Bank: %.0f deg", static_cast<double>(glm::degrees(m_plane.GetBankRadians())));
+        ImGui::Text("Crashes: %d", m_crashCount);
+
+        if (ImGui::Button("Reset plane (R)"))
+        {
+            ResetPlane();
+        }
+        ImGui::SetItemTooltip("Respawns at the authored start pose and clears the crash state.");
+
+        ImGui::SeparatorText("Handling");
+        mukki::FlightSettings settings = m_plane.GetSettings();
+        bool changed = ImGui::SliderFloat("Max speed (m/s)", &settings.maxSpeed, 120.0f, 500.0f, "%.0f");
+        changed |= ImGui::SliderFloat("Pitch rate", &settings.pitchRate, 0.4f, 3.0f, "%.2f");
+        changed |= ImGui::SliderFloat("Roll rate", &settings.rollRate, 0.8f, 5.0f, "%.2f");
+        changed |= ImGui::SliderFloat("Yaw rate", &settings.yawRate, 0.2f, 2.0f, "%.2f");
+        changed |= ImGui::SliderFloat("Auto level", &settings.autoLevelGain, 0.0f, 2.0f, "%.2f");
+        changed |= ImGui::SliderFloat("Mouse stick gain", &m_flightMouseGain, 0.001f, 0.02f, "%.3f");
+        changed |= ImGui::SliderFloat("Stick return", &m_flightStickReturn, 0.5f, 8.0f, "%.1f");
+        if (changed)
+        {
+            m_plane.GetSettings() = settings;
+        }
+
+        ImGui::SeparatorText("Controls");
+        ImGui::TextUnformatted("Mouse: pitch / roll (captured cursor)");
+        ImGui::TextUnformatted("W/S: throttle, A/D: rudder");
+        ImGui::TextUnformatted("F: toggle flight mode, R: reset, Tab: free cursor");
+        ImGui::TextUnformatted(
+            "Hitting a building, the ground or the 12 km boundary respawns you.");
+        ImGui::End();
+    }
+
+    void DrawPhysicsSettings()
+    {
+        ImGui::SeparatorText("Physics (Box3D)");
+
+        mukki::PhysicsSettings settings = m_physics.GetSettings();
+        bool changed = ImGui::Checkbox("Physics enabled", &settings.enabled);
+        changed |= ImGui::DragFloat3("Gravity", &settings.gravity.x, 0.05f, -100.0f, 100.0f);
+        changed |= ImGui::SliderFloat("Step rate (Hz)", &settings.stepHz, 15.0f, 240.0f, "%.0f");
+        int subSteps = static_cast<int>(settings.subSteps);
+        if (ImGui::SliderInt("Sub-steps", &subSteps, 1, 8))
+        {
+            settings.subSteps = static_cast<std::uint32_t>(subSteps);
+            changed = true;
+        }
+        if (changed)
+        {
+            m_physics.SetSettings(settings);
+            // Mirror into the scene so Save JSON persists gravity and solver settings.
+            m_scene.physics.gravity = settings.gravity;
+            m_scene.physics.stepHz = settings.stepHz;
+            m_scene.physics.subSteps = settings.subSteps;
+        }
+
+        std::size_t staticCount = 0;
+        std::size_t dynamicCount = 0;
+        std::size_t kinematicCount = 0;
+        for (const mukki::CollisionBody& body : m_physics.GetBodies())
+        {
+            if (body.handle == 0)
+            {
+                continue;
+            }
+            switch (body.type)
+            {
+            case mukki::BodyType::Static:
+                ++staticCount;
+                break;
+            case mukki::BodyType::Dynamic:
+                ++dynamicCount;
+                break;
+            case mukki::BodyType::Kinematic:
+                ++kinematicCount;
+                break;
+            }
+        }
+        ImGui::Text(
+            "Bodies: %zu (static %zu, dynamic %zu, kinematic %zu)",
+            m_physics.GetBodyCount(),
+            staticCount,
+            dynamicCount,
+            kinematicCount);
+        ImGui::Text(
+            "Box3D memory: %.1f KiB",
+            static_cast<double>(m_physics.GetByteCount()) / 1024.0);
+
+        ImGui::SeparatorText("Static floor");
+        bool floorChanged = ImGui::Checkbox("Floor collider", &m_floor.enabled);
+        ImGui::SetItemTooltip(
+            "The ground collider dynamic bodies rest on. Disable it to drop them into the void.");
+        floorChanged |= ImGui::DragFloat("Floor top (Y)", &m_floor.topY, 0.05f, -1000.0f, 1000.0f, "%.2f");
+        floorChanged |= ImGui::DragFloat2("Floor center (XZ)", &m_floor.center.x, 0.1f, -5000.0f, 5000.0f, "%.1f");
+        floorChanged |= ImGui::DragFloat("Floor half X", &m_floor.halfExtentX, 0.5f, 0.5f, 10000.0f, "%.1f");
+        floorChanged |= ImGui::DragFloat("Floor half Z", &m_floor.halfExtentZ, 0.5f, 0.5f, 10000.0f, "%.1f");
+        floorChanged |= ImGui::DragFloat("Floor thickness", &m_floor.thickness, 0.05f, 0.1f, 100.0f, "%.2f");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Reset floor"))
+        {
+            ResetFloorFromSceneBounds();
+            floorChanged = true;
+        }
+        ImGui::SetItemTooltip("Fits the floor to the loaded scene bounds (top surface at the scene minimum Y).");
+        if (floorChanged)
+        {
+            UpdateFloorBody();
+        }
+
+        bool showPhysicsGizmos = m_renderer->ArePhysicsGizmosEnabled();
+        if (ImGui::Checkbox("Show collision gizmos", &showPhysicsGizmos))
+        {
+            m_renderer->SetPhysicsGizmoView(showPhysicsGizmos);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Rebuild bodies"))
+        {
+            RebuildPhysics();
+            m_sceneStatus = "physics bodies rebuilt";
+        }
+        ImGui::SetItemTooltip(
+            "Recreates every collider from the scene description and resets dynamic body poses.");
+        ImGui::TextDisabled("Gravity and step rate are saved with Save JSON; the floor is runtime only.");
     }
 
     void DrawReflectionSettings()
@@ -1329,18 +2146,41 @@ private:
     void DrawObjectEditor(mukki::SceneObject& object)
     {
         const std::size_t index = static_cast<std::size_t>(std::max(m_selectedObject, 0));
+        const bool dynamicBody = object.physics.body == mukki::ScenePhysicsBody::Dynamic;
         ImGui::Text("Model: %s", object.modelPath.c_str());
 
         bool changed = false;
         changed |= ImGui::DragFloat3("Object position", &object.position.x, 0.05f, -100.0f, 100.0f);
         changed |= ImGui::DragFloat3("Object rotation (deg)", &object.rotation.x, 0.5f, -360.0f, 360.0f);
+        if (dynamicBody)
+        {
+            ImGui::BeginDisabled();
+        }
         changed |= ImGui::DragFloat3("Object scale", &object.scale.x, 0.02f, 0.01f, 100.0f);
+        if (dynamicBody)
+        {
+            ImGui::EndDisabled();
+            ImGui::SetItemTooltip(
+                "Dynamic bodies bake the scale into their collider. Author halfExtents/radius\n"
+                "instead so the collider matches the visual.");
+        }
 
         if (changed)
         {
             if (index < m_renderer->GetSceneObjectCount())
             {
                 m_renderer->UpdateSceneObjectTransform(index, mukki::BuildObjectTransform(object));
+                if (dynamicBody)
+                {
+                    const std::uint32_t handle = FindBodyHandleForObject(index);
+                    if (handle != 0)
+                    {
+                        m_physics.TeleportBody(
+                            handle,
+                            object.position,
+                            mukki::BuildObjectRotation(object));
+                    }
+                }
                 m_sceneStatus = "object '" + object.name + "' updated";
             }
             else
@@ -1349,6 +2189,76 @@ private:
             }
         }
 
+        ImGui::SeparatorText("Physics collider");
+        bool physicsChanged = false;
+
+        static const char* kBodyNames[] = {"None", "Static", "Dynamic"};
+        int body = static_cast<int>(object.physics.body);
+        if (ImGui::Combo("Body", &body, kBodyNames, 3))
+        {
+            object.physics.body = static_cast<mukki::ScenePhysicsBody>(body);
+            physicsChanged = true;
+        }
+
+        static const char* kShapeNames[] = {"Box", "Sphere", "Capsule"};
+        int shape = static_cast<int>(object.physics.shape);
+        if (ImGui::Combo("Shape", &shape, kShapeNames, 3))
+        {
+            object.physics.shape = static_cast<mukki::ScenePhysicsShape>(shape);
+            physicsChanged = true;
+        }
+
+        switch (object.physics.shape)
+        {
+        case mukki::ScenePhysicsShape::Box:
+            physicsChanged |= ImGui::DragFloat3(
+                "Half extents (0 = fit)",
+                &object.physics.halfExtents.x,
+                0.02f,
+                0.0f,
+                100.0f);
+            break;
+        case mukki::ScenePhysicsShape::Sphere:
+            physicsChanged |= ImGui::DragFloat(
+                "Radius (0 = fit)",
+                &object.physics.radius,
+                0.02f,
+                0.0f,
+                100.0f,
+                "%.3f");
+            break;
+        case mukki::ScenePhysicsShape::Capsule:
+            physicsChanged |= ImGui::DragFloat(
+                "Radius (0 = fit)",
+                &object.physics.radius,
+                0.02f,
+                0.0f,
+                100.0f,
+                "%.3f");
+            physicsChanged |= ImGui::DragFloat(
+                "Height (0 = fit)",
+                &object.physics.height,
+                0.02f,
+                0.0f,
+                200.0f,
+                "%.3f");
+            break;
+        }
+        physicsChanged |= ImGui::DragFloat3("Collider offset", &object.physics.offset.x, 0.01f, -20.0f, 20.0f);
+        physicsChanged |= ImGui::DragFloat("Density", &object.physics.density, 5.0f, 0.0f, 100000.0f, "%.0f");
+        physicsChanged |= ImGui::DragFloat("Friction", &object.physics.friction, 0.005f, 0.0f, 1.0f, "%.3f");
+        physicsChanged |= ImGui::DragFloat("Restitution", &object.physics.restitution, 0.005f, 0.0f, 1.0f, "%.3f");
+
+        if (physicsChanged)
+        {
+            m_physicsDirty = true;
+        }
+        if (m_physicsDirty)
+        {
+            m_physicsDirty = false;
+            RebuildPhysics();
+            m_sceneStatus = "physics bodies rebuilt";
+        }
     }
 
     void DrawLightEditor(mukki::SceneLight& sceneLight)
@@ -1481,6 +2391,16 @@ private:
         m_debugTexturesRegistered = false;
     }
 
+    struct FloorSettings
+    {
+        bool enabled = true;
+        float topY = 0.0f;
+        glm::vec2 center{0.0f};
+        float halfExtentX = 50.0f;
+        float halfExtentZ = 50.0f;
+        float thickness = 1.0f;
+    };
+
     mukki::Camera m_camera{};
     mukki::FlyCameraController m_controller{};
     glm::mat4 m_previousViewProjection{1.0f};
@@ -1488,7 +2408,25 @@ private:
     std::unique_ptr<mukki::rhi::Device> m_device{};
     std::unique_ptr<mukki::DeferredRenderer> m_renderer{};
     mukki::vulkan::UiLayer m_ui{};
+    mukki::PhysicsWorld m_physics{};
     mukki::SceneDescription m_scene{};
+    FloorSettings m_floor{};
+    std::uint32_t m_groundBody = 0;
+    mukki::PlaneController m_plane{};
+    glm::vec3 m_planeStartPosition{0.0f};
+    glm::quat m_planeStartRotation{1.0f, 0.0f, 0.0f, 0.0f};
+    glm::vec3 m_chaseCameraPosition{0.0f};
+    std::vector<glm::vec3> m_collisionBoundsMin{};
+    std::vector<glm::vec3> m_collisionBoundsMax{};
+    std::string m_flightStatus{};
+    float m_flightStickX = 0.0f;
+    float m_flightStickY = 0.0f;
+    float m_flightMouseGain = 0.006f;
+    float m_flightStickReturn = 2.5f;
+    float m_crashTimer = 0.0f;
+    int m_planeObjectIndex = -1;
+    int m_crashCount = 0;
+    std::string m_iniPath{};
     std::vector<std::filesystem::path> m_sceneFiles{};
     std::filesystem::path m_scenesRoot{};
     std::filesystem::path m_pendingModelPath{};
@@ -1514,11 +2452,22 @@ private:
     int m_maxFrames = 0;
     int m_frameCount = 0;
     bool m_sceneLightsDirty = false;
+    bool m_physicsDirty = false;
     bool m_debugTexturesRegistered = false;
     bool m_renderedFrame = false;
     bool m_cursorReleased = false;
-    bool m_showGBuffer = false;
+    bool m_showScenesWindow = true;
+    bool m_showGiLightsWindow = true;
+    bool m_showObjectsPhysicsWindow = true;
+    bool m_showVolumetricsWindow = true;
+    bool m_showFlightWindow = true;
+    bool m_showGBuffer = true;
     bool m_showDemoWindow = false;
+    bool m_layoutInitialized = false;
+    bool m_hasSavedLayout = false;
+    bool m_resetLayoutRequested = false;
+    bool m_flightEnabled = false;
+    bool m_crashed = false;
 };
 
 } // namespace

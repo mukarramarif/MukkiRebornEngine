@@ -46,6 +46,13 @@ public:
         float length,
         const glm::vec4& color);
 
+    // Concatenates the line list of another builder (for example externally supplied physics
+    // collider wireframes).
+    void Append(const DebugLines& other)
+    {
+        m_vertices.insert(m_vertices.end(), other.m_vertices.begin(), other.m_vertices.end());
+    }
+
     void AddPointLight(const glm::vec3& position, float range, const glm::vec4& color);
     void AddSpotLight(
         const glm::vec3& position,

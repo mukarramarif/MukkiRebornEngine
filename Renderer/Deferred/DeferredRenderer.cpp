@@ -390,6 +390,7 @@ void DeferredRenderer::Shutdown()
     m_gbufferFragmentShader.reset();
     m_gbufferVertexShader.reset();
     m_sceneDrawItems.clear();
+    m_groundDrawItemValid = false;
     m_gbufferSecondaries.clear();
     m_shadowSecondaries.clear();
     m_tlas.clear();
@@ -695,6 +696,8 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
     const glm::vec3 fittedMax = glm::vec3{fit * glm::vec4{model.maxBounds, 1.0f}};
     resources->fittedBounds.center = (fittedMin + fittedMax) * 0.5f;
     resources->fittedBounds.radius = glm::length(fittedMax - fittedMin) * 0.5f;
+    resources->fittedMin = glm::min(fittedMin, fittedMax);
+    resources->fittedMax = glm::max(fittedMin, fittedMax);
 
     const auto createTextureFromImage = [this, &model](int imageIndex, rhi::Format format) {
         std::unique_ptr<rhi::Texture> texture{};
@@ -1206,6 +1209,46 @@ bool DeferredRenderer::GetSceneBounds(glm::vec3& outMin, glm::vec3& outMax) cons
     return true;
 }
 
+bool DeferredRenderer::GetSceneObjectFittedBounds(
+    std::size_t objectIndex,
+    glm::vec3& outMin,
+    glm::vec3& outMax) const
+{
+    if (objectIndex >= m_objectInstances.size())
+    {
+        return false;
+    }
+
+    const SceneObjectInstance& sceneObject = m_objectInstances[objectIndex];
+    MRE_ASSERT(sceneObject.modelIndex < m_models.size(), "Scene object model index out of range");
+    const ModelResources& model = *m_models[sceneObject.modelIndex];
+    const glm::mat4 world =
+        glm::scale(glm::mat4{1.0f}, glm::vec3{m_modelScale}) * sceneObject.transform;
+
+    glm::vec3 boundsMin{std::numeric_limits<float>::max()};
+    glm::vec3 boundsMax{std::numeric_limits<float>::lowest()};
+    for (int corner = 0; corner < 8; ++corner)
+    {
+        const glm::vec3 local{
+            (corner & 1) != 0 ? model.fittedMax.x : model.fittedMin.x,
+            (corner & 2) != 0 ? model.fittedMax.y : model.fittedMin.y,
+            (corner & 4) != 0 ? model.fittedMax.z : model.fittedMin.z};
+        const glm::vec3 worldCorner = glm::vec3{world * glm::vec4{local, 1.0f}};
+        boundsMin = glm::min(boundsMin, worldCorner);
+        boundsMax = glm::max(boundsMax, worldCorner);
+    }
+
+    outMin = boundsMin;
+    outMax = boundsMax;
+    // A degenerate (for example planar) model still needs a usable collider bound.
+    const glm::vec3 minimumExtent{0.01f};
+    const glm::vec3 center = (outMin + outMax) * 0.5f;
+    const glm::vec3 halfExtents = glm::max((outMax - outMin) * 0.5f, minimumExtent);
+    outMin = center - halfExtents;
+    outMax = center + halfExtents;
+    return true;
+}
+
 void DeferredRenderer::ClearModelInstances()
 {
     m_modelDrawItems.clear();
@@ -1241,6 +1284,47 @@ void DeferredRenderer::SetModelScale(float scale)
     MRE_ASSERT(scale > 0.0f, "Model scale must be greater than zero");
     m_modelScale = std::clamp(scale, 0.01f, 100.0f);
     ApplyModelScale();
+    ++m_geometryRevision;
+}
+
+void DeferredRenderer::SetGroundPlaneExtent(float halfExtent)
+{
+    MRE_ASSERT(halfExtent > 0.0f, "Ground plane extent must be greater than zero");
+    m_groundPlaneExtent = std::clamp(halfExtent, 1.0f, 100000.0f);
+    if (!m_groundDrawItemValid)
+    {
+        return;
+    }
+
+    m_groundDrawItem.pushConstants.model =
+        glm::scale(glm::mat4{1.0f}, glm::vec3{m_groundPlaneExtent / 10.0f});
+    if (m_groundVisible && !m_sceneDrawItems.empty())
+    {
+        m_sceneDrawItems.front().pushConstants.model = m_groundDrawItem.pushConstants.model;
+    }
+    ++m_geometryRevision;
+}
+
+void DeferredRenderer::SetGroundVisible(bool visible)
+{
+    if (visible == m_groundVisible)
+    {
+        return;
+    }
+    m_groundVisible = visible;
+    if (!m_groundDrawItemValid)
+    {
+        return;
+    }
+
+    if (visible)
+    {
+        m_sceneDrawItems.insert(m_sceneDrawItems.begin(), m_groundDrawItem);
+    }
+    else if (!m_sceneDrawItems.empty())
+    {
+        m_sceneDrawItems.erase(m_sceneDrawItems.begin());
+    }
     ++m_geometryRevision;
 }
 
@@ -2743,7 +2827,8 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
 
 void DeferredRenderer::RecordDebugLines(rhi::CommandList& commandList, const FrameView& view)
 {
-    if (m_debugLinePipeline == nullptr || (!m_showLightGizmos && !m_showProbeGizmos))
+    if (m_debugLinePipeline == nullptr ||
+        (!m_showLightGizmos && !m_showProbeGizmos && !m_showPhysicsGizmos))
     {
         return;
     }
@@ -2822,6 +2907,11 @@ void DeferredRenderer::RecordDebugLines(rhi::CommandList& commandList, const Fra
                     glm::vec4{irradiance, 1.0f});
             }
         }
+    }
+
+    if (m_showPhysicsGizmos)
+    {
+        lines.Append(m_physicsDebugLines);
     }
 
     if (lines.Empty())
@@ -2938,11 +3028,11 @@ void DeferredRenderer::BuildShadowCullItems()
 {
     m_shadowCullItems.clear();
 
-    // The ground plane spans 20x20 world units around the origin.
-    constexpr float kGroundRadius = 14.15f;
+    // The ground plane spans 20x20 world units at its default extent, scaled by SetGroundPlaneExtent.
+    const float groundRadius = 14.15f * (m_groundPlaneExtent / 10.0f);
     for (const DrawItem& item : m_sceneDrawItems)
     {
-        m_shadowCullItems.push_back(ShadowCullItem{&item, glm::vec3{0.0f}, kGroundRadius});
+        m_shadowCullItems.push_back(ShadowCullItem{&item, glm::vec3{0.0f}, groundRadius});
     }
 
     for (const SceneObjectInstance& instance : m_objectInstances)
@@ -3424,7 +3514,7 @@ bool DeferredRenderer::CreateScene()
     ground.indexBuffer = m_planeIndexBuffer;
     ground.indexCount = static_cast<std::uint32_t>(std::size(kPlaneIndices));
     ground.firstIndex = 0;
-    ground.pushConstants.model = glm::mat4{1.0f};
+    ground.pushConstants.model = glm::scale(glm::mat4{1.0f}, glm::vec3{m_groundPlaneExtent / 10.0f});
     ground.pushConstants.baseColorFactor = glm::vec4{0.35f, 0.35f, 0.38f, 1.0f};
     ground.pushConstants.params = glm::vec4{0.9f, 0.0f, 0.0f, 0.0f};
     const std::uint32_t whiteIndex = m_whiteTexture->GetBindlessIndex();
@@ -3465,7 +3555,12 @@ bool DeferredRenderer::CreateScene()
         m_blasDirty = true;
     }
 
-    m_sceneDrawItems.push_back(ground);
+    m_groundDrawItem = ground;
+    m_groundDrawItemValid = true;
+    if (m_groundVisible)
+    {
+        m_sceneDrawItems.push_back(ground);
+    }
 
     MRE_ASSERT(m_planeVertexBuffer != nullptr, "Failed to create the ground plane vertex buffer");
     return true;

@@ -72,13 +72,23 @@ void computeMain(uint3 dispatchThreadId : SV_DispatchThreadID)
                 frame);
         }
 
-        sumRadiance += radiance;
-        sumDirectional += radiance * direction;
+        // A single non-finite ray must not poison the probe SH. Sources are floating point edge
+        // cases in the shared hit shading (degenerate normals, retroreflection half vectors).
+        if (all(isfinite(radiance)))
+        {
+            sumRadiance += radiance;
+            sumDirectional += radiance * direction;
+        }
     }
 
     const float inverseRays = 1.0 / float(rayCount);
     const float3 sh0 = sumRadiance * inverseRays;
     const float3 sh1 = sumDirectional * (2.0 * inverseRays);
+    if (!all(isfinite(sh0)) || !all(isfinite(sh1)))
+    {
+        gProbeOut[probeIndex] = probe;
+        return;
+    }
 
     const float blend = 1.0 - hysteresis;
     GpuGiProbe result = probe;

@@ -270,7 +270,12 @@ SurfaceSample LoadSurface(
     const float3 n0 = LoadFloat3(vertexBuffer, i0 * stride + 12u);
     const float3 n1 = LoadFloat3(vertexBuffer, i1 * stride + 12u);
     const float3 n2 = LoadFloat3(vertexBuffer, i2 * stride + 12u);
-    const float3 geometricNormal = normalize(n0 * w0 + n1 * barycentrics.x + n2 * barycentrics.y);
+    const float3 normalSum = n0 * w0 + n1 * barycentrics.x + n2 * barycentrics.y;
+    const float normalLengthSquared = dot(normalSum, normalSum);
+    // Degenerate normals would turn every downstream term into NaN; fall back to a normal facing
+    // the ray origin.
+    const float3 geometricNormal =
+        normalLengthSquared > 1e-8 ? normalSum * rsqrt(normalLengthSquared) : -rayDirection;
 
     const float2 uv0 = LoadFloat2(vertexBuffer, i0 * stride + 24u);
     const float2 uv1 = LoadFloat2(vertexBuffer, i1 * stride + 24u);

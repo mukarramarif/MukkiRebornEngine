@@ -1,0 +1,11 @@
+Model Information:
+* title:	Aviation, Aircraft, Airplane model
+* source:	https://sketchfab.com/3d-models/aviation-aircraft-airplane-model-5e888f8b4b4747428c58a0cdbd03ba31
+* author:	Pixel (https://sketchfab.com/stefan.lengyel1)
+
+Model License:
+* license type:	CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+* requirements:	Author must be credited. Commercial use is allowed.
+
+If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
+This work is based on "Aviation, Aircraft, Airplane model" (https://sketchfab.com/3d-models/aviation-aircraft-airplane-model-5e888f8b4b4747428c58a0cdbd03ba31) by Pixel (https://sketchfab.com/stefan.lengyel1) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)

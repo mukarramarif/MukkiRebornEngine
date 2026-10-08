@@ -108,9 +108,11 @@ lighting (a sample lives in `AssetLibrary/lakeside_sunrise_2k.hdr`).
 Controls: `WASD`/`QE` to move, mouse to look, `Shift` to move faster, `Tab` to toggle the cursor for
 UI interaction (or hold `Left Alt`), `Esc` to quit.
 
-The sandbox has a scene browser window listing the JSON scenes in `Sandbox/Scenes`, a scene window
-with the light editor, a G-buffer debug window, and an ImGui demo window. glTF objects loaded from a
-scene are auto-fitted to the ground plane.
+The sandbox uses a docked ImGui layout persisted next to the executable (`imgui.ini`): `Stats`,
+`Scenes` and `G-buffer` tab together in the left group, while `GI & Lights`, `Objects & Physics`,
+`Volumetrics` (environment + clouds) and `Flight` tab together in the main group. `View -> Reset
+layout` in the `Stats` menu restores the default layout; stale layouts from older window sets are
+rebuilt automatically. glTF objects loaded from a scene are auto-fitted to the ground plane.
 
 ## Rendering pipeline
 
@@ -259,7 +261,17 @@ A minimal scene:
   use `range`, directional lights ignore `position`/`range`, and point lights ignore `direction`.
 - Up to 256 lights (`kMaxLights`) and any number of glTF objects are supported. Models referenced
   more than once are loaded once and instanced.
-- `Sandbox/Scenes/demo.scene.json` is a complete example with 7 glTF objects and 25 lights.
+- Optional per-object `physics` blocks make an object a static or dynamic rigid body; see
+  [Physics](#physics).
+- The optional scene root `environment` block (`{"map": "...", "intensity": 1.0}`) loads an HDR
+  environment map (resolved like model paths), and `clouds` overrides the volumetric cloud settings
+  (same fields as the `Volumetrics` UI). Scenes without these blocks keep the current renderer
+  settings, so `--env` still works for older scenes.
+- `playerPlane` names the scene object that enters flight mode on load; see the
+  [Airplane demo](#airplane-demo).
+- `Sandbox/Scenes/demo.scene.json` is a complete example with 11 glTF objects (including two dynamic
+  bodies and one static body) and 10 lights; `Sandbox/Scenes/flight.scene.json` is the playable
+  airplane demo.
 
 ### Compiling
 
@@ -292,6 +304,91 @@ then loads only that bytecode:
 .\build\windows-debug\Debug\mukki_sandbox.exe --scene Sandbox\Scenes\demo.scene.json --frames 240
 ```
 
+### Physics
+
+Physics is optional per scene object and runs on [Box3D](https://github.com/erincatto/box3d)
+(vendored through `overlay-ports/box3d`, stepped single threaded on the game thread). An object
+without a `physics` block is render-only, and a ground box collider is created by default at the
+bottom of the scene bounds.
+
+```json
+{
+  "physics": { "gravity": [0.0, -9.81, 0.0], "stepHz": 60.0, "subSteps": 4 },
+  "objects": [
+    {
+      "name": "Crate",
+      "model": "Box/glTF/Box.gltf",
+      "position": [0.0, 4.0, 0.0],
+      "physics": { "body": "dynamic", "shape": "box", "density": 400.0, "friction": 0.6 }
+    },
+    {
+      "name": "Pillar",
+      "model": "BoomBox/glTF/BoomBox.gltf",
+      "position": [-2.0, 1.5, 0.0],
+      "physics": { "body": "static", "shape": "box" }
+    }
+  ]
+}
+```
+
+- `body` is `none` (default), `static` or `dynamic`; `shape` is `box`, `sphere` or `capsule`.
+- With zero `halfExtents`/`radius`/`height` the collider is fitted to the loaded model bounds (a
+  single box for boxes, the max extent as radius for spheres/capsules); set them to override.
+  `offset` moves the collider in body local space and `density`/`friction`/`restitution` set the
+  material.
+- The optional scene root `physics` block authors gravity, the fixed step rate (`stepHz`, 15-240)
+  and Box3D `subSteps` (1-8). All three are also editable in the `Objects & Physics` tab and are
+  written back by `Save JSON`.
+- Dynamic bodies are stepped once per frame and their transforms are written back into the scene
+  objects (post-step sync, no render interpolation); editing a dynamic object in the UI teleports it
+  and clears its velocity. Scale edits are disabled for dynamic bodies because the scale is baked
+  into the collider.
+- `Rebuild bodies` recreates every collider from the current scene description and `Show collision
+  gizmos` draws collider wireframes (green static, cyan dynamic) through the debug line pass.
+- The `Static floor` controls adjust the default ground collider at runtime: enable/disable, top
+  surface height (Y), XZ center, half extents and thickness. `Reset floor` fits it to the loaded
+  scene bounds again; only the floor collider is recreated while editing so moving bodies keep
+  simulating. The floor is runtime only (not serialized into the scene JSON).
+- Scene files with physics require scene binary version 5+ (`MRES`); older files still load with
+  physics defaults.
+
+### Airplane demo
+
+`Sandbox/Scenes/flight.scene.json` is a playable demo: a low-poly glass skyscraper city under the
+`lakeside_sunrise_2k.hdr` environment, a volumetric cloud layer you can climb into (0.9-2.8 km) and
+a controllable airplane. The scene sets its own environment, clouds and `playerPlane`, so flight
+mode enables automatically when it loads:
+
+```powershell
+.\build\windows-debug\Debug\mukki_sandbox.exe --scene Sandbox\Scenes\flight.scene.json
+```
+
+Controls while flying:
+
+| Input | Action |
+| --- | --- |
+| Mouse | pitch / roll (the cursor is captured; `Tab` frees it for the UI) |
+| `W` / `S` | throttle up / down |
+| `A` / `D` | rudder left / right |
+| `R` | reset the plane to its spawn pose |
+| `F` | toggle flight mode / free camera |
+
+The `Flight` tab shows speed, altitude, throttle, bank and the crash counter, and exposes the
+handling sliders (max speed, pitch/roll/yaw rates, auto-level, mouse stick gain, stick return).
+
+Crashing into a building, the ground or the 12 km boundary freezes the plane and respawns it after
+a short delay; the crash counter tracks the attempts. Collision uses the fitted building bounds, so
+the estimate is slightly conservative. The demo ground is the renderer's built-in plane scaled to
+9 km (`DeferredRenderer::SetGroundPlaneExtent`), and dynamic bodies keep simulating under Box3D.
+
+Both demo assets come from Sketchfab under CC-BY-4.0 and live under `AssetLibrary/`:
+
+- "Aviation, Aircraft, Airplane model" by Pixel (https://sketchfab.com/stefan.lengyel1)
+- "Skyscraper with interior with animation video" (see `AssetLibrary/skyscraper_with_interior_with_animation_video/license.txt`)
+
+The volumetric clouds are composited on sky pixels only, so a cloud in front of a building does not
+veil it; flying through clouds against the sky works as expected. There is no audio.
+
 ### Shadows
 
 The renderer implements shadow mapping for all light types:
@@ -301,9 +398,11 @@ The renderer implements shadow mapping for all light types:
   light with `"castShadows": true` (JSON, default `true`) is used.
 - **Spot**: up to 4 perspective shadow maps (1024x1024) in a `Texture2DArray`; the projection
   covers the light cone plus a small margin.
-- **Point**: up to 2 lights, each with six 512x512 perspective faces packed into a 2D atlas
-  (1536x2048). The lighting pass picks the face from the major axis of the light-to-fragment
-  vector and filters inside the atlas tile.
+- **Point**: up to 4 lights, each with its own 512x512x6 depth map (six cube faces as array
+  layers). The lighting pass picks the face from the major axis of the light-to-fragment vector
+  and filters inside it. With `Dynamic point shadows` (default on) a light's map is only
+  re-rendered when the light moves/changes or the scene geometry changes, so static lights keep
+  their cached map and moving lights update every frame.
 - All shadow views are rendered in one shadow pass, recorded into secondary command buffers on
   worker threads like the G-buffer pass. Spot and point views cull objects by light range using
   per-instance bounding spheres.
@@ -316,9 +415,9 @@ The renderer implements shadow mapping for all light types:
   G-buffer and the lighting pass reads the resulting full-resolution visibility mask instead of the
   cascades. Spot and point lights keep using shadow maps.
 
-The `Scene` window exposes `Enabled`, `Distance`, `Depth bias` and `Normal bias` sliders for
-tuning, and every light editor has a `Casts shadows` checkbox (subject to the spot/point slot
-budgets above).
+The `Scene` window exposes `Enabled`, `Distance`, `Depth bias`, `Normal bias` and
+`Dynamic point shadows` controls, and every light editor has a `Casts shadows` checkbox (subject
+to the spot/point slot budgets above).
 
 ### Global illumination
 
@@ -425,6 +524,7 @@ in-memory edits to `<exe>\scenes\<name>.mres`, and `Save JSON` dumps them back t
 - `Application/` - windowing, input, keybinds, camera, ImGui styles
 - `Assets/` - asset loading (glTF via tinygltf, KTX2 planned)
 - `Core/` - engine core (version, time)
+- `Physics/` - Box3D rigid body world (single threaded, fixed-step accumulator)
 - `Renderer/RHI/` - vendor-agnostic render hardware interface (device, command lists, resources)
 - `Renderer/Vulkan/` - Vulkan backend implementation
 - `Renderer/Debug/` - world-space debug line builder (light/probe gizmos)
@@ -436,6 +536,7 @@ in-memory edits to `<exe>\scenes\<name>.mres`, and `Save JSON` dumps them back t
 - `Scene/` - scene description, JSON authoring (nlohmann/json) and `MRES` bytecode
 - `Tools/` - command line tools (`mukki_scene_compiler`)
 - `ThirdParty/` - submodules (glTF sample models)
+- `overlay-ports/` - local vcpkg ports (tinygltf, box3d)
 - `Utilities/` - logging, asserts, future containers and allocators
 - `Tests/` - GoogleTest unit tests
 - `Sandbox/` - sandbox executable and `Scenes/demo.scene.json`
