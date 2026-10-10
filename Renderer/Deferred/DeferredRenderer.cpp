@@ -3932,7 +3932,8 @@ void DeferredRenderer::UpdateUniforms(std::uint32_t frameIndex, const FrameView&
     m_sceneUniform.screenSize = glm::vec4{
         static_cast<float>(m_gbuffer.GetWidth()),
         static_cast<float>(m_gbuffer.GetHeight()),
-        m_clusterDebugView ? 1.0f : 0.0f,
+        // z: debug view selection (0 = lit, 1 = cluster light count heatmap, 2 = GI only).
+        m_giDebugView ? 2.0f : (m_clusterDebugView ? 1.0f : 0.0f),
         IsPerPixelGiActive() ? 1.0f : 0.0f};
     // ambientColor.w carries the active GI probe count to the lighting pass (0 disables them).
     m_sceneUniform.ambientColor.w =
@@ -4176,6 +4177,33 @@ bool DeferredRenderer::IsProbeGiActive() const
     return m_giSettings.enabled && m_giSettings.useProbes &&
            m_device != nullptr && m_device->IsRayTracingSupported() &&
            m_giProbePipeline != nullptr && !m_giProbeData.empty();
+}
+
+bool DeferredRenderer::ReadGiProbes(std::vector<GpuGiProbe>& out)
+{
+    out.clear();
+    if (m_giProbeBuffer == nullptr || m_giProbeData.empty() || m_device == nullptr)
+    {
+        return false;
+    }
+
+    m_device->WaitIdle();
+    out.resize(m_giProbeData.size());
+    if (!m_giProbeBuffer->Read(out.data(), out.size() * sizeof(GpuGiProbe)))
+    {
+        return false;
+    }
+
+    // Keep the CPU copy's SH current for the debug gizmos; the positions stay untouched and the
+    // data is not re-uploaded (the GPU owns the accumulated coefficients).
+    for (std::size_t index = 0; index < m_giProbeData.size(); ++index)
+    {
+        m_giProbeData[index].sh0 = out[index].sh0;
+        m_giProbeData[index].shX = out[index].shX;
+        m_giProbeData[index].shY = out[index].shY;
+        m_giProbeData[index].shZ = out[index].shZ;
+    }
+    return true;
 }
 
 bool DeferredRenderer::IsPerPixelGiActive() const

@@ -401,9 +401,12 @@ float4 fragmentMain(VertexOutput input) : SV_Target
     }
 
     // Ambient/indirect diffuse: SH irradiance from the environment, or the flat ambient fallback.
+    // `color` accumulates the indirect signal; direct light goes into `directColor` so the GI-only
+    // debug view can show the indirect part alone.
     float3 color = gScene.skyParams.x > 0.5
                        ? EvaluateSkySh(gScene.skySh, normal) * albedo * (1.0 - metalness) * surfaceWeight
                        : gScene.ambientColor.rgb * albedo * surfaceWeight;
+    float3 directColor = 0.0;
 
     const float shadowFactor = sampleShadowFactor(worldPosition.xyz, normal, int2(input.position.xy));
 
@@ -411,7 +414,7 @@ float4 fragmentMain(VertexOutput input) : SV_Target
     const uint clusterBase = clusterIndex * kMaxLightsPerCluster;
     const uint clusterLightCount = min(gClusterCounts[clusterIndex], kMaxLightsPerCluster);
 
-    if (gScene.screenSize.z > 0.5)
+    if (gScene.screenSize.z > 0.5 && gScene.screenSize.z < 1.5)
     {
         const uint rawCount = gClusterCounts[clusterIndex];
         if (rawCount >= kMaxLightsPerCluster)
@@ -478,25 +481,25 @@ float4 fragmentMain(VertexOutput input) : SV_Target
         const float nDotL = max(dot(normal, lightDirection), 0.0);
         if (nDotL > 0.0)
         {
-            color += EvaluateCookTorrance(
-                         albedo,
-                         f0,
-                         metalness,
-                         roughness,
-                         normal,
-                         viewDirection,
-                         lightDirection,
-                         radiance) *
-                     surfaceWeight;
-            color += EvaluateSheenBRDF(
-                         sheenColor,
-                         sheenRoughness,
-                         normal,
-                         viewDirection,
-                         lightDirection,
-                         radiance,
-                         nDotL) *
-                     surfaceWeight;
+            directColor += EvaluateCookTorrance(
+                               albedo,
+                               f0,
+                               metalness,
+                               roughness,
+                               normal,
+                               viewDirection,
+                               lightDirection,
+                               radiance) *
+                           surfaceWeight;
+            directColor += EvaluateSheenBRDF(
+                               sheenColor,
+                               sheenRoughness,
+                               normal,
+                               viewDirection,
+                               lightDirection,
+                               radiance,
+                               nDotL) *
+                           surfaceWeight;
         }
     }
 
@@ -554,5 +557,12 @@ float4 fragmentMain(VertexOutput input) : SV_Target
                  gScene.reflectionParams.x;
     }
 
-    return float4(acesTonemap(color + emissive), 1.0);
+    // GI-only debug view: the indirect signal (ambient SH/IBL diffuse, traced indirect diffuse or
+    // probes and reflections) without direct lights or emissive.
+    if (gScene.screenSize.z > 1.5)
+    {
+        return float4(acesTonemap(color), 1.0);
+    }
+
+    return float4(acesTonemap(color + directColor + emissive), 1.0);
 }

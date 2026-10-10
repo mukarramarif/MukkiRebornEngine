@@ -160,6 +160,19 @@ public:
     void SetClusterDebugView(bool enabled) { m_clusterDebugView = enabled; }
     [[nodiscard]] bool IsClusterDebugViewEnabled() const { return m_clusterDebugView; }
 
+    // Debug view that shows only the indirect (GI) lighting: ambient SH/IBL diffuse, the traced
+    // indirect diffuse (per-pixel or probes) and the traced reflections, without direct lights.
+    void SetGiDebugView(bool enabled) { m_giDebugView = enabled; }
+    [[nodiscard]] bool IsGiDebugViewEnabled() const { return m_giDebugView; }
+
+    // True when the GI trace is currently replaced by the irradiance probes.
+    [[nodiscard]] bool IsProbeGiActive() const;
+
+    // Reads back the GPU-resident irradiance probe coefficients (waits for the device to be idle).
+    // The CPU probe copy is refreshed so the probe gizmos reflect the accumulated SH (including
+    // the punctual-light contribution). Returns false when there are no probes or no probe buffer.
+    [[nodiscard]] bool ReadGiProbes(std::vector<GpuGiProbe>& out);
+
     // World space debug gizmos: wireframe markers for lights and world space GI probes.
     void SetGiProbes(std::span<const GiProbe> probes);
     void SetGizmoView(bool showLights, bool showProbes)
@@ -444,7 +457,6 @@ private:
     [[nodiscard]] bool IsRtShadowActive() const;
     bool CreateGiProbeResources(rhi::Device& device);
     void RecordGiProbes(rhi::CommandList& commandList, std::uint32_t frameIndex);
-    [[nodiscard]] bool IsProbeGiActive() const;
     [[nodiscard]] bool IsPerPixelGiActive() const;
     bool CreateReflectionResources(rhi::Device& device);
     void UpdateReflectionUniform(std::uint32_t frameIndex);
@@ -665,6 +677,7 @@ private:
     std::uint32_t m_secondaryBatchCount = 1;
     bool m_lightingSetsDirty = true;
     bool m_clusterDebugView = false;
+    bool m_giDebugView = false;
     bool m_initialized = false;
 };
 

@@ -148,6 +148,11 @@ public:
     [[nodiscard]] virtual std::uint64_t GetDeviceAddress() const = 0;
     virtual void Write(const void* data, std::uint64_t size, std::uint64_t offset = 0) = 0;
 
+    // Reads back host-visible contents (debug UI, diagnostics). Returns false when the buffer is
+    // not host visible or the request is out of range. Wait for the device to be idle first for
+    // GPU-written data.
+    [[nodiscard]] virtual bool Read(void* data, std::uint64_t size, std::uint64_t offset = 0) = 0;
+
 protected:
     Buffer() = default;
 };

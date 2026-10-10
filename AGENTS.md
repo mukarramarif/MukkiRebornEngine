@@ -188,6 +188,19 @@ must not expose backend types, and Vulkan types may only appear under `Renderer/
   the probes (binding 14, count in `SceneUniform.ambientColor.w`) and the per-pixel trace + SVGF
   denoiser are skipped so indirect is not double counted (`IsPerPixelGiActive`). `gi_shading.slang`
   is an include, not a standalone shader; keep `GiUniform` in sync across all gi_*.slang files.
+  `SceneUniform.screenSize.z` selects the lighting debug view: 0 = lit, 1 = cluster light count
+  heatmap (`SetClusterDebugView`), 2 = GI only (`SetGiDebugView`: ambient SH/IBL diffuse, indirect
+  or probes and reflections, no direct/emissive). `DeferredRenderer::ReadGiProbes` waits idle and
+  reads the GPU probe buffer back via `rhi::Buffer::Read`; the sandbox rebuilds a 32x16-per-probe
+  equirectangular SH irradiance atlas (`R8G8B8A8Srgb`) on a timer and shows it in the probe UI,
+  retiring old textures for a few frames before releasing them (ImGui descriptors must outlive the
+  frames that referenced them). Non-finite ray results are skipped in `gi_probes.comp.slang` /
+  `gi_trace.comp.slang`, and the shared BRDF guards degenerate normalizations (retroreflection
+  half vector, zero-length interpolated normals) because a single NaN ray would permanently poison
+  a probe (hysteresis) and blacken the probe-blended scene. Probe placement helpers: `Fill scene`
+  covers the whole scene bounds and `Fill target` (or the object editor's `Fill probes inside`) a
+  single object's `GetSceneObjectFittedBounds` box (e.g. a Sponza interior), both Halton-distributed
+  with inset and vertical-bottom/top sliders (`FillProbesInBounds` in the sandbox).
 - Global illumination: optional hardware ray tracing (`VK_KHR_acceleration_structure`,
   `VK_KHR_ray_query`, `VK_KHR_deferred_host_operations`; `Device::IsRayTracingSupported()`). The RT
   entry points are loaded manually by `Renderer/Vulkan/Core/VkRayTracingDispatch` because the Vulkan

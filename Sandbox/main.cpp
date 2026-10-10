@@ -63,7 +63,7 @@ const char* LightTypeLabel(mukki::LightType type)
 }
 
 // Chase camera offset in airplane local space (behind = +Z, above = +Y, in metres).
-constexpr glm::vec3 kChaseLocalOffset{0.0f, 3.2f, 10.5f};
+constexpr glm::vec3 kChaseLocalOffset{0.0f, 1.4f, 2.0f};
 
 
 void DrawTexturePreview(const char* label, ImTextureID textureId, float width, float aspect)
@@ -147,6 +147,10 @@ protected:
             RequestExit();
             return;
         }
+
+        const mukki::rhi::Extent2D renderExtent = m_device->GetSwapchainInfo().extent;
+        m_renderExtentWidth = renderExtent.width;
+        m_renderExtentHeight = renderExtent.height;
 
         if (!m_ui.Init(*m_device, GetWindow().GetHandle()))
         {
@@ -296,6 +300,7 @@ protected:
 
         m_physics.Step(deltaTime);
         SyncDynamicBodies();
+        UpdateProbeReadback(deltaTime);
         if (m_renderer->ArePhysicsGizmosEnabled())
         {
             mukki::DebugLines lines{};
@@ -308,6 +313,8 @@ protected:
             const std::uint32_t width = static_cast<std::uint32_t>(GetWindow().GetWidth());
             const std::uint32_t height = static_cast<std::uint32_t>(GetWindow().GetHeight());
 
+            m_renderExtentWidth = width;
+            m_renderExtentHeight = height;
             ApplyCameraPerspective();
             m_device->Resize(mukki::rhi::Extent2D{width, height});
             m_renderer->Resize(width, height);
@@ -342,6 +349,20 @@ protected:
         if (!m_device->BeginFrame())
         {
             return;
+        }
+
+        // The window can resize between the update and the frame begin (the swapchain then
+        // recreates inside BeginFrame). Keep the G-buffer and the ImGui debug textures in sync so
+        // the depth attachment always matches the swapchain render area.
+        const mukki::rhi::Extent2D swapchainExtent = m_device->GetSwapchainInfo().extent;
+        if (swapchainExtent.width != m_renderExtentWidth ||
+            swapchainExtent.height != m_renderExtentHeight)
+        {
+            m_renderExtentWidth = swapchainExtent.width;
+            m_renderExtentHeight = swapchainExtent.height;
+            m_renderer->Resize(swapchainExtent.width, swapchainExtent.height);
+            ReleaseDebugTextures();
+            m_renderedFrame = false;
         }
 
         mukki::rhi::CommandList& commandList = m_device->GetCommandList();
@@ -423,6 +444,7 @@ protected:
             m_device->WaitIdle();
         }
         ReleaseDebugTextures();
+        ReleaseProbeTextures();
         m_ui.Shutdown();
         m_physics.Shutdown();
         m_renderer.reset();
@@ -610,6 +632,7 @@ private:
                 m_scene = mukki::SceneDescription{};
                 m_sceneSourcePath.clear();
                 m_physics.ClearBodies();
+                m_probeFillTarget = -1;
                 m_sceneStatus = "scene unloaded";
             }
         }
@@ -691,6 +714,7 @@ private:
         m_scene = std::move(loaded);
         m_selectedLight = 0;
         m_selectedObject = 0;
+        m_probeFillTarget = -1;
         if (!m_renderer->LoadScene(m_scene))
         {
             m_sceneStatus = "the renderer failed to load the scene";
@@ -1212,7 +1236,7 @@ private:
         m_chaseCameraPosition = glm::mix(m_chaseCameraPosition, desired, blend);
 
         const glm::vec3 lookTarget =
-            m_plane.GetPosition() + orientation * glm::vec3{0.0f, 1.5f, -12.0f};
+            m_plane.GetPosition() + orientation * glm::vec3{0.0f, 1.2f, -10.0f};
         const glm::vec3 forward = lookTarget - m_chaseCameraPosition;
         if (glm::length(forward) > 1.0e-3f)
         {
@@ -1704,6 +1728,49 @@ private:
         return result;
     }
 
+    // Distributes probes with a Halton sequence inside the given world bounds. `inset` shrinks the
+    // horizontal borders and `bottomFraction`/`topFraction` the vertical band, so a glTF object
+    // like a Sponza interior gets probes in its usable volume instead of the whole scene box.
+    void FillProbesInBounds(
+        const glm::vec3& boundsMin,
+        const glm::vec3& boundsMax,
+        int count,
+        float inset,
+        float bottomFraction,
+        float topFraction)
+    {
+        const int probeCount = std::clamp(count, 1, static_cast<int>(mukki::kMaxGiProbes));
+        const float clampedInset = std::clamp(inset, 0.0f, 0.45f);
+        const float bottom = std::clamp(bottomFraction, 0.0f, 1.0f);
+        const float top = std::clamp(topFraction, bottom, 1.0f);
+        const glm::vec3 extent = glm::max(boundsMax - boundsMin, glm::vec3{0.0f});
+        const glm::vec3 lower{
+            boundsMin.x + extent.x * clampedInset,
+            boundsMin.y + extent.y * bottom,
+            boundsMin.z + extent.z * clampedInset};
+        const glm::vec3 upper{
+            boundsMax.x - extent.x * clampedInset,
+            boundsMin.y + extent.y * top,
+            boundsMax.z - extent.z * clampedInset};
+
+        m_scene.probes.clear();
+        for (int index = 1; index <= probeCount; ++index)
+        {
+            const glm::vec3 t{
+                RadicalInverse(index, 2),
+                RadicalInverse(index, 3),
+                RadicalInverse(index, 5)};
+            mukki::SceneProbe probe{};
+            probe.name = "Auto " + std::to_string(index);
+            probe.position = glm::mix(lower, upper, t);
+            probe.radius = 0.35f;
+            m_scene.probes.push_back(probe);
+        }
+
+        m_selectedProbe = m_scene.probes.empty() ? -1 : 0;
+        ApplySceneProbes();
+    }
+
     void FillSceneProbes(int count)
     {
         glm::vec3 boundsMin{0.0f};
@@ -1714,26 +1781,39 @@ private:
             return;
         }
 
-        const int probeCount = std::clamp(count, 1, static_cast<int>(mukki::kMaxGiProbes));
-        const glm::vec3 inset{0.05f};
-        m_scene.probes.clear();
-        for (int index = 1; index <= probeCount; ++index)
+        FillProbesInBounds(boundsMin, boundsMax, count, 0.05f, 0.05f, 0.95f);
+        m_sceneStatus = "scene probes: " + std::to_string(m_scene.probes.size());
+    }
+
+    // Fills probes inside a single object's fitted bounds (e.g. a Sponza interior) so the GI is
+    // concentrated where the player actually is.
+    void FillTargetProbes(int count)
+    {
+        if (m_probeFillTarget < 0 ||
+            m_probeFillTarget >= static_cast<int>(m_scene.objects.size()))
         {
-            const glm::vec3 t{
-                RadicalInverse(index, 2),
-                RadicalInverse(index, 3),
-                RadicalInverse(index, 5)};
-            mukki::SceneProbe probe{};
-            probe.name = "Auto " + std::to_string(index);
-            probe.position =
-                glm::mix(boundsMin, boundsMax, inset + t * (glm::vec3{1.0f} - inset * 2.0f));
-            probe.radius = 0.35f;
-            m_scene.probes.push_back(probe);
+            FillSceneProbes(count);
+            return;
         }
 
-        m_selectedProbe = m_scene.probes.empty() ? -1 : 0;
-        ApplySceneProbes();
-        m_sceneStatus = "scene probes: " + std::to_string(m_scene.probes.size());
+        const std::size_t objectIndex = static_cast<std::size_t>(m_probeFillTarget);
+        glm::vec3 boundsMin{0.0f};
+        glm::vec3 boundsMax{0.0f};
+        if (!m_renderer->GetSceneObjectFittedBounds(objectIndex, boundsMin, boundsMax))
+        {
+            m_sceneStatus = "probe fill target is not instantiated";
+            return;
+        }
+
+        FillProbesInBounds(
+            boundsMin,
+            boundsMax,
+            count,
+            m_probeFillInset,
+            m_probeFillBottom,
+            m_probeFillTop);
+        m_sceneStatus = "probes inside '" + m_scene.objects[objectIndex].name + "': " +
+                        std::to_string(m_scene.probes.size());
     }
 
     void DrawEnvironmentSettings()
@@ -1944,7 +2024,8 @@ private:
 
         // Scene fill: distributes probes over the loaded scene bounds (Halton sequence) so the
         // whole scene can be covered without placing probes by hand. "Maximize" places the GPU
-        // limit in one click.
+        // limit in one click. The fill target can be a single object so its interior (for example
+        // a Sponza hall) gets all the probes.
         glm::vec3 boundsMin{0.0f};
         glm::vec3 boundsMax{0.0f};
         if (m_renderer->GetSceneBounds(boundsMin, boundsMax))
@@ -1956,6 +2037,50 @@ private:
         {
             ImGui::TextDisabled("Scene extent: no loaded objects");
         }
+
+        std::string targetLabel = "Whole scene";
+        if (m_probeFillTarget >= 0 &&
+            m_probeFillTarget < static_cast<int>(m_scene.objects.size()))
+        {
+            targetLabel = m_scene.objects[static_cast<std::size_t>(m_probeFillTarget)].name;
+        }
+        ImGui::SetNextItemWidth(180.0f);
+        if (ImGui::BeginCombo("Fill target", targetLabel.c_str()))
+        {
+            if (ImGui::Selectable("Whole scene", m_probeFillTarget < 0))
+            {
+                m_probeFillTarget = -1;
+            }
+            for (std::size_t index = 0; index < m_scene.objects.size(); ++index)
+            {
+                const bool selected = static_cast<int>(index) == m_probeFillTarget;
+                if (ImGui::Selectable(m_scene.objects[index].name.c_str(), selected))
+                {
+                    m_probeFillTarget = static_cast<int>(index);
+                }
+                if (selected)
+                {
+                    ImGui::SetItemDefaultFocus();
+                }
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::SetItemTooltip(
+            "Fill target: the whole scene bounds or a single object's fitted bounds.\n"
+            "Pick a glTF object (e.g. Sponza) to place all probes inside it.");
+
+        ImGui::SetNextItemWidth(120.0f);
+        ImGui::SliderFloat("##probe_inset", &m_probeFillInset, 0.0f, 0.4f, "Inset %.2f");
+        ImGui::SetItemTooltip("Shrinks the target bounds horizontally before the fill.");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(120.0f);
+        ImGui::SliderFloat("##probe_bottom", &m_probeFillBottom, 0.0f, 1.0f, "Bottom %.2f");
+        ImGui::SetItemTooltip("Lowest probe height as a fraction of the target bounds.");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(120.0f);
+        ImGui::SliderFloat("##probe_top", &m_probeFillTop, 0.0f, 1.0f, "Top %.2f");
+        ImGui::SetItemTooltip("Highest probe height as a fraction of the target bounds.");
+
         ImGui::SetNextItemWidth(130.0f);
         ImGui::SliderInt(
             "##probe_fill_count",
@@ -1964,20 +2089,26 @@ private:
             static_cast<int>(mukki::kMaxGiProbes),
             "Probes: %d");
         ImGui::SameLine();
-        if (ImGui::Button("Fill scene"))
+        if (ImGui::Button("Fill target"))
         {
-            FillSceneProbes(m_probeFillCount);
+            FillTargetProbes(m_probeFillCount);
         }
+        ImGui::SetItemTooltip("Fills the selected target with the chosen probe count.");
         ImGui::SameLine();
         if (ImGui::Button("Maximize probes"))
         {
             m_probeFillCount = static_cast<int>(mukki::kMaxGiProbes);
-            FillSceneProbes(m_probeFillCount);
+            FillTargetProbes(m_probeFillCount);
         }
         ImGui::SetItemTooltip(
-            "Replaces the probe list with probes distributed across the loaded scene bounds,\n"
-            "up to the GPU limit (max %u).",
+            "Fills the selected target with the GPU limit (max %u).",
             mukki::kMaxGiProbes);
+        ImGui::SameLine();
+        if (ImGui::Button("Fill scene"))
+        {
+            FillSceneProbes(m_probeFillCount);
+        }
+        ImGui::SetItemTooltip("Fills the whole loaded scene bounds, ignoring the target.");
 
         if (m_selectedProbe >= 0 && m_selectedProbe < static_cast<int>(m_scene.probes.size()))
         {
@@ -1998,6 +2129,107 @@ private:
             {
                 ApplySceneProbes();
             }
+        }
+
+        ImGui::SeparatorText("Probe irradiance (live)");
+
+        // Punctual lights the probe pass accumulates (mirrors SelectGiLights + the GI light cap).
+        const mukki::GiSettings& giSettings = m_renderer->GetGiSettings();
+        const std::size_t giLightCap =
+            std::min<std::size_t>(giSettings.maxGiLights, mukki::kMaxGiLights);
+        std::size_t punctualTotal = 0;
+        std::size_t pointSelected = 0;
+        std::size_t spotSelected = 0;
+        for (const mukki::SceneLight& sceneLight : m_scene.lights)
+        {
+            const bool point = sceneLight.light.type == mukki::LightType::Point;
+            const bool spot = sceneLight.light.type == mukki::LightType::Spot;
+            if (!point && !spot)
+            {
+                continue;
+            }
+            ++punctualTotal;
+            if (pointSelected + spotSelected < giLightCap)
+            {
+                point ? ++pointSelected : ++spotSelected;
+            }
+        }
+        const std::size_t accumulated = pointSelected + spotSelected;
+        if (!giSettings.pointLights)
+        {
+            ImGui::TextDisabled("Probes ignore punctual lights (\"Point/spot lights in GI\" is off).");
+        }
+        else if (accumulated == 0)
+        {
+            ImGui::TextDisabled("Probes accumulate no punctual lights (the scene has none).");
+        }
+        else
+        {
+            ImGui::Text(
+                "Probes accumulate %zu punctual light(s): %zu point, %zu spot.",
+                accumulated,
+                pointSelected,
+                spotSelected);
+            if (punctualTotal > accumulated)
+            {
+                ImGui::SameLine();
+                ImGui::TextDisabled(
+                    "(%zu beyond \"GI light count\")",
+                    punctualTotal - accumulated);
+            }
+        }
+
+        ImGui::Checkbox("Live update", &m_probeLive);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(140.0f);
+        ImGui::SliderFloat("##probe_refresh", &m_probeLiveInterval, 0.1f, 2.0f, "Every %.1f s");
+        ImGui::SameLine();
+        if (ImGui::Button("Refresh probes"))
+        {
+            RefreshProbeReadback();
+        }
+        ImGui::SetItemTooltip("Reads the GPU probe coefficients back (briefly stalls the GPU).");
+
+        if (!m_renderer->IsProbeGiActive())
+        {
+            ImGui::TextDisabled("Inactive: enable \"Use probes for GI\" and place probes.");
+        }
+        else if (m_probeReadback.empty())
+        {
+            ImGui::TextDisabled("Waiting for the first probe readback...");
+        }
+        else if (m_probeTextureId != 0)
+        {
+            const float available = ImGui::GetContentRegionAvail().x;
+            const float imageWidth = std::max(64.0f, std::min(available, 512.0f));
+            const float imageHeight =
+                imageWidth * (static_cast<float>(m_probeReadback.size() * 16u) / 32.0f);
+            ImGui::Image(ImTextureRef{m_probeTextureId}, ImVec2(imageWidth, imageHeight));
+            ImGui::TextDisabled(
+                "%zu probes; each row is one probe's 32x16 irradiance map (x azimuth, y elevation)",
+                m_probeReadback.size());
+        }
+
+        if (m_selectedProbe >= 0 && m_selectedProbe < static_cast<int>(m_probeReadback.size()))
+        {
+            const mukki::GpuGiProbe& probe =
+                m_probeReadback[static_cast<std::size_t>(m_selectedProbe)];
+            ImGui::Text(
+                "sh0 (%.3f, %.3f, %.3f)   shX (%.3f, %.3f, %.3f)",
+                static_cast<double>(probe.sh0.x),
+                static_cast<double>(probe.sh0.y),
+                static_cast<double>(probe.sh0.z),
+                static_cast<double>(probe.shX.x),
+                static_cast<double>(probe.shX.y),
+                static_cast<double>(probe.shX.z));
+            ImGui::Text(
+                "shY (%.3f, %.3f, %.3f)   shZ (%.3f, %.3f, %.3f)",
+                static_cast<double>(probe.shY.x),
+                static_cast<double>(probe.shY.y),
+                static_cast<double>(probe.shY.z),
+                static_cast<double>(probe.shZ.x),
+                static_cast<double>(probe.shZ.y),
+                static_cast<double>(probe.shZ.z));
         }
     }
 
@@ -2061,6 +2293,14 @@ private:
             ImGui::SameLine();
             ImGui::TextDisabled("(ray tracing unavailable)");
         }
+
+        bool giOnly = m_renderer->IsGiDebugViewEnabled();
+        if (ImGui::Checkbox("GI only view", &giOnly))
+        {
+            m_renderer->SetGiDebugView(giOnly);
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("(ambient + indirect + reflections, no direct light)");
 
         changed |= ImGui::SliderFloat("Trace scale", &settings.resolutionScale, 0.25f, 1.0f, "%.2f");
         int traceSamples = static_cast<int>(settings.traceSamples);
@@ -2259,6 +2499,18 @@ private:
             RebuildPhysics();
             m_sceneStatus = "physics bodies rebuilt";
         }
+
+        // Quick probe fill for this object's interior (for example a Sponza hall) so the GI is
+        // concentrated where the player walks.
+        if (ImGui::Button("Fill probes inside"))
+        {
+            m_probeFillTarget = static_cast<int>(index);
+            FillTargetProbes(m_probeFillCount);
+        }
+        ImGui::SetItemTooltip(
+            "Replaces the probe list with %d probes distributed inside this object's bounds.\n"
+            "Use the Inset / Bottom / Top sliders in the Probes section to tune the volume.",
+            m_probeFillCount);
     }
 
     void DrawLightEditor(mukki::SceneLight& sceneLight)
@@ -2391,6 +2643,145 @@ private:
         m_debugTexturesRegistered = false;
     }
 
+    // Reads the GPU probe coefficients back and rebuilds the irradiance atlas. The readback stalls
+    // the device, so it runs on a timer (and on demand) rather than every frame.
+    void RefreshProbeReadback()
+    {
+        if (m_renderer == nullptr || !m_renderer->ReadGiProbes(m_probeReadback))
+        {
+            m_probeReadback.clear();
+            return;
+        }
+        RebuildProbeIrradianceTexture();
+    }
+
+    void UpdateProbeReadback(float deltaTime)
+    {
+        ReleaseRetiredProbeTextures();
+        // The readback stalls the device: only refresh while the probe view is actually visible.
+        if (!m_probeLive || !m_showObjectsPhysicsWindow || m_renderer == nullptr ||
+            !m_renderer->IsProbeGiActive())
+        {
+            return;
+        }
+
+        m_probeReadbackTimer += deltaTime;
+        if (m_probeReadbackTimer < m_probeLiveInterval)
+        {
+            return;
+        }
+        m_probeReadbackTimer = 0.0f;
+        RefreshProbeReadback();
+    }
+
+    // Builds a 32x16 equirectangular irradiance thumbnail per probe (stacked vertically) and shows
+    // it as a UI image.
+    void RebuildProbeIrradianceTexture()
+    {
+        constexpr std::uint32_t kThumbnailWidth = 32;
+        constexpr std::uint32_t kThumbnailHeight = 16;
+        if (m_probeReadback.empty() || m_device == nullptr)
+        {
+            return;
+        }
+
+        const std::uint32_t height =
+            kThumbnailHeight * static_cast<std::uint32_t>(m_probeReadback.size());
+        std::vector<std::uint8_t> pixels(static_cast<std::size_t>(kThumbnailWidth) * height * 4);
+        for (std::size_t probeIndex = 0; probeIndex < m_probeReadback.size(); ++probeIndex)
+        {
+            const mukki::GpuGiProbe& probe = m_probeReadback[probeIndex];
+            for (std::uint32_t y = 0; y < kThumbnailHeight; ++y)
+            {
+                const float theta = (static_cast<float>(y) + 0.5f) / kThumbnailHeight * 3.14159265f;
+                for (std::uint32_t x = 0; x < kThumbnailWidth; ++x)
+                {
+                    const float phi = (static_cast<float>(x) + 0.5f) / kThumbnailWidth * 6.28318531f;
+                    const glm::vec3 direction{
+                        std::sin(theta) * std::cos(phi),
+                        std::cos(theta),
+                        std::sin(theta) * std::sin(phi)};
+                    const glm::vec3 irradiance = glm::max(
+                        glm::vec3{probe.sh0} + glm::vec3{probe.shX} * direction.x +
+                            glm::vec3{probe.shY} * direction.y + glm::vec3{probe.shZ} * direction.z,
+                        glm::vec3{0.0f});
+
+                    const std::size_t offset =
+                        (probeIndex * kThumbnailHeight + y) * kThumbnailWidth + x;
+                    for (int channel = 0; channel < 3; ++channel)
+                    {
+                        const float value = irradiance[channel];
+                        const float tonemapped = value / (1.0f + value);
+                        const float encoded = std::pow(std::clamp(tonemapped, 0.0f, 1.0f), 1.0f / 2.2f);
+                        pixels[offset * 4 + static_cast<std::size_t>(channel)] =
+                            static_cast<std::uint8_t>(encoded * 255.0f + 0.5f);
+                    }
+                    pixels[offset * 4 + 3] = 255;
+                }
+            }
+        }
+
+        const mukki::rhi::TextureDesc desc{
+            kThumbnailWidth,
+            height,
+            mukki::rhi::Format::R8G8B8A8Srgb,
+            mukki::rhi::TextureUsage::Sampled,
+            pixels.data(),
+            pixels.size()};
+        std::unique_ptr<mukki::rhi::Texture> texture = m_device->CreateTexture(desc);
+        if (texture == nullptr)
+        {
+            return;
+        }
+
+        if (m_probeTexture != nullptr)
+        {
+            m_retiredProbeTextures.push_back(
+                RetiredProbeTexture{std::move(m_probeTexture), m_probeTextureId, m_frameCount});
+            m_probeTextureId = 0;
+        }
+        m_probeTexture = std::move(texture);
+        m_probeTextureId = m_ui.AddTexture(*m_probeTexture);
+    }
+
+    // The UI image and its ImGui descriptor must outlive the frames that referenced them.
+    void ReleaseRetiredProbeTextures()
+    {
+        const int grace = (m_device != nullptr
+                               ? static_cast<int>(m_device->GetFramesInFlight())
+                               : 2) +
+                          2;
+        for (std::size_t index = 0; index < m_retiredProbeTextures.size();)
+        {
+            if (m_frameCount - m_retiredProbeTextures[index].frame >= grace)
+            {
+                m_ui.RemoveTexture(m_retiredProbeTextures[index].id);
+                m_retiredProbeTextures.erase(
+                    m_retiredProbeTextures.begin() + static_cast<std::ptrdiff_t>(index));
+            }
+            else
+            {
+                ++index;
+            }
+        }
+    }
+
+    void ReleaseProbeTextures()
+    {
+        if (m_probeTextureId != 0)
+        {
+            m_ui.RemoveTexture(m_probeTextureId);
+            m_probeTextureId = 0;
+        }
+        m_probeTexture.reset();
+        for (const RetiredProbeTexture& retired : m_retiredProbeTextures)
+        {
+            m_ui.RemoveTexture(retired.id);
+        }
+        m_retiredProbeTextures.clear();
+        m_probeReadback.clear();
+    }
+
     struct FloorSettings
     {
         bool enabled = true;
@@ -2399,6 +2790,13 @@ private:
         float halfExtentX = 50.0f;
         float halfExtentZ = 50.0f;
         float thickness = 1.0f;
+    };
+
+    struct RetiredProbeTexture
+    {
+        std::unique_ptr<mukki::rhi::Texture> texture{};
+        ImTextureID id = 0;
+        int frame = 0;
     };
 
     mukki::Camera m_camera{};
@@ -2426,6 +2824,14 @@ private:
     float m_crashTimer = 0.0f;
     int m_planeObjectIndex = -1;
     int m_crashCount = 0;
+    std::uint32_t m_renderExtentWidth = 0;
+    std::uint32_t m_renderExtentHeight = 0;
+    std::vector<mukki::GpuGiProbe> m_probeReadback{};
+    std::unique_ptr<mukki::rhi::Texture> m_probeTexture{};
+    std::vector<RetiredProbeTexture> m_retiredProbeTextures{};
+    ImTextureID m_probeTextureId = 0;
+    float m_probeReadbackTimer = 0.0f;
+    float m_probeLiveInterval = 0.5f;
     std::string m_iniPath{};
     std::vector<std::filesystem::path> m_sceneFiles{};
     std::filesystem::path m_scenesRoot{};
@@ -2448,6 +2854,10 @@ private:
     int m_selectedObject = 0;
     int m_selectedProbe = -1;
     int m_probeFillCount = static_cast<int>(mukki::kMaxGiProbes);
+    int m_probeFillTarget = -1;
+    float m_probeFillInset = 0.08f;
+    float m_probeFillBottom = 0.05f;
+    float m_probeFillTop = 0.95f;
     int m_sceneFileIndex = 0;
     int m_maxFrames = 0;
     int m_frameCount = 0;
@@ -2468,6 +2878,7 @@ private:
     bool m_resetLayoutRequested = false;
     bool m_flightEnabled = false;
     bool m_crashed = false;
+    bool m_probeLive = true;
 };
 
 } // namespace

@@ -483,7 +483,13 @@ clustered lights:
   lighting pass blends the surrounding probes by inverse distance, and the per-pixel trace/denoiser
   is skipped while probes are active (`Use probes for GI`) so the indirect lighting is not counted
   twice. Place several probes around the scene for smooth indirect; they update every frame and
-  reset their accumulation when moved.
+  reset their accumulation when moved. The `Probe irradiance (live)` section reads the GPU
+  coefficients back on a timer (or on `Refresh probes`) and shows each probe's SH as a 32x16
+  equirectangular irradiance thumbnail, plus the numeric `sh0..shZ` of the selected probe.
+- **Debug views**: `Visualize cluster light counts` replaces the image with the cluster heatmap and
+  `GI only view` (in the GI section) shows just the indirect signal: ambient SH/IBL diffuse, the
+  traced diffuse signal (or probes) and the traced reflections, without direct lights or emissive.
+  Both are driven by `SceneUniform::screenSize.z` (0 lit, 1 cluster heatmap, 2 GI only).
 - A hand-rolled SVGF denoiser accumulates edge-aware temporally (depth, normal, luminance and
   hit-distance rejection, variance from the first two moments), then runs 4 iterations of a
   depth/normal/roughness-aware a-trous filter and a joint bilateral upsample back to full
@@ -492,23 +498,30 @@ clustered lights:
   at creation; each a-trous iteration owns its descriptor set because updating a set that is bound
   to a recording command buffer invalidates that command buffer.
 
-The `Scene` window exposes the GI controls: `Ray traced GI`, `Trace scale`, `GI intensity`,
+The `GI & Lights` window exposes the GI controls: `Ray traced GI`, `GI only view`, `Trace scale`,
+`GI intensity`,
 `Max ray distance`, `Bounce feedback`, `Specular min roughness`, the temporal/edge-stop
 parameters, `A-trous iterations`, `Sun shadow ray` and the punctual-light controls
 (`Point/spot lights in GI`, `GI light count`, `GI light shadows`, `GI light shadow bias`). Devices
 without ray tracing report `(ray tracing unavailable)` and render the clustered lights only. The
-`Volumetric clouds (Nubis)` section hosts the coverage/type/density, layer, wind/curl, step count,
-trace scale, temporal blend and god-ray controls.
+`Volumetrics` window hosts the environment controls and the `Volumetric clouds (Nubis)`
+coverage/type/density, layer, wind/curl, step count, trace scale, temporal blend and god-ray
+controls.
 
 In the sandbox, the `Scenes` window browses and loads the JSON scenes found in `Sandbox/Scenes`
-(with a global transform scale). The `Scene` window lists the loaded objects and lights:
+(with a global transform scale). The `Objects & Physics` window lists the loaded objects and
+lights:
 
 - Selecting an object lets you edit its position, rotation (degrees, YXZ) and scale; the change is
   applied to the renderer immediately. The `Probes` section below the objects manages the
-world-space GI probes (`Add probe` places one in front of the camera, `Add grid` drops a 3x2x3
-grid, `Fill scene`/`Maximize probes` distribute probes across the loaded scene bounds up to the
-GPU limit of `kMaxGiProbes`, and the selected probe has position/radius/enabled controls); they
-are persisted in the scene JSON and bytecode.
+  world-space GI probes (`Add probe` places one in front of the camera, `Add grid` drops a 3x2x3
+  grid, and the selected probe has position/radius/enabled controls); they are persisted in the
+  scene JSON and bytecode. The fill controls place the GPU-budget of `kMaxGiProbes` probes without
+  hand placement: `Fill scene` covers the whole loaded scene bounds while `Fill target` fills only
+  the object selected in the `Fill target` combo (for example a Sponza interior), both using a
+  Halton sequence with `Inset`, `Bottom` and `Top` sliders to shape the volume; `Maximize probes`
+  fills the target with the GPU limit. The object editor also has a `Fill probes inside` shortcut.
+  The `Probe irradiance (live)` section below the probe editor visualizes the GPU probe data.
 - Selecting a light opens a `Type` dropdown (directional/point/spot) plus position, direction,
   color, `Strength`, range and cone controls.
 - `Show light gizmos` draws wireframe markers for the lights in the viewport: range spheres for
