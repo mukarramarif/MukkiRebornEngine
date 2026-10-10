@@ -197,10 +197,16 @@ must not expose backend types, and Vulkan types may only appear under `Renderer/
   frames that referenced them). Non-finite ray results are skipped in `gi_probes.comp.slang` /
   `gi_trace.comp.slang`, and the shared BRDF guards degenerate normalizations (retroreflection
   half vector, zero-length interpolated normals) because a single NaN ray would permanently poison
-  a probe (hysteresis) and blacken the probe-blended scene. Probe placement helpers: `Fill scene`
-  covers the whole scene bounds and `Fill target` (or the object editor's `Fill probes inside`) a
-  single object's `GetSceneObjectFittedBounds` box (e.g. a Sponza interior), both Halton-distributed
-  with inset and vertical-bottom/top sliders (`FillProbesInBounds` in the sandbox).
+  a probe (hysteresis) and blacken the probe-blended scene. Probe depth checks: `GpuGiProbe.depth`
+  carries x = mean hit distance, y = mean squared, z = valid flag, w = smoothed backface fraction
+  (hardware `RayQuery.CommittedTriangleFrontFace`, so node rotations/mirrored transforms are
+  handled); probes above 0.6 backfaces are treated as embedded in geometry, skipped by the
+  lighting pass and tinted red by the gizmos, and fills auto-remove them. Lighting weights valid
+  probes with a Chebyshev visibility from the depth mean/variance to stop light bleeding through
+  walls. Probe placement helpers: `Fill scene` covers the whole scene bounds and `Fill target` (or
+  the object editor's `Fill probes inside`) a single object's `GetSceneObjectFittedBounds` box
+  (e.g. a Sponza interior), both Halton-distributed with inset and vertical-bottom/top sliders
+  (`FillProbesInBounds` in the sandbox).
 - Global illumination: optional hardware ray tracing (`VK_KHR_acceleration_structure`,
   `VK_KHR_ray_query`, `VK_KHR_deferred_host_operations`; `Device::IsRayTracingSupported()`). The RT
   entry points are loaded manually by `Renderer/Vulkan/Core/VkRayTracingDispatch` because the Vulkan

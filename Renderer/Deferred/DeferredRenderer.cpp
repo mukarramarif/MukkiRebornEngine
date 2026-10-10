@@ -2881,22 +2881,26 @@ void DeferredRenderer::RecordDebugLines(rhi::CommandList& commandList, const Fra
 
             const GpuGiProbe& probe = m_giProbeData[index];
             const glm::vec3 position{probe.position};
-            lines.AddSphere(position, marker.radius, marker.color);
+            // Probes that failed the depth check (embedded in geometry) are flagged red.
+            const bool depthValid = probe.depth.z >= 0.5f;
+            const glm::vec4 sphereColor =
+                depthValid ? marker.color : glm::vec4{1.0f, 0.15f, 0.15f, 1.0f};
+            lines.AddSphere(position, marker.radius, sphereColor);
             lines.AddCross(
                 position,
                 marker.radius * 0.6f,
                 glm::vec4{
-                    marker.color.r * 0.7f,
-                    marker.color.g * 0.7f,
-                    marker.color.b * 0.7f,
-                    marker.color.a});
+                    sphereColor.r * 0.7f,
+                    sphereColor.g * 0.7f,
+                    sphereColor.b * 0.7f,
+                    sphereColor.a});
 
             const glm::vec3 direction{
                 probe.shX.r + probe.shX.g + probe.shX.b,
                 probe.shY.r + probe.shY.g + probe.shY.b,
                 probe.shZ.r + probe.shZ.g + probe.shZ.b};
             const float directionLength = glm::length(direction);
-            if (directionLength > 1e-4f)
+            if (depthValid && directionLength > 1e-4f)
             {
                 const glm::vec3 irradiance =
                     glm::clamp(glm::vec3{probe.sh0}, glm::vec3{0.0f}, glm::vec3{1.0f});
@@ -4194,14 +4198,15 @@ bool DeferredRenderer::ReadGiProbes(std::vector<GpuGiProbe>& out)
         return false;
     }
 
-    // Keep the CPU copy's SH current for the debug gizmos; the positions stay untouched and the
-    // data is not re-uploaded (the GPU owns the accumulated coefficients).
+    // Keep the CPU copy's SH and depth current for the debug gizmos; the positions stay untouched
+    // and the data is not re-uploaded (the GPU owns the accumulated coefficients).
     for (std::size_t index = 0; index < m_giProbeData.size(); ++index)
     {
         m_giProbeData[index].sh0 = out[index].sh0;
         m_giProbeData[index].shX = out[index].shX;
         m_giProbeData[index].shY = out[index].shY;
         m_giProbeData[index].shZ = out[index].shZ;
+        m_giProbeData[index].depth = out[index].depth;
     }
     return true;
 }

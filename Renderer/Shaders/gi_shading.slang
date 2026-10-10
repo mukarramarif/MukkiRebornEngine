@@ -248,6 +248,32 @@ struct SurfaceSample
     float3 emissive;
 };
 
+// Interpolated geometric normal of a hit. Cheap enough for probe depth checks (three vertex
+// loads); returns a zero vector for degenerate triangles.
+float3 LoadGeometricNormal(
+    uint geometryIndex,
+    uint primitiveIndex,
+    float2 barycentrics)
+{
+    const GpuGeometryData geometry = gGeometry[geometryIndex];
+    const ByteAddressBuffer vertexBuffer = gBuffers[NonUniformResourceIndex(geometry.bufferIndices.x)];
+    const ByteAddressBuffer indexBuffer = gBuffers[NonUniformResourceIndex(geometry.bufferIndices.y)];
+    const uint stride = geometry.bufferIndices.z;
+
+    const uint base = primitiveIndex * 12u;
+    const uint i0 = indexBuffer.Load(base);
+    const uint i1 = indexBuffer.Load(base + 4u);
+    const uint i2 = indexBuffer.Load(base + 8u);
+
+    const float w0 = 1.0 - barycentrics.x - barycentrics.y;
+    const float3 normalSum =
+        LoadFloat3(vertexBuffer, i0 * stride + 12u) * w0 +
+        LoadFloat3(vertexBuffer, i1 * stride + 12u) * barycentrics.x +
+        LoadFloat3(vertexBuffer, i2 * stride + 12u) * barycentrics.y;
+    const float lengthSquared = dot(normalSum, normalSum);
+    return lengthSquared > 1e-8 ? normalSum * rsqrt(lengthSquared) : float3(0.0, 0.0, 0.0);
+}
+
 SurfaceSample LoadSurface(
     uint geometryIndex,
     uint primitiveIndex,
@@ -267,15 +293,13 @@ SurfaceSample LoadSurface(
     const uint i2 = indexBuffer.Load(base + 8u);
 
     const float w0 = 1.0 - barycentrics.x - barycentrics.y;
-    const float3 n0 = LoadFloat3(vertexBuffer, i0 * stride + 12u);
-    const float3 n1 = LoadFloat3(vertexBuffer, i1 * stride + 12u);
-    const float3 n2 = LoadFloat3(vertexBuffer, i2 * stride + 12u);
-    const float3 normalSum = n0 * w0 + n1 * barycentrics.x + n2 * barycentrics.y;
-    const float normalLengthSquared = dot(normalSum, normalSum);
+    float3 geometricNormal = LoadGeometricNormal(geometryIndex, primitiveIndex, barycentrics);
     // Degenerate normals would turn every downstream term into NaN; fall back to a normal facing
     // the ray origin.
-    const float3 geometricNormal =
-        normalLengthSquared > 1e-8 ? normalSum * rsqrt(normalLengthSquared) : -rayDirection;
+    if (dot(geometricNormal, geometricNormal) < 1e-8)
+    {
+        geometricNormal = -rayDirection;
+    }
 
     const float2 uv0 = LoadFloat2(vertexBuffer, i0 * stride + 24u);
     const float2 uv1 = LoadFloat2(vertexBuffer, i1 * stride + 24u);

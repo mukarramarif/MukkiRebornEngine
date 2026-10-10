@@ -480,6 +480,13 @@ clustered lights:
   feed the irradiance probe pass. `gi_probes.comp.slang`
   traces `Probe rays` uniform-sphere rays per probe with the same hit shading as the path tracer,
   projects the result onto SH L1 and blends it with the previous frame (`Probe hysteresis`). The
+  trace also records **depth statistics** per probe: the mean/variance of the hit distances and the
+  fraction of committed hits that are backfaces. Probes whose backface fraction stays above 0.6 are
+  flagged as embedded in geometry (`depth.z = 0`): the lighting pass skips them, the debug gizmos
+  draw them red, and fills automatically remove them (the `Probe irradiance (live)` section shows
+  the count and has a manual `Remove stuck probes` action). For valid probes the lighting pass
+  applies a **Chebyshev visibility weight** from the depth mean/variance, so a probe on the far side
+  of a wall contributes almost nothing to the surface (no light bleeding through geometry). The
   lighting pass blends the surrounding probes by inverse distance, and the per-pixel trace/denoiser
   is skipped while probes are active (`Use probes for GI`) so the indirect lighting is not counted
   twice. Place several probes around the scene for smooth indirect; they update every frame and
@@ -520,8 +527,10 @@ lights:
   hand placement: `Fill scene` covers the whole loaded scene bounds while `Fill target` fills only
   the object selected in the `Fill target` combo (for example a Sponza interior), both using a
   Halton sequence with `Inset`, `Bottom` and `Top` sliders to shape the volume; `Maximize probes`
-  fills the target with the GPU limit. The object editor also has a `Fill probes inside` shortcut.
-  The `Probe irradiance (live)` section below the probe editor visualizes the GPU probe data.
+  fills the target with the GPU limit. Fills run the depth check afterwards and remove the probes
+  that landed inside walls or props (the status line reports how many). The object editor also has
+  a `Fill probes inside` shortcut. The `Probe irradiance (live)` section below the probe editor
+  visualizes the GPU probe data.
 - Selecting a light opens a `Type` dropdown (directional/point/spot) plus position, direction,
   color, `Strength`, range and cone controls.
 - `Show light gizmos` draws wireframe markers for the lights in the viewport: range spheres for

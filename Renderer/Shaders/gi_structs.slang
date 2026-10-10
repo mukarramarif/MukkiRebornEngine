@@ -69,4 +69,8 @@ struct GpuGiProbe
     float4 shX;
     float4 shY;
     float4 shZ;
+    // x: mean hit distance (misses count as the GI ray length), y: mean squared distance,
+    // z: valid flag (0 while the probe is embedded in geometry), w: fraction of committed hits
+    // that are backfaces.
+    float4 depth;
 };

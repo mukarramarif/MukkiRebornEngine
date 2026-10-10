@@ -107,7 +107,15 @@ struct GpuGiProbe
     glm::vec4 shX{0.0f};
     glm::vec4 shY{0.0f};
     glm::vec4 shZ{0.0f};
+    // Depth statistics from the probe trace. x: mean hit distance (misses count as the GI ray
+    // length), y: mean squared distance, z: valid flag (0 while the probe is embedded in geometry),
+    // w: fraction of committed hits that are backfaces (a probe inside a solid sees mostly
+    // backfaces). The lighting pass skips invalid probes and uses the mean/variance as a Chebyshev
+    // visibility weight so probes behind a wall do not bleed light through it.
+    glm::vec4 depth{0.0f};
 };
+
+static_assert(sizeof(GpuGiProbe) == 6 * 16, "GpuGiProbe must match gi_structs.slang");
 
 // Mirrors the lighting pass evaluation; irradiance over pi for the given surface normal.
 [[nodiscard]] inline glm::vec3 EvaluateProbeIrradiance(

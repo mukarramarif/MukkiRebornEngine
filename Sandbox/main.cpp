@@ -1769,6 +1769,8 @@ private:
 
         m_selectedProbe = m_scene.probes.empty() ? -1 : 0;
         ApplySceneProbes();
+        // Let the probe pass run once, then drop the probes the depth check rejects.
+        m_probePrunePending = true;
     }
 
     void FillSceneProbes(int count)
@@ -1976,6 +1978,7 @@ private:
             m_scene.probes.push_back(probe);
             m_selectedProbe = static_cast<int>(m_scene.probes.size()) - 1;
             ApplySceneProbes();
+            m_probePrunePending = true;
         }
         ImGui::SameLine();
         if (ImGui::Button("Add grid"))
@@ -2004,6 +2007,7 @@ private:
             }
             ApplySceneProbes();
             m_sceneStatus = "probe grid added";
+            m_probePrunePending = true;
         }
         ImGui::SameLine();
         if (ImGui::Button("Remove probe") && !m_scene.probes.empty())
@@ -2189,6 +2193,39 @@ private:
             RefreshProbeReadback();
         }
         ImGui::SetItemTooltip("Reads the GPU probe coefficients back (briefly stalls the GPU).");
+
+        // Depth check results: probes embedded in geometry are skipped by the lighting pass and
+        // drawn red in the probe gizmos.
+        std::size_t stuckCount = 0;
+        for (const mukki::GpuGiProbe& probe : m_probeReadback)
+        {
+            if (probe.depth.z < 0.5f)
+            {
+                ++stuckCount;
+            }
+        }
+        if (!m_probeReadback.empty())
+        {
+            if (stuckCount > 0)
+            {
+                ImGui::TextColored(
+                    ImVec4{1.0f, 0.3f, 0.3f, 1.0f},
+                    "%zu probe(s) embedded in geometry (skipped, red gizmos).",
+                    stuckCount);
+            }
+            else
+            {
+                ImGui::TextDisabled("Depth check: all probes are outside geometry.");
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Remove stuck probes"))
+            {
+                PruneStuckProbes();
+            }
+            ImGui::SetItemTooltip(
+                "Removes the probes flagged by the depth check using the latest readback\n"
+                "(use Refresh probes if it is stale).");
+        }
 
         if (!m_renderer->IsProbeGiActive())
         {
@@ -2653,6 +2690,54 @@ private:
             return;
         }
         RebuildProbeIrradianceTexture();
+        if (m_probePrunePending)
+        {
+            m_probePrunePending = false;
+            PruneStuckProbes();
+        }
+    }
+
+    // Removes probes the depth check flagged as embedded in geometry. Probes are matched by
+    // position because disabled probes are not uploaded to the GPU.
+    void PruneStuckProbes()
+    {
+        if (m_probeReadback.empty())
+        {
+            return;
+        }
+
+        std::size_t removed = 0;
+        for (const mukki::GpuGiProbe& gpu : m_probeReadback)
+        {
+            if (gpu.depth.z >= 0.5f)
+            {
+                continue;
+            }
+
+            const glm::vec3 position{gpu.position};
+            for (auto it = m_scene.probes.begin(); it != m_scene.probes.end(); ++it)
+            {
+                if (it->enabled && glm::length(it->position - position) < 1.0e-3f)
+                {
+                    m_scene.probes.erase(it);
+                    ++removed;
+                    break;
+                }
+            }
+        }
+
+        if (removed == 0)
+        {
+            return;
+        }
+
+        m_selectedProbe = m_scene.probes.empty()
+                              ? -1
+                              : std::min(
+                                    m_selectedProbe,
+                                    static_cast<int>(m_scene.probes.size()) - 1);
+        ApplySceneProbes();
+        m_sceneStatus = "removed " + std::to_string(removed) + " probe(s) stuck in geometry";
     }
 
     void UpdateProbeReadback(float deltaTime)
@@ -2879,6 +2964,7 @@ private:
     bool m_flightEnabled = false;
     bool m_crashed = false;
     bool m_probeLive = true;
+    bool m_probePrunePending = false;
 };
 
 } // namespace

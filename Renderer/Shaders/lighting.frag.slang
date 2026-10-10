@@ -47,6 +47,7 @@ struct GpuGiProbe
     float4 shX;
     float4 shY;
     float4 shZ;
+    float4 depth;    // x: mean hit distance, y: mean squared, z: valid, w: backface fraction
 };
 
 // Must match DeferredRenderer::GpuObjectData.
@@ -530,15 +531,34 @@ float4 fragmentMain(VertexOutput input) : SV_Target
     }
     else if (gScene.ambientColor.w > 0.5)
     {
-        // Probe GI: inverse distance blend of the surrounding irradiance probes.
+        // Probe GI: inverse distance blend of the surrounding irradiance probes with a depth
+        // visibility term so probes on the far side of geometry do not bleed light through walls.
         const uint probeCount = min(uint(gScene.ambientColor.w + 0.5), kMaxGiProbes);
         float3 indirect = 0.0;
         float weightSum = 0.0;
         for (uint probeIndex = 0; probeIndex < probeCount; ++probeIndex)
         {
             const GpuGiProbe probe = gGiProbes[probeIndex];
+            if (probe.depth.z < 0.5)
+            {
+                // Probe failed the stuck-in-geometry depth check.
+                continue;
+            }
+
             const float3 offset = probe.position.xyz - worldPosition.xyz;
-            const float weight = 1.0 / (dot(offset, offset) + 0.05);
+            const float distanceSquared = dot(offset, offset);
+            const float distance = sqrt(distanceSquared);
+
+            // Chebyshev visibility (DDGI): probes whose average hit distance is much smaller than
+            // the shading distance are occluded by geometry between the probe and the surface.
+            const float mean = max(probe.depth.x, 1e-4);
+            const float meanSquared = max(probe.depth.y, mean * mean + 1e-4);
+            const float variance = max(meanSquared - mean * mean, 1e-4);
+            const float delta = distance - mean;
+            const float visibility =
+                delta > 0.0 ? variance / (variance + delta * delta) : 1.0;
+
+            const float weight = visibility / (distanceSquared + 0.05);
             indirect +=
                 (probe.sh0.rgb + probe.shX.rgb * normal.x + probe.shY.rgb * normal.y +
                  probe.shZ.rgb * normal.z) * weight;
