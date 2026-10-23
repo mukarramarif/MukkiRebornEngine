@@ -3,6 +3,13 @@
 A vendor-agnostic game engine: C++20, Vulkan 1.4 (vulkan.hpp + VMA), deferred rendering, Slang
 shaders and an ImGui docking UI. Rewrite of an older Vulkan renderer into a proper engine.
 
+## Photo ShowCase of Progress
+<img width="3426" height="1390" alt="Screenshot 2026-10-08 155529" src="https://github.com/user-attachments/assets/bfc08da8-e0d1-461f-ac46-f6d258a5a229" />
+<img width="3440" height="1404" alt="Screenshot 2026-10-02 211233" src="https://github.com/user-attachments/assets/0a43a918-3dd0-48c4-8ab4-f67b8975c896" />
+<img width="3426" height="1390" alt="Screenshot 2026-10-01 131615" src="https://github.com/user-attachments/assets/3b49fa13-8b27-43d5-a5f8-50f9ac46854e" />
+<img width="2044" height="997" alt="Screenshot 2026-10-10 174436" src="https://github.com/user-attachments/assets/0b7da713-29e9-480e-af50-b2f35241ede1" />
+
+
 ## Requirements
 
 - CMake 3.25 or newer
