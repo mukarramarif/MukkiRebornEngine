@@ -60,6 +60,9 @@ struct GpuGeometryData
     float4 emissive;            // rgb: emissiveFactor (incl. strength)
     uint4 emissiveTextureIndices; // x: emissiveTexture
     uint4 emissiveSamplerIndices; // x: emissive sampler
+    float4 subsurface;            // rgb: diffuseTransmissionColor, a: factor
+    uint4 subsurfaceTextureIndices; // x: diffuseTransmissionTexture, y: color texture
+    uint4 subsurfaceSamplerIndices;
 };
 
 struct GpuGiProbe

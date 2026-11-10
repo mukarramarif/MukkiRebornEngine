@@ -1412,6 +1412,7 @@ private:
         DrawShadowSettings();
         DrawGiSettings();
         DrawReflectionSettings();
+        DrawSubsurfaceSettings();
 
         ImGui::End();
     }
@@ -1643,6 +1644,53 @@ private:
         ImGui::SetItemTooltip(
             "Recreates every collider from the scene description and resets dynamic body poses.");
         ImGui::TextDisabled("Gravity and step rate are saved with Save JSON; the floor is runtime only.");
+    }
+
+    void DrawSubsurfaceSettings()
+    {
+        ImGui::SeparatorText("Subsurface scattering");
+
+        mukki::DeferredRenderer::SssSettings settings = m_renderer->GetSssSettings();
+        bool changed = ImGui::Checkbox("Subsurface scattering", &settings.enabled);
+        ImGui::SetItemTooltip(
+            "Screen space diffusion of KHR_materials_diffuse_transmission surfaces\n"
+            "(thin back-lit materials such as leaves).");
+
+        changed |= ImGui::SliderFloat(
+            "Scatter radius (px)",
+            &settings.radiusPixels,
+            2.0f,
+            64.0f,
+            "%.0f");
+        changed |= ImGui::SliderFloat("Scatter strength", &settings.strength, 0.0f, 4.0f, "%.2f");
+        ImGui::SetItemTooltip(
+            "Scales the diffused subsurface contribution on top of the sharp term.");
+
+        changed |= ImGui::SliderFloat(
+            "Depth tolerance",
+            &settings.depthTolerance,
+            0.2f,
+            8.0f,
+            "%.1f");
+        ImGui::SetItemTooltip(
+            "Blur taps that land farther than this many local pixels in world space are faded\n"
+            "so the diffusion does not bleed across depth discontinuities.");
+
+        int iterations = static_cast<int>(settings.iterations);
+        if (ImGui::SliderInt("Blur iterations", &iterations, 1, 3))
+        {
+            settings.iterations = static_cast<std::uint32_t>(iterations);
+            changed = true;
+        }
+        ImGui::SetItemTooltip("Additional ping-pong passes widen the diffusion halo.");
+
+        static const char* kSssDebugViews[] = {"Off", "Blurred SSS", "Sharp source"};
+        changed |= ImGui::Combo("SSS debug", &settings.debugView, kSssDebugViews, 3);
+
+        if (changed)
+        {
+            m_renderer->SetSssSettings(settings);
+        }
     }
 
     void DrawReflectionSettings()

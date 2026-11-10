@@ -548,6 +548,25 @@ bool LoadGltfModel(const std::filesystem::path& path, GltfModel& model)
             converted.dispersion = readNumber(*dispersion, "dispersion", converted.dispersion);
         }
 
+        if (const tinygltf::Value* diffuseTransmission =
+                extensionValue("KHR_materials_diffuse_transmission"))
+        {
+            converted.diffuseTransmissionFactor = readNumber(
+                *diffuseTransmission,
+                "diffuseTransmissionFactor",
+                converted.diffuseTransmissionFactor);
+            converted.diffuseTransmissionTexture = readTextureIndex(
+                *diffuseTransmission,
+                "diffuseTransmissionTexture");
+            converted.diffuseTransmissionColorFactor = readColor(
+                *diffuseTransmission,
+                "diffuseTransmissionColorFactor",
+                converted.diffuseTransmissionColorFactor);
+            converted.diffuseTransmissionColorTexture = readTextureIndex(
+                *diffuseTransmission,
+                "diffuseTransmissionColorTexture");
+        }
+
         if (const tinygltf::Value* sheen = extensionValue("KHR_materials_sheen"))
         {
             converted.sheenColorFactor =

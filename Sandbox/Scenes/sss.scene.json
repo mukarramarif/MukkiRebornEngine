@@ -1,0 +1,35 @@
+{
+  "name": "Subsurface Plant",
+  "assetRoot": "../../ThirdParty/glTF-Sample-Assets",
+  "environment": {
+    "map": "../../AssetLibrary/lakeside_sunrise_2k.hdr",
+    "intensity": 0.35
+  },
+  "objects": [
+    {
+      "name": "Plant",
+      "model": "Models/DiffuseTransmissionPlant/glTF/DiffuseTransmissionPlant.gltf",
+      "position": [0.0, 0.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0],
+      "scale": [1.5, 1.5, 1.5]
+    }
+  ],
+  "lights": [
+    {
+      "name": "Sun",
+      "type": "directional",
+      "direction": [-0.3, -1.0, -0.45],
+      "color": [1.0, 0.96, 0.9],
+      "intensity": 0.7
+    },
+    {
+      "name": "Firefly",
+      "type": "point",
+      "position": [0.3, 2.0, -1.4],
+      "color": [0.79, 1.0, 0.49],
+      "intensity": 45.0,
+      "range": 6.0,
+      "castShadows": true
+    }
+  ]
+}

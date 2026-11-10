@@ -22,7 +22,7 @@ must not expose backend types, and Vulkan types may only appear under `Renderer/
   `Renderer/Vulkan/`); `rhi::MergeShaderReflectionBindings` and `rhi::ApplyShaderReflection` build
   descriptor set layouts, vertex input layouts and push constant ranges from the shader interface.
   Only the bindless set (update-after-bind runtime arrays) is declared by hand.
-- The engine will be using tinygltf and ktx libraries for loading glTF and KTX2 assets, respectively. The engine will support PBR materials and textures, as well as animation and skinning. tinygltf is pinned to 2.9.3 via a `vcpkg.json` override and served from `overlay-ports/tinygltf` because the registry port hashes are stale after GitHub regenerated its release tarballs. Sample models live in the shallow `ThirdParty/glTF-Sample-Models` submodule.
+- The engine will be using tinygltf and ktx libraries for loading glTF and KTX2 assets, respectively. The engine will support PBR materials and textures, as well as animation and skinning. tinygltf is pinned to 2.9.3 via a `vcpkg.json` override and served from `overlay-ports/tinygltf` because the registry port hashes are stale after GitHub regenerated its release tarballs. Sample models live in the shallow `ThirdParty/glTF-Sample-Models` submodule; the Khronos `ThirdParty/glTF-Sample-Assets` submodule is shallow + sparse (`Models/DiffuseTransmissionPlant`) for the SSS demo.
 - Scenes: authored as JSON with nlohmann/json under `Scene/` (`SceneJson`), compiled offline or
   in-tool into the little-endian `SceneBinary` bytecode (magic `MRES`), and loaded by the engine
   from that bytecode at runtime. `SceneDescription` holds glTF object instances (model path plus
@@ -50,6 +50,22 @@ must not expose backend types, and Vulkan types may only appear under `Renderer/
   older scenes. Root `playerPlane` names the scene object that enters flight mode. `SceneJson`
   parses/serializes both blocks and `SceneBinary` writes them after the physics block; v4/v5 still
   decode with defaults.
+- Subsurface scattering (Phases 1+2): `KHR_materials_diffuse_transmission` is parsed into
+  `GltfMaterial`/`DrawItem`/`GpuObjectData` (factor in texture alpha, sRGB color texture) and
+  `GpuGeometryData`; `brdf.slang` exposes `SubsurfaceTransmissionRadiance` (back-lit diffuse BTDF)
+  and the diffuse BRDF albedo is scaled by `(1 - factor)`. The lighting pass now renders offscreen
+  with two attachments (`m_lightingColor` + `m_sssSource`, both RGBA16F) and the transparent pass
+  runs in that HDR scope; ACES moved to `composite.frag.slang` (adds the blurred SSS, then tone
+  maps; cluster-heatmap/GI-only debug views pass through). `sss_blur.comp.slang` is a separable
+  depth-aware diffusion at half resolution using the radius-parameterized LUT from
+  `Renderer/Lighting/Subsurface.h` (`BuildSubsurfaceLut`, 128x16, tap distance x log radius bucket,
+  per-channel radii); the sets are created lazily after the first lighting pass because the color
+  targets start in the undefined layout. `DeferredRenderer::SssSettings` (enabled/radius/strength/
+  depth tolerance/iterations/debug view) is exposed in the `Subsurface scattering` UI section and
+  `m_hasSssMaterials` (set when a material has a factor, cleared with the models) gates the passes.
+  `Sandbox/Scenes/sss.scene.json` uses `ThirdParty/glTF-Sample-Assets` (shallow + sparse:
+  `Models/DiffuseTransmissionPlant`); `Tests/test_subsurface.cpp` and the loader test cover the LUT
+  and the extension parsing.
 - Flight demo: `Sandbox/Scenes/flight.scene.json` spawns a glass skyscraper city with a low-poly
   airplane as the `playerPlane` object (flight mode auto-enables on load), a 0.9-2.8 km cloud layer
   and the sunrise HDR environment.

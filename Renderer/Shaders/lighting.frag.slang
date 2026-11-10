@@ -68,6 +68,9 @@ struct GpuObjectData
     float4 emissive; // rgb: emissiveFactor (incl. strength)
     uint4 emissiveTextureIndices;
     uint4 emissiveSamplerIndices;
+    float4 subsurface;            // rgb: diffuseTransmissionColor, a: factor
+    uint4 subsurfaceTextureIndices; // x: diffuseTransmissionTexture, y: color texture
+    uint4 subsurfaceSamplerIndices;
 };
 
 [[vk::binding(0, 0)]] ConstantBuffer<SceneUniform> gScene;
@@ -119,16 +122,6 @@ static const uint kSpotShadowOffset = kShadowCascadeCount;
 static const uint kPointShadowOffset = kSpotShadowOffset + kMaxSpotShadowLights;
 static const uint kPointShadowFaceCount = 6;
 static const uint kPointShadowResolution = 512;
-
-float3 acesTonemap(float3 color)
-{
-    const float a = 2.51;
-    const float b = 0.03;
-    const float c = 2.43;
-    const float d = 0.59;
-    const float e = 0.14;
-    return saturate((color * (a * color + b)) / (color * (c * color + d) + e));
-}
 
 float distanceAttenuation(float distance, float range)
 {
@@ -335,8 +328,25 @@ struct VertexOutput
     [[vk::location(0)]] float2 uv : TEXCOORD0;
 };
 
+// The lighting pass renders offscreen with two attachments: the HDR lit image and the subsurface
+// diffuse source (rgb: transmit energy, a: coverage). The composite pass adds the diffused source
+// and applies tone mapping, so this entry no longer tonemaps.
+struct LightingOutput
+{
+    float4 color : SV_Target0;
+    float4 subsurface : SV_Target1;
+};
+
+LightingOutput MakeOutput(float3 color, float3 subsurface, float subsurfaceCoverage)
+{
+    LightingOutput output;
+    output.color = float4(color, 1.0);
+    output.subsurface = float4(subsurface, subsurfaceCoverage);
+    return output;
+}
+
 [shader("fragment")]
-float4 fragmentMain(VertexOutput input) : SV_Target
+LightingOutput fragmentMain(VertexOutput input)
 {
     const float4 albedoMetalness = gAlbedo.Sample(input.uv);
     const float4 normalRoughness = gNormal.Sample(input.uv);
@@ -369,7 +379,7 @@ float4 fragmentMain(VertexOutput input) : SV_Target
         // the in-scattered light.
         const float4 clouds = gClouds.Sample(gCloudSampler, input.uv);
         sky = sky * clouds.a + clouds.rgb + gGodRays.Sample(gCloudSampler, input.uv).rgb;
-        return float4(acesTonemap(sky), 1.0);
+        return MakeOutput(sky, float3(0.0), 0.0);
     }
 
     const float3 albedo = albedoMetalness.rgb;
@@ -389,8 +399,12 @@ float4 fragmentMain(VertexOutput input) : SV_Target
 
     // Emissive: position.w stores the object index + 1 (0 = sky) and motion.zw the object UV, so
     // the emissive texture is sampled with its real texture coordinates instead of screen UVs.
+    // The same fetch drives subsurface scattering (KHR_materials_diffuse_transmission): the
+    // transmitted diffuse energy moves out of the diffuse BRDF into the back-lit BTDF.
     const float4 gbufferMotion = gMotion.Load(int3(int2(input.position.xy), 0));
     float3 emissive = 0.0;
+    float3 subsurfaceColor = float3(0.0);
+    float subsurfaceFactor = 0.0;
     if (worldPosition.w > 0.5)
     {
         const GpuObjectData object = gObjects[uint(worldPosition.w - 0.5)];
@@ -399,15 +413,31 @@ float4 fragmentMain(VertexOutput input) : SV_Target
                 gSamplers[NonUniformResourceIndex(object.emissiveSamplerIndices.x)],
                 gbufferMotion.zw).rgb;
         emissive = object.emissive.rgb * emissiveSample;
+
+        const float subsurfaceFactorSample =
+            gTextures[NonUniformResourceIndex(object.subsurfaceTextureIndices.x)].Sample(
+                gSamplers[NonUniformResourceIndex(object.subsurfaceSamplerIndices.x)],
+                gbufferMotion.zw).a;
+        const float3 subsurfaceColorSample =
+            gTextures[NonUniformResourceIndex(object.subsurfaceTextureIndices.y)].Sample(
+                gSamplers[NonUniformResourceIndex(object.subsurfaceSamplerIndices.y)],
+                gbufferMotion.zw).rgb;
+        subsurfaceFactor = object.subsurface.a * subsurfaceFactorSample;
+        subsurfaceColor = object.subsurface.rgb * subsurfaceColorSample;
     }
+    const float3 diffuseAlbedo = albedo * (1.0 - subsurfaceFactor);
 
     // Ambient/indirect diffuse: SH irradiance from the environment, or the flat ambient fallback.
     // `color` accumulates the indirect signal; direct light goes into `directColor` so the GI-only
     // debug view can show the indirect part alone.
     float3 color = gScene.skyParams.x > 0.5
-                       ? EvaluateSkySh(gScene.skySh, normal) * albedo * (1.0 - metalness) * surfaceWeight
-                       : gScene.ambientColor.rgb * albedo * surfaceWeight;
+                       ? EvaluateSkySh(gScene.skySh, normal) * diffuseAlbedo * (1.0 - metalness) * surfaceWeight
+                       : gScene.ambientColor.rgb * diffuseAlbedo * surfaceWeight;
     float3 directColor = 0.0;
+    // Subsurface diffuse transmission is written to the second attachment and diffused by the
+    // screen space passes; the composite adds the blurred result.
+    float3 subsurfaceEnergy = float3(0.0);
+    const float subsurfaceCoverage = subsurfaceFactor > 0.0 ? 1.0 : 0.0;
 
     const float shadowFactor = sampleShadowFactor(worldPosition.xyz, normal, int2(input.position.xy));
 
@@ -420,11 +450,11 @@ float4 fragmentMain(VertexOutput input) : SV_Target
         const uint rawCount = gClusterCounts[clusterIndex];
         if (rawCount >= kMaxLightsPerCluster)
         {
-            return float4(1.0, 0.0, 1.0, 1.0);
+            return MakeOutput(float3(1.0, 0.0, 1.0), float3(0.0), 0.0);
         }
 
         const float heat = saturate(float(rawCount) / 64.0);
-        return float4(heat, heat * heat, 1.0 - heat, 1.0);
+        return MakeOutput(float3(heat, heat * heat, 1.0 - heat), float3(0.0), 0.0);
     }
 
     for (uint slot = 0; slot < clusterLightCount; ++slot)
@@ -479,11 +509,12 @@ float4 fragmentMain(VertexOutput input) : SV_Target
             }
         }
 
-        const float nDotL = max(dot(normal, lightDirection), 0.0);
+        const float rawNdotL = dot(normal, lightDirection);
+        const float nDotL = max(rawNdotL, 0.0);
         if (nDotL > 0.0)
         {
             directColor += EvaluateCookTorrance(
-                               albedo,
+                               diffuseAlbedo,
                                f0,
                                metalness,
                                roughness,
@@ -501,6 +532,18 @@ float4 fragmentMain(VertexOutput input) : SV_Target
                                radiance,
                                nDotL) *
                            surfaceWeight;
+        }
+        if (subsurfaceFactor > 0.0)
+        {
+            // Back-lit diffuse transmission (KHR_materials_diffuse_transmission). The screen space
+            // diffusion pass blurs this contribution over the surface.
+            subsurfaceEnergy += SubsurfaceTransmissionRadiance(
+                                    subsurfaceColor,
+                                    subsurfaceFactor,
+                                    metalness,
+                                    rawNdotL,
+                                    radiance) *
+                                surfaceWeight;
         }
     }
 
@@ -578,11 +621,12 @@ float4 fragmentMain(VertexOutput input) : SV_Target
     }
 
     // GI-only debug view: the indirect signal (ambient SH/IBL diffuse, traced indirect diffuse or
-    // probes and reflections) without direct lights or emissive.
+    // probes and reflections) without direct lights or emissive. The composite applies the tone
+    // mapping (the renderer disables the subsurface add for this view).
     if (gScene.screenSize.z > 1.5)
     {
-        return float4(acesTonemap(color), 1.0);
+        return MakeOutput(color, float3(0.0), 0.0);
     }
 
-    return float4(acesTonemap(color + directColor + emissive), 1.0);
+    return MakeOutput(color + directColor + emissive, subsurfaceEnergy, subsurfaceCoverage);
 }

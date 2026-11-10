@@ -5,6 +5,7 @@
 #include "Renderer/Clouds/CloudNoise.h"
 #include "Core/JobSystem.h"
 #include "Renderer/GlobalIllumination/GiAtrousSchedule.h"
+#include "Renderer/Lighting/Subsurface.h"
 #include "Renderer/RHI/Device.h"
 #include "Scene/SceneDescription.h"
 #include "Utilities/Assert.h"
@@ -363,6 +364,12 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
         return false;
     }
 
+    if (!CreateSssResources(device))
+    {
+        Shutdown();
+        return false;
+    }
+
     m_sceneUniform.ambientColor = glm::vec4(0.05f, 0.06f, 0.09f, 1.0f);
 
     m_initialized = true;
@@ -540,6 +547,11 @@ void DeferredRenderer::Resize(std::uint32_t width, std::uint32_t height)
     if (!CreateCloudResources(*m_device))
     {
         MRE_CRITICAL("Failed to recreate the cloud resources");
+    }
+
+    if (!CreateSssResources(*m_device))
+    {
+        MRE_CRITICAL("Failed to recreate the subsurface scattering resources");
     }
 
     if (!CreateRtShadowResources(*m_device))
@@ -753,6 +765,18 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
         // Emissive textures carry light, so they stay linear instead of sRGB.
         material.emissiveTexture =
             createTextureFromImage(textureImageIndex(source.emissiveTexture), rhi::Format::R8G8B8A8Unorm);
+        // Diffuse transmission: the factor lives in the alpha channel, the color is sRGB.
+        material.diffuseTransmissionTexture = createTextureFromImage(
+            textureImageIndex(source.diffuseTransmissionTexture),
+            rhi::Format::R8G8B8A8Unorm);
+        material.diffuseTransmissionColorTexture = createTextureFromImage(
+            textureImageIndex(source.diffuseTransmissionColorTexture),
+            rhi::Format::R8G8B8A8Srgb);
+        if (source.diffuseTransmissionFactor > 0.0f && !m_hasSssMaterials)
+        {
+            m_hasSssMaterials = true;
+            MRE_INFO("Diffuse transmission material detected; screen space SSS enabled");
+        }
 
         if (material.baseColorTexture != nullptr)
         {
@@ -806,6 +830,20 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
                 0,
                 *material.sheenRoughnessTexture,
                 material.sheenRoughnessTexture->GetBindlessIndex());
+        }
+        if (material.diffuseTransmissionTexture != nullptr)
+        {
+            m_bindlessSet->BindTexture(
+                0,
+                *material.diffuseTransmissionTexture,
+                material.diffuseTransmissionTexture->GetBindlessIndex());
+        }
+        if (material.diffuseTransmissionColorTexture != nullptr)
+        {
+            m_bindlessSet->BindTexture(
+                0,
+                *material.diffuseTransmissionColorTexture,
+                material.diffuseTransmissionColorTexture->GetBindlessIndex());
         }
         if (material.emissiveTexture != nullptr)
         {
@@ -900,6 +938,10 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
             item.emissive = glm::vec4{0.0f};
             item.emissiveTextureIndices = glm::uvec4{whiteIndex, 0u, 0u, 0u};
             item.emissiveSamplerIndices = glm::uvec4{defaultSamplerIndex, 0u, 0u, 0u};
+            item.subsurface = glm::vec4{0.0f};
+            item.subsurfaceTextureIndices = glm::uvec4{whiteIndex, whiteIndex, 0u, 0u};
+            item.subsurfaceSamplerIndices =
+                glm::uvec4{defaultSamplerIndex, defaultSamplerIndex, 0u, 0u};
 
             if (primitive.materialIndex >= 0 &&
                 primitive.materialIndex < static_cast<int>(resources->materials.size()))
@@ -942,6 +984,11 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
                     material.emissiveFactor.g,
                     material.emissiveFactor.b,
                     0.0f};
+                item.subsurface = glm::vec4{
+                    material.diffuseTransmissionColorFactor.r,
+                    material.diffuseTransmissionColorFactor.g,
+                    material.diffuseTransmissionColorFactor.b,
+                    material.diffuseTransmissionFactor};
 
                 const Material& gpuMaterial = resources->materials[static_cast<std::size_t>(primitive.materialIndex)];
                 if (gpuMaterial.baseColorTexture != nullptr)
@@ -1054,6 +1101,33 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
                     const GltfTexture& texture =
                         model.textures[static_cast<std::size_t>(material.emissiveTexture)];
                     item.emissiveSamplerIndices.x =
+                        GetSamplerIndex(ToRhiAddressMode(texture.wrapS), ToRhiAddressMode(texture.wrapT));
+                }
+
+                if (gpuMaterial.diffuseTransmissionTexture != nullptr)
+                {
+                    item.subsurfaceTextureIndices.x =
+                        gpuMaterial.diffuseTransmissionTexture->GetBindlessIndex();
+                }
+                if (gpuMaterial.diffuseTransmissionColorTexture != nullptr)
+                {
+                    item.subsurfaceTextureIndices.y =
+                        gpuMaterial.diffuseTransmissionColorTexture->GetBindlessIndex();
+                }
+                if (material.diffuseTransmissionTexture >= 0 &&
+                    material.diffuseTransmissionTexture < static_cast<int>(model.textures.size()))
+                {
+                    const GltfTexture& texture =
+                        model.textures[static_cast<std::size_t>(material.diffuseTransmissionTexture)];
+                    item.subsurfaceSamplerIndices.x =
+                        GetSamplerIndex(ToRhiAddressMode(texture.wrapS), ToRhiAddressMode(texture.wrapT));
+                }
+                if (material.diffuseTransmissionColorTexture >= 0 &&
+                    material.diffuseTransmissionColorTexture < static_cast<int>(model.textures.size()))
+                {
+                    const GltfTexture& texture =
+                        model.textures[static_cast<std::size_t>(material.diffuseTransmissionColorTexture)];
+                    item.subsurfaceSamplerIndices.y =
                         GetSamplerIndex(ToRhiAddressMode(texture.wrapS), ToRhiAddressMode(texture.wrapT));
                 }
             }
@@ -1262,6 +1336,7 @@ void DeferredRenderer::ClearModels()
     m_modelCache.clear();
     m_models.clear();
     m_blasDirty = true;
+    m_hasSssMaterials = false;
     ++m_geometryRevision;
 }
 
@@ -1375,6 +1450,9 @@ void DeferredRenderer::UpdateObjectData(std::uint32_t frameIndex)
         objectData[index].emissive = item.emissive;
         objectData[index].emissiveTextureIndices = item.emissiveTextureIndices;
         objectData[index].emissiveSamplerIndices = item.emissiveSamplerIndices;
+        objectData[index].subsurface = item.subsurface;
+        objectData[index].subsurfaceTextureIndices = item.subsurfaceTextureIndices;
+        objectData[index].subsurfaceSamplerIndices = item.subsurfaceSamplerIndices;
         item.pushConstants.drawIndex = static_cast<std::uint32_t>(index);
         m_previousModels[index] = item.pushConstants.model;
         ++index;
@@ -1480,6 +1558,9 @@ void DeferredRenderer::BuildAccelerationStructures(rhi::CommandList& commandList
         geometry.emissive = item.emissive;
         geometry.emissiveTextureIndices = item.emissiveTextureIndices;
         geometry.emissiveSamplerIndices = item.emissiveSamplerIndices;
+        geometry.subsurface = item.subsurface;
+        geometry.subsurfaceTextureIndices = item.subsurfaceTextureIndices;
+        geometry.subsurfaceSamplerIndices = item.subsurfaceSamplerIndices;
         m_geometryData.push_back(geometry);
     };
 
@@ -2792,10 +2873,15 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
     RecordCloudPasses(commandList, frameIndex);
 
     commandList.BeginGpuZone("Lighting");
-    commandList.BeginSwapchainRendering(
-        rhi::ClearColor{0.0f, 0.0f, 0.0f, 1.0f},
-        rhi::DepthAttachment{&m_gbuffer.GetDepth(), 1.0f, false},
-        true);
+    // Lighting and the transparent pass render offscreen in HDR with two attachments: the lit
+    // image and the subsurface diffuse source. The screen space SSS passes diffuse the source and
+    // the composite tone maps everything into the swapchain.
+    rhi::RenderingDesc lightingDesc{};
+    lightingDesc.colorAttachments = {
+        rhi::ColorAttachment{m_lightingColor.get(), rhi::ClearColor{0.0f, 0.0f, 0.0f, 1.0f}, true},
+        rhi::ColorAttachment{m_sssSource.get(), rhi::ClearColor{0.0f, 0.0f, 0.0f, 0.0f}, true}};
+    lightingDesc.depthAttachment = rhi::DepthAttachment{&m_gbuffer.GetDepth(), 1.0f, false};
+    commandList.BeginRendering(lightingDesc);
     commandList.BindPipeline(*m_lightingPipeline);
     commandList.BindDescriptorSet(0, *m_lightingSets[frameIndex]);
     commandList.BindDescriptorSet(1, *m_bindlessSet);
@@ -2818,6 +2904,43 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
             commandList.DrawIndexed(item->indexCount, item->firstIndex);
         }
         commandList.EndGpuZone();
+    }
+    commandList.EndRendering();
+    commandList.EndGpuZone();
+
+    // The composite always needs its descriptor set, even when no material uses subsurface
+    // scattering (it then passes the lighting target through).
+    CreateSssDescriptorSets();
+    if (IsSssActive())
+    {
+        RecordSssPasses(commandList, view);
+    }
+
+    commandList.BeginGpuZone("Composite");
+    commandList.BeginSwapchainRendering(
+        rhi::ClearColor{0.0f, 0.0f, 0.0f, 1.0f},
+        rhi::DepthAttachment{&m_gbuffer.GetDepth(), 1.0f, false},
+        true);
+    if (m_compositePipeline != nullptr && m_compositeSet != nullptr)
+    {
+        CompositePushConstants composite{};
+        const bool passthrough = m_clusterDebugView;
+        const bool useSharpSource = !IsSssActive();
+        const float strength = passthrough ? 0.0f
+                                           : (useSharpSource ? 1.0f
+                                                             : std::max(m_sssSettings.strength, 0.0f));
+        composite.params = glm::vec4{
+            strength,
+            static_cast<float>(m_sssSettings.debugView),
+            useSharpSource ? 1.0f : 0.0f,
+            passthrough ? 1.0f : 0.0f};
+        commandList.BindPipeline(*m_compositePipeline);
+        commandList.BindDescriptorSet(0, *m_compositeSet);
+        commandList.SetPushConstants(
+            &composite,
+            sizeof(composite),
+            rhi::ShaderStageMask::Fragment);
+        commandList.Draw(3);
     }
 
     RecordDebugLines(commandList, view);
@@ -3293,6 +3416,12 @@ bool DeferredRenderer::LoadShaders(rhi::Device& device, const std::filesystem::p
     m_cloudGodRayShader = device.CreateShader(
         rhi::ShaderStage::Compute,
         shaderDirectory / "cloud_godrays.comp.spv");
+    m_sssBlurShader = device.CreateShader(
+        rhi::ShaderStage::Compute,
+        shaderDirectory / "sss_blur.comp.spv");
+    m_compositeShader = device.CreateShader(
+        rhi::ShaderStage::Fragment,
+        shaderDirectory / "composite.frag.spv");
 
     if (m_gbufferVertexShader == nullptr || m_gbufferFragmentShader == nullptr ||
         m_transparentFragmentShader == nullptr ||
@@ -3305,7 +3434,8 @@ bool DeferredRenderer::LoadShaders(rhi::Device& device, const std::filesystem::p
         m_reflectionTemporalShader == nullptr || m_reflectionUpsampleShader == nullptr ||
         m_debugLineVertexShader == nullptr || m_debugLineFragmentShader == nullptr ||
         m_cloudShader == nullptr || m_cloudUpsampleShader == nullptr ||
-        m_cloudReprojectShader == nullptr || m_cloudGodRayShader == nullptr)
+        m_cloudReprojectShader == nullptr || m_cloudGodRayShader == nullptr ||
+        m_sssBlurShader == nullptr || m_compositeShader == nullptr)
     {
         MRE_CRITICAL("Failed to load the deferred shaders from '{}'", PathToUtf8(shaderDirectory));
         return false;
@@ -3354,7 +3484,12 @@ bool DeferredRenderer::CreatePipelines(rhi::Device& device)
     transparentPipelineDesc.blend = true;
     transparentPipelineDesc.cullMode = rhi::CullMode::None;
     transparentPipelineDesc.descriptorSetLayouts = {m_sceneSetLayout.get(), m_bindlessSetLayout.get()};
-    transparentPipelineDesc.colorFormats = {device.GetSwapchainInfo().format};
+    // The transparent pass renders into the offscreen HDR lighting scope, which has two
+    // attachments; the pipeline must declare the matching attachment count (the subsurface target
+    // keeps its cleared value).
+    transparentPipelineDesc.colorFormats = {
+        rhi::Format::R16G16B16A16Sfloat,
+        rhi::Format::R16G16B16A16Sfloat};
     transparentPipelineDesc.depthFormat = rhi::Format::D32Sfloat;
     m_transparentPipeline = device.CreatePipeline(transparentPipelineDesc);
 
@@ -3365,13 +3500,48 @@ bool DeferredRenderer::CreatePipelines(rhi::Device& device)
     lightingPipelineDesc.depthWrite = false;
     lightingPipelineDesc.blend = false;
     lightingPipelineDesc.cullMode = rhi::CullMode::None;
-    // Set 1 is the bindless material set used for the emissive texture lookup.
+    // Set 1 is the bindless material set used for the emissive/subsurface texture lookups.
     lightingPipelineDesc.descriptorSetLayouts = {m_lightingSetLayout.get(), m_bindlessSetLayout.get()};
-    lightingPipelineDesc.colorFormats = {device.GetSwapchainInfo().format};
-    // The swapchain scope attaches the G-buffer depth for the transparent pass; pipelines drawn in
-    // that scope must declare the matching depth format even when depth testing is disabled.
+    // Attachment 0: HDR lit image, attachment 1: subsurface diffuse source (blurred before the
+    // composite adds it and applies tone mapping).
+    lightingPipelineDesc.colorFormats = {
+        rhi::Format::R16G16B16A16Sfloat,
+        rhi::Format::R16G16B16A16Sfloat};
     lightingPipelineDesc.depthFormat = rhi::Format::D32Sfloat;
     m_lightingPipeline = device.CreatePipeline(lightingPipelineDesc);
+
+    if (m_sssBlurShader != nullptr)
+    {
+        const std::array<const rhi::Shader*, 1> sssBlurStages{m_sssBlurShader.get()};
+        m_sssBlurSetLayout =
+            device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(sssBlurStages, 0));
+
+        rhi::PipelineDesc sssBlurPipelineDesc{};
+        sssBlurPipelineDesc.computeShader = m_sssBlurShader.get();
+        sssBlurPipelineDesc.descriptorSetLayouts = {m_sssBlurSetLayout.get()};
+        sssBlurPipelineDesc.pushConstantSize = sizeof(SssBlurPushConstants);
+        sssBlurPipelineDesc.pushConstantStages = rhi::ShaderStageMask::Compute;
+        m_sssBlurPipeline = device.CreatePipeline(sssBlurPipelineDesc);
+    }
+
+    if (m_compositeShader != nullptr)
+    {
+        const std::array<const rhi::Shader*, 1> compositeStages{m_compositeShader.get()};
+        m_compositeSetLayout =
+            device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(compositeStages, 0));
+
+        rhi::PipelineDesc compositePipelineDesc{};
+        compositePipelineDesc.vertexShader = m_lightingVertexShader.get();
+        compositePipelineDesc.fragmentShader = m_compositeShader.get();
+        compositePipelineDesc.descriptorSetLayouts = {m_compositeSetLayout.get()};
+        compositePipelineDesc.pushConstantSize = sizeof(CompositePushConstants);
+        compositePipelineDesc.pushConstantStages = rhi::ShaderStageMask::Fragment;
+        compositePipelineDesc.cullMode = rhi::CullMode::None;
+        compositePipelineDesc.colorFormats = {device.GetSwapchainInfo().format};
+        // Drawn in the swapchain scope that also hosts the debug line pass (depth test disabled).
+        compositePipelineDesc.depthFormat = rhi::Format::D32Sfloat;
+        m_compositePipeline = device.CreatePipeline(compositePipelineDesc);
+    }
 
     rhi::PipelineDesc clusterPipelineDesc{};
     clusterPipelineDesc.computeShader = m_clusterCullingShader.get();
@@ -4209,6 +4379,203 @@ bool DeferredRenderer::ReadGiProbes(std::vector<GpuGiProbe>& out)
         m_giProbeData[index].depth = out[index].depth;
     }
     return true;
+}
+
+bool DeferredRenderer::CreateSssResources(rhi::Device& device)
+{
+    m_lightingColor.reset();
+    m_sssSource.reset();
+    m_sssBlurTargets[0].reset();
+    m_sssBlurTargets[1].reset();
+    m_sssLut.reset();
+    m_sssSampler.reset();
+    m_sssBlurSets.clear();
+    m_compositeSet.reset();
+
+    const std::uint32_t width = m_gbuffer.GetWidth();
+    const std::uint32_t height = m_gbuffer.GetHeight();
+    if (width == 0 || height == 0)
+    {
+        return false;
+    }
+
+    m_sssHalfWidth = std::max(1u, width / 2u);
+    m_sssHalfHeight = std::max(1u, height / 2u);
+
+    m_lightingColor = device.CreateTexture(rhi::TextureDesc{
+        width,
+        height,
+        rhi::Format::R16G16B16A16Sfloat,
+        rhi::TextureUsage::ColorAttachment});
+    m_sssSource = device.CreateTexture(rhi::TextureDesc{
+        width,
+        height,
+        rhi::Format::R16G16B16A16Sfloat,
+        rhi::TextureUsage::ColorAttachment});
+    m_sssBlurTargets[0] = device.CreateTexture(rhi::TextureDesc{
+        m_sssHalfWidth,
+        m_sssHalfHeight,
+        rhi::Format::R16G16B16A16Sfloat,
+        rhi::TextureUsage::Storage});
+    m_sssBlurTargets[1] = device.CreateTexture(rhi::TextureDesc{
+        m_sssHalfWidth,
+        m_sssHalfHeight,
+        rhi::Format::R16G16B16A16Sfloat,
+        rhi::TextureUsage::Storage});
+
+    std::vector<float> lutPixels{};
+    BuildSubsurfaceLut(lutPixels);
+    m_sssLut = device.CreateTexture(rhi::TextureDesc{
+        kSubsurfaceLutWidth,
+        kSubsurfaceLutHeight,
+        rhi::Format::R32G32B32A32Sfloat,
+        rhi::TextureUsage::Sampled,
+        lutPixels.data(),
+        lutPixels.size() * sizeof(float)});
+    m_sssSampler = device.CreateSampler(rhi::SamplerDesc{});
+
+    if (m_lightingColor == nullptr || m_sssSource == nullptr ||
+        m_sssBlurTargets[0] == nullptr || m_sssBlurTargets[1] == nullptr ||
+        m_sssLut == nullptr || m_sssSampler == nullptr)
+    {
+        MRE_CRITICAL("Failed to create the subsurface scattering resources");
+        return false;
+    }
+    return true;
+}
+
+// Descriptor sets are created lazily after the first lighting pass: the color targets are in the
+// undefined layout at creation and only become shader readable when the pass ends.
+void DeferredRenderer::CreateSssDescriptorSets()
+{
+    if (m_device == nullptr || m_sssBlurPipeline == nullptr || m_sssBlurSetLayout == nullptr ||
+        m_compositeSetLayout == nullptr || m_lightingColor == nullptr || m_sssSource == nullptr ||
+        m_sssBlurTargets[0] == nullptr || m_sssBlurTargets[1] == nullptr || m_sssLut == nullptr ||
+        m_sssSampler == nullptr)
+    {
+        return;
+    }
+
+    if (m_sssBlurSets.empty())
+    {
+        constexpr std::uint32_t kMaxPasses = 6; // 3 iterations * (horizontal + vertical)
+        m_sssBlurSets.reserve(kMaxPasses);
+        for (std::uint32_t pass = 0; pass < kMaxPasses; ++pass)
+        {
+            const bool horizontal = (pass % 2u) == 0u;
+            rhi::Texture* source = m_sssSource.get();
+            if (pass > 0)
+            {
+                source = horizontal ? m_sssBlurTargets[1].get() : m_sssBlurTargets[0].get();
+            }
+            rhi::Texture* dest =
+                horizontal ? m_sssBlurTargets[0].get() : m_sssBlurTargets[1].get();
+
+            std::unique_ptr<rhi::DescriptorSet> set =
+                m_device->CreateDescriptorSet(*m_sssBlurSetLayout);
+            set->BindTexture(0, *source, 0u);
+            set->BindSampler(1, *m_sssSampler);
+            set->BindTexture(2, m_gbuffer.GetPosition(), 0u);
+            set->BindTexture(3, *m_sssLut, 0u);
+            set->BindSampler(4, *m_sssSampler);
+            set->BindStorageImage(5, *dest);
+            m_sssBlurSets.push_back(std::move(set));
+        }
+    }
+
+    if (m_compositeSet == nullptr)
+    {
+        m_compositeSet = m_device->CreateDescriptorSet(*m_compositeSetLayout);
+        m_compositeSet->BindTexture(0, *m_lightingColor, 0u);
+        m_compositeSet->BindTexture(1, *m_sssSource, 0u);
+        m_compositeSet->BindTexture(2, *m_sssBlurTargets[1], 0u);
+        m_compositeSet->BindSampler(3, *m_sssSampler);
+    }
+}
+
+void DeferredRenderer::RecordSssPasses(rhi::CommandList& commandList, const FrameView& view)
+{
+    if (m_sssBlurPipeline == nullptr || !m_hasSssMaterials)
+    {
+        return;
+    }
+
+    if (m_sssBlurSets.empty())
+    {
+        return;
+    }
+
+    const std::uint32_t iterations =
+        std::clamp(m_sssSettings.iterations, 1u, 3u);
+    const float radius =
+        std::clamp(m_sssSettings.radiusPixels, 1.0f, kSubsurfaceLutRadiusMaxPx);
+    const float logMin = std::log(kSubsurfaceLutRadiusMinPx);
+    const float logMax = std::log(kSubsurfaceLutRadiusMaxPx);
+    const float logRange = std::max(logMax - logMin, 1.0e-4f);
+
+    commandList.BeginGpuZone("SssBlur");
+    commandList.BindPipeline(*m_sssBlurPipeline);
+    for (std::uint32_t pass = 0; pass < 2u * iterations; ++pass)
+    {
+        if (pass > 0)
+        {
+            commandList.ShaderMemoryBarrier(
+                rhi::ShaderStageMask::Compute,
+                rhi::ShaderStageMask::Compute);
+        }
+
+        const bool horizontal = (pass % 2u) == 0u;
+        const std::uint32_t sourceWidth =
+            pass == 0 ? m_gbuffer.GetWidth() : m_sssHalfWidth;
+        const std::uint32_t sourceHeight =
+            pass == 0 ? m_gbuffer.GetHeight() : m_sssHalfHeight;
+        const float spacing =
+            std::max(radius / 4.0f, 0.5f) * static_cast<float>(1u + pass / 2u);
+
+        SssBlurPushConstants push{};
+        push.params = glm::vec4{
+            radius,
+            std::max(m_sssSettings.depthTolerance, 0.01f),
+            spacing,
+            0.0f};
+        push.fullSize = glm::vec4{
+            static_cast<float>(m_gbuffer.GetWidth()),
+            static_cast<float>(m_gbuffer.GetHeight()),
+            0.0f,
+            0.0f};
+        push.sourceSize = glm::vec4{
+            static_cast<float>(sourceWidth),
+            static_cast<float>(sourceHeight),
+            0.0f,
+            0.0f};
+        push.destSize = glm::vec4{
+            static_cast<float>(m_sssHalfWidth),
+            static_cast<float>(m_sssHalfHeight),
+            0.0f,
+            0.0f};
+        push.direction = horizontal ? glm::vec4{1.0f, 0.0f, 0.0f, 0.0f}
+                                    : glm::vec4{0.0f, 1.0f, 0.0f, 0.0f};
+        push.cameraPosition = glm::vec4{view.position, 1.0f};
+        push.projection = glm::vec4{
+            std::tan(std::max(view.fovYRadians, 1.0e-3f) * 0.5f),
+            static_cast<float>(m_gbuffer.GetHeight()),
+            0.0f,
+            0.0f};
+        push.lutParams = glm::vec4{1.0f / logRange, -logMin / logRange, 0.0f, 0.0f};
+
+        commandList.BindDescriptorSet(0, *m_sssBlurSets[pass]);
+        commandList.SetPushConstants(&push, sizeof(push), rhi::ShaderStageMask::Compute);
+        commandList.Dispatch(
+            (m_sssHalfWidth + 7u) / 8u,
+            (m_sssHalfHeight + 7u) / 8u,
+            1);
+    }
+    commandList.EndGpuZone();
+}
+
+bool DeferredRenderer::IsSssActive() const
+{
+    return m_sssSettings.enabled && m_hasSssMaterials && m_sssBlurPipeline != nullptr;
 }
 
 bool DeferredRenderer::IsPerPixelGiActive() const

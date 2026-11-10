@@ -246,6 +246,8 @@ struct SurfaceSample
     float3 sheenColor;
     float sheenRoughness;
     float3 emissive;
+    float3 subsurfaceColor;
+    float subsurfaceFactor;
 };
 
 // Interpolated geometric normal of a hit. Cheap enough for probe depth checks (three vertex
@@ -336,6 +338,16 @@ SurfaceSample LoadSurface(
             gSamplers[NonUniformResourceIndex(geometry.emissiveSamplerIndices.x)],
             uv,
             0.0).rgb;
+    const float subsurfaceFactorSample =
+        gTextures[NonUniformResourceIndex(geometry.subsurfaceTextureIndices.x)].SampleLevel(
+            gSamplers[NonUniformResourceIndex(geometry.subsurfaceSamplerIndices.x)],
+            uv,
+            0.0).a;
+    const float3 subsurfaceColorSample =
+        gTextures[NonUniformResourceIndex(geometry.subsurfaceTextureIndices.y)].SampleLevel(
+            gSamplers[NonUniformResourceIndex(geometry.subsurfaceSamplerIndices.y)],
+            uv,
+            0.0).rgb;
 
     SurfaceSample surface;
     surface.position = rayOrigin + rayDirection * hitDistance;
@@ -359,6 +371,8 @@ SurfaceSample LoadSurface(
     surface.sheenColor = geometry.sheen.rgb * sheenColorSample;
     surface.sheenRoughness = saturate(geometry.sheen.a * sheenRoughnessSample);
     surface.emissive = geometry.emissive.rgb * emissiveSample;
+    surface.subsurfaceColor = geometry.subsurface.rgb * subsurfaceColorSample;
+    surface.subsurfaceFactor = saturate(geometry.subsurface.a * subsurfaceFactorSample);
     return surface;
 }
 
@@ -438,13 +452,16 @@ float3 ShadeOpaqueSurface(
     const float roughness = clamp(surface.roughness, 0.04, 1.0);
 
     const float3 sunDirection = gGi.sunDirectionIntensity.xyz;
-    const float sunNdotL = max(dot(normal, sunDirection), 0.0);
+    const float rawSunNdotL = dot(normal, sunDirection);
+    const float sunNdotL = max(rawSunNdotL, 0.0);
     const bool sunActive =
-        gGi.params3.z > 0.5 && gGi.sunDirectionIntensity.w > 0.0 && sunNdotL > 0.0;
+        gGi.params3.z > 0.5 && gGi.sunDirectionIntensity.w > 0.0 && (sunNdotL > 0.0 || surface.subsurfaceFactor > 0.0);
 
     // Sky/ambient stays diffuse; direct lights are shaded with the full BRDF. Emissive surfaces
-    // add their emitted radiance regardless of lighting.
-    float3 radiance = surface.baseColor * GiIrradianceOverPi(normal) + surface.emissive;
+    // add their emitted radiance regardless of lighting. Subsurface materials move part of the
+    // diffuse lobe into the back-lit diffuse transmission term added below.
+    const float3 diffuseAlbedo = surface.baseColor * (1.0 - surface.subsurfaceFactor);
+    float3 radiance = diffuseAlbedo * GiIrradianceOverPi(normal) + surface.emissive;
 
     if (sunActive)
     {
@@ -500,7 +517,7 @@ float3 ShadeOpaqueSurface(
         const float3 sunRadiance =
             gGi.sunColor.rgb * gGi.sunDirectionIntensity.w * visibility;
         radiance += EvaluateCookTorrance(
-            surface.baseColor,
+            diffuseAlbedo,
             f0,
             surface.metalness,
             roughness,
@@ -508,6 +525,15 @@ float3 ShadeOpaqueSurface(
             viewDirection,
             sunDirection,
             sunRadiance);
+        if (surface.subsurfaceFactor > 0.0)
+        {
+            radiance += SubsurfaceTransmissionRadiance(
+                surface.subsurfaceColor,
+                surface.subsurfaceFactor,
+                surface.metalness,
+                rawSunNdotL,
+                sunRadiance);
+        }
         if (any(surface.sheenColor > 1e-5))
         {
             radiance += EvaluateSheenBRDF(
@@ -552,8 +578,9 @@ float3 ShadeOpaqueSurface(
                 }
             }
 
-            const float nDotL = dot(normal, lightDirection);
-            if (nDotL <= 0.0)
+            const float rawNdotL = dot(normal, lightDirection);
+            const bool backLit = surface.subsurfaceFactor > 0.0 && rawNdotL < 0.0;
+            if (rawNdotL <= 0.0 && !backLit)
             {
                 continue;
             }
@@ -563,7 +590,7 @@ float3 ShadeOpaqueSurface(
             {
                 visibility = TraceLightVisibility(
                     hitPosition,
-                    normal,
+                    backLit ? -normal : normal,
                     lightDirection,
                     distance,
                     shadowBias);
@@ -572,7 +599,7 @@ float3 ShadeOpaqueSurface(
             const float3 lightRadiance =
                 light.color.rgb * light.directionIntensity.w * attenuation * cone * visibility;
             radiance += EvaluateCookTorrance(
-                surface.baseColor,
+                diffuseAlbedo,
                 f0,
                 surface.metalness,
                 roughness,
@@ -580,6 +607,15 @@ float3 ShadeOpaqueSurface(
                 viewDirection,
                 lightDirection,
                 lightRadiance);
+            if (backLit)
+            {
+                radiance += SubsurfaceTransmissionRadiance(
+                    surface.subsurfaceColor,
+                    surface.subsurfaceFactor,
+                    surface.metalness,
+                    rawNdotL,
+                    lightRadiance);
+            }
             if (any(surface.sheenColor > 1e-5))
             {
                 radiance += EvaluateSheenBRDF(
@@ -589,7 +625,7 @@ float3 ShadeOpaqueSurface(
                     viewDirection,
                     lightDirection,
                     lightRadiance,
-                    saturate(nDotL));
+                    saturate(rawNdotL));
             }
         }
     }

@@ -94,6 +94,9 @@ struct GpuObjectData
     glm::vec4 emissive{0.0f};           // rgb: emissiveFactor (incl. strength)
     glm::uvec4 emissiveTextureIndices{0u}; // x: emissiveTexture
     glm::uvec4 emissiveSamplerIndices{0u}; // x: emissive sampler
+    glm::vec4 subsurface{0.0f};            // rgb: diffuseTransmissionColor, a: factor
+    glm::uvec4 subsurfaceTextureIndices{0u}; // x: diffuseTransmissionTexture, y: color texture
+    glm::uvec4 subsurfaceSamplerIndices{0u};
 };
 
 class DeferredRenderer
@@ -164,6 +167,22 @@ public:
     // indirect diffuse (per-pixel or probes) and the traced reflections, without direct lights.
     void SetGiDebugView(bool enabled) { m_giDebugView = enabled; }
     [[nodiscard]] bool IsGiDebugViewEnabled() const { return m_giDebugView; }
+
+    // Screen space subsurface scattering (KHR_materials_diffuse_transmission). The lighting pass
+    // moves the back-lit diffuse transmission into a source buffer, blurs it with a
+    // radius-parameterized diffusion LUT and composites the result before tone mapping.
+    struct SssSettings
+    {
+        bool enabled = true;
+        float radiusPixels = 18.0f;   // diffusion radius in half-resolution pixels
+        float strength = 1.0f;
+        float depthTolerance = 2.0f;  // multiples of the local pixel world size
+        std::uint32_t iterations = 2; // 1..3 ping-pong pairs (larger halos)
+        int debugView = 0;            // 0 = off, 1 = blurred SSS, 2 = sharp SSS source
+    };
+
+    void SetSssSettings(const SssSettings& settings) { m_sssSettings = settings; }
+    [[nodiscard]] const SssSettings& GetSssSettings() const { return m_sssSettings; }
 
     // True when the GI trace is currently replaced by the irradiance probes.
     [[nodiscard]] bool IsProbeGiActive() const;
@@ -261,11 +280,16 @@ private:
         glm::vec4 sheen{0.0f};
         glm::uvec4 sheenTextureIndices{0u};
         glm::uvec4 sheenSamplerIndices{0u};
-        // Emissive: rgb = emissiveFactor (scaled by emissive strength), a = 1 when any emissive.
-        glm::vec4 emissive{0.0f};
-        glm::uvec4 emissiveTextureIndices{0u};
-        glm::uvec4 emissiveSamplerIndices{0u};
+    // Emissive: rgb = emissiveFactor (scaled by emissive strength), a = 1 when any emissive.
+    glm::vec4 emissive{0.0f};
+    glm::uvec4 emissiveTextureIndices{0u};
+    glm::uvec4 emissiveSamplerIndices{0u};
+    // KHR_materials_diffuse_transmission (see GpuObjectData).
+    glm::vec4 subsurface{0.0f};               // rgb: diffuseTransmissionColorFactor, a: factor
+    glm::uvec4 subsurfaceTextureIndices{0u};  // x: diffuseTransmissionTexture, y: color texture
+    glm::uvec4 subsurfaceSamplerIndices{0u};
     };
+
 
     // Per draw item data read by ray traced effects (global illumination color bleeding).
     struct GpuGeometryData
@@ -282,10 +306,14 @@ private:
         glm::vec4 sheen{0.0f};               // rgb: sheenColorFactor, a: sheenRoughnessFactor
         glm::uvec4 sheenTextureIndices{0u};  // x: sheenColorTexture, y: sheenRoughnessTexture
         glm::uvec4 sheenSamplerIndices{0u};
-        glm::vec4 emissive{0.0f};             // rgb: emissiveFactor (incl. strength), a: unused
-        glm::uvec4 emissiveTextureIndices{0u}; // x: emissiveTexture
-        glm::uvec4 emissiveSamplerIndices{0u}; // x: emissive sampler
+    glm::vec4 emissive{0.0f};             // rgb: emissiveFactor (incl. strength), a: unused
+    glm::uvec4 emissiveTextureIndices{0u}; // x: emissiveTexture
+    glm::uvec4 emissiveSamplerIndices{0u}; // x: emissive sampler
+    glm::vec4 subsurface{0.0f};            // rgb: diffuseTransmissionColor, a: factor
+    glm::uvec4 subsurfaceTextureIndices{0u}; // x: diffuseTransmissionTexture, y: color texture
+    glm::uvec4 subsurfaceSamplerIndices{0u};
     };
+
 
     inline static constexpr std::uint32_t kMaxObjectData = 2048;
 
@@ -300,6 +328,8 @@ private:
         std::unique_ptr<rhi::Texture> sheenColorTexture{};
         std::unique_ptr<rhi::Texture> sheenRoughnessTexture{};
         std::unique_ptr<rhi::Texture> emissiveTexture{};
+        std::unique_ptr<rhi::Texture> diffuseTransmissionTexture{};
+        std::unique_ptr<rhi::Texture> diffuseTransmissionColorTexture{};
     };
 
     struct SceneObjectBounds
@@ -457,6 +487,29 @@ private:
     [[nodiscard]] bool IsRtShadowActive() const;
     bool CreateGiProbeResources(rhi::Device& device);
     void RecordGiProbes(rhi::CommandList& commandList, std::uint32_t frameIndex);
+
+    // Screen space subsurface scattering resources and passes.
+    struct SssBlurPushConstants
+    {
+        glm::vec4 params{0.0f};     // x: radius px, y: depth tolerance, z: tap spacing px
+        glm::vec4 fullSize{0.0f};   // xy: full resolution
+        glm::vec4 sourceSize{0.0f}; // xy: source resolution
+        glm::vec4 destSize{0.0f};   // xy: destination resolution
+        glm::vec4 direction{0.0f};  // xy: blur axis
+        glm::vec4 cameraPosition{0.0f};
+        glm::vec4 projection{0.0f}; // x: tan(fovY / 2), y: full height
+        glm::vec4 lutParams{0.0f};  // x/y: bucket mapping
+    };
+
+    struct CompositePushConstants
+    {
+        glm::vec4 params{0.0f}; // x: strength, y: debug view, z: passthrough
+    };
+
+    bool CreateSssResources(rhi::Device& device);
+    void CreateSssDescriptorSets();
+    void RecordSssPasses(rhi::CommandList& commandList, const FrameView& view);
+    [[nodiscard]] bool IsSssActive() const;
     [[nodiscard]] bool IsPerPixelGiActive() const;
     bool CreateReflectionResources(rhi::Device& device);
     void UpdateReflectionUniform(std::uint32_t frameIndex);
@@ -644,6 +697,24 @@ private:
     std::vector<std::unique_ptr<rhi::Buffer>> m_debugLineBuffers{};
     std::size_t m_debugLineBufferCapacity = 0;
     std::vector<GiProbe> m_giProbes{};
+    // Screen space subsurface scattering (KHR_materials_diffuse_transmission).
+    SssSettings m_sssSettings{};
+    bool m_hasSssMaterials = false;
+    std::unique_ptr<rhi::Shader> m_sssBlurShader{};
+    std::unique_ptr<rhi::Shader> m_compositeShader{};
+    std::unique_ptr<rhi::Pipeline> m_sssBlurPipeline{};
+    std::unique_ptr<rhi::Pipeline> m_compositePipeline{};
+    std::unique_ptr<rhi::DescriptorSetLayout> m_sssBlurSetLayout{};
+    std::unique_ptr<rhi::DescriptorSetLayout> m_compositeSetLayout{};
+    std::unique_ptr<rhi::Texture> m_lightingColor{};
+    std::unique_ptr<rhi::Texture> m_sssSource{};
+    std::unique_ptr<rhi::Texture> m_sssBlurTargets[2]{};
+    std::unique_ptr<rhi::Texture> m_sssLut{};
+    std::unique_ptr<rhi::Sampler> m_sssSampler{};
+    std::vector<std::unique_ptr<rhi::DescriptorSet>> m_sssBlurSets{};
+    std::unique_ptr<rhi::DescriptorSet> m_compositeSet{};
+    std::uint32_t m_sssHalfWidth = 0;
+    std::uint32_t m_sssHalfHeight = 0;
     bool m_showLightGizmos = true;
     bool m_showProbeGizmos = true;
     bool m_showPhysicsGizmos = false;

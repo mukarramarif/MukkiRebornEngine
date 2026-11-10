@@ -31,7 +31,7 @@ configure into `build/<preset>/vcpkg_installed`. That first configure can take s
 vcpkg builds the dependencies. `tinygltf` is pinned to 2.9.3 because the 3.0.0 port hash no longer
 matches GitHub's regenerated tarball.
 
-Sample assets live in a submodule (about 1.7 GB, cloned shallow):
+Sample assets live in two submodules (about 1.7 GB and 12 MB, cloned shallow):
 
 ```sh
 git clone --recurse-submodules <repository-url>
@@ -39,8 +39,15 @@ git clone --recurse-submodules <repository-url>
 git submodule update --init --depth 1
 ```
 
-Without the submodule the engine still builds and tests pass, but the default demo scene cannot
-load its models.
+`ThirdParty/glTF-Sample-Assets` uses a sparse checkout (only
+`Models/DiffuseTransmissionPlant`) to keep the download small; after initializing it run:
+
+```sh
+git -C ThirdParty/glTF-Sample-Assets sparse-checkout set Models/DiffuseTransmissionPlant
+```
+
+Without the submodules the engine still builds and tests pass, but the demo scenes cannot load their
+models.
 
 Shader compilation uses `slangc` from the Vulkan SDK, found through the `VULKAN_SDK` environment
 variable (or on `PATH`). If `slangc` is missing, CMake prints a warning, shader targets are skipped
@@ -271,7 +278,8 @@ A minimal scene:
   [Airplane demo](#airplane-demo).
 - `Sandbox/Scenes/demo.scene.json` is a complete example with 11 glTF objects (including two dynamic
   bodies and one static body) and 10 lights; `Sandbox/Scenes/flight.scene.json` is the playable
-  airplane demo.
+  airplane demo and `Sandbox/Scenes/sss.scene.json` demonstrates subsurface scattering on the
+  Khronos diffuse transmission plant.
 
 ### Compiling
 
@@ -493,6 +501,19 @@ clustered lights:
   reset their accumulation when moved. The `Probe irradiance (live)` section reads the GPU
   coefficients back on a timer (or on `Refresh probes`) and shows each probe's SH as a 32x16
   equirectangular irradiance thumbnail, plus the numeric `sh0..shZ` of the selected probe.
+- **Subsurface scattering**: `KHR_materials_diffuse_transmission` materials (thin back-lit surfaces
+  such as leaves) mix part of their diffuse lobe into a diffuse transmission BTDF. The lighting
+  pass writes that back-lit term into a second offscreen attachment (the HDR lit image and the
+  subsurface source are produced together), the `sss_blur.comp.slang` passes run a separable,
+  depth-aware diffusion at half resolution with a **radius-parameterized LUT**
+  (`BuildSubsurfaceLut`, 128x16: normalized tap distance x logarithmic scattering radius bucket,
+  per-channel radii so red scatters furthest) and `composite.frag.slang` adds the blurred result to
+  the lighting image before applying ACES tone mapping. The `Subsurface scattering` UI section
+  controls the effect: enabled, scatter radius in pixels, strength, depth tolerance and blur
+  iterations, plus `Off`/`Blurred SSS`/`Sharp source` debug views. The same terms are evaluated in
+  the ray traced hit shading (`gi_shading.slang`), so GI, reflections and probes stay consistent.
+  `Sandbox/Scenes/sss.scene.json` is a demo built around the Khronos `DiffuseTransmissionPlant`
+  with a firefly light behind the leaves.
 - **Debug views**: `Visualize cluster light counts` replaces the image with the cluster heatmap and
   `GI only view` (in the GI section) shows just the indirect signal: ambient SH/IBL diffuse, the
   traced diffuse signal (or probes) and the traced reflections, without direct lights or emissive.
@@ -557,7 +578,7 @@ in-memory edits to `<exe>\scenes\<name>.mres`, and `Save JSON` dumps them back t
 - `Renderer/BufferManager` - vertex/index/uniform buffer management
 - `Scene/` - scene description, JSON authoring (nlohmann/json) and `MRES` bytecode
 - `Tools/` - command line tools (`mukki_scene_compiler`)
-- `ThirdParty/` - submodules (glTF sample models)
+- `ThirdParty/` - submodules (glTF sample models, glTF sample assets)
 - `overlay-ports/` - local vcpkg ports (tinygltf, box3d)
 - `Utilities/` - logging, asserts, future containers and allocators
 - `Tests/` - GoogleTest unit tests

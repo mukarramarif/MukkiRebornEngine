@@ -117,10 +117,11 @@ add_library(mukki_engine STATIC
     Renderer/Deferred/DeferredRenderer.cpp
     Renderer/Deferred/GBuffer.cpp
     Renderer/GlobalIllumination/GiAtrousSchedule.cpp
-Renderer/Lighting/ClusterGrid.cpp
-Renderer/Lighting/Environment.cpp
-Renderer/Lighting/Light.cpp
-Renderer/Lighting/ShadowCascade.cpp
+    Renderer/Lighting/ClusterGrid.cpp
+    Renderer/Lighting/Environment.cpp
+    Renderer/Lighting/Light.cpp
+    Renderer/Lighting/ShadowCascade.cpp
+    Renderer/Lighting/Subsurface.cpp
     Renderer/RHI/Resources.cpp
     Scene/SceneBinary.cpp
     Scene/SceneDescription.cpp
@@ -223,6 +224,8 @@ if(MRE_BUILD_SANDBOX)
         Renderer/Shaders/cloud_upsample.comp.slang
         Renderer/Shaders/debug_line.vert.slang
         Renderer/Shaders/debug_line.frag.slang
+        Renderer/Shaders/sss_blur.comp.slang
+        Renderer/Shaders/composite.frag.slang
     )
 endif()
 

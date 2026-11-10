@@ -21,6 +21,44 @@ std::filesystem::path AssetLibraryRoot()
     return std::filesystem::path{MRE_SOURCE_DIR} / "AssetLibrary";
 }
 
+TEST(GltfLoader, ParsesDiffuseTransmissionMaterials)
+{
+    const std::filesystem::path modelPath =
+        std::filesystem::path{MRE_SOURCE_DIR} /
+        "ThirdParty/glTF-Sample-Assets/Models/DiffuseTransmissionPlant/glTF/DiffuseTransmissionPlant.gltf";
+    if (!std::filesystem::exists(modelPath))
+    {
+        GTEST_SKIP() << "glTF-Sample-Assets submodule is not initialized";
+    }
+
+    mukki::GltfModel model{};
+    ASSERT_TRUE(mukki::LoadGltfModel(modelPath, model));
+
+    const auto leaves = std::find_if(
+        model.materials.begin(),
+        model.materials.end(),
+        [](const mukki::GltfMaterial& material) {
+            return material.diffuseTransmissionFactor > 0.0f;
+        });
+    ASSERT_NE(leaves, model.materials.end());
+    EXPECT_NEAR(leaves->diffuseTransmissionFactor, 0.1f, 1.0e-4f);
+    EXPECT_FLOAT_EQ(leaves->diffuseTransmissionColorFactor.r, 1.0f);
+    EXPECT_FLOAT_EQ(leaves->diffuseTransmissionColorFactor.g, 1.0f);
+    EXPECT_FLOAT_EQ(leaves->diffuseTransmissionColorFactor.b, 1.0f);
+    EXPECT_GE(leaves->diffuseTransmissionColorTexture, 0);
+    EXPECT_EQ(leaves->diffuseTransmissionTexture, -1);
+    EXPECT_TRUE(leaves->alphaMask);
+
+    // Materials without the extension stay disabled.
+    const auto opaque = std::find_if(
+        model.materials.begin(),
+        model.materials.end(),
+        [](const mukki::GltfMaterial& material) {
+            return material.diffuseTransmissionFactor == 0.0f;
+        });
+    EXPECT_NE(opaque, model.materials.end());
+}
+
 TEST(GltfLoader, LoadsFlightDemoAirplane)
 {
     const std::filesystem::path modelPath =
