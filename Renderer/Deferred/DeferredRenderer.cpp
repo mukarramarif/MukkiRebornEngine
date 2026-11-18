@@ -409,9 +409,10 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
     if (m_meshletRenderingSupported)
     {
         MRE_INFO(
-            "Meshlet rendering {} (mesh shader G-buffer and shadow passes, {})",
+            "Meshlet rendering {} (mesh shader G-buffer and shadow passes, {}, debug view {})",
             m_meshletRenderingEnabled ? "enabled" : "disabled",
-            m_meshletCullPipeline != nullptr ? "compute culling" : "in-shader culling");
+            m_meshletCullPipeline != nullptr ? "compute culling" : "in-shader culling",
+            m_meshletDebugView ? "on" : "off");
     }
 
     if (!CreateRtShadowResources(device))

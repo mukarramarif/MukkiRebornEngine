@@ -233,7 +233,10 @@ must not expose backend types, and Vulkan types may only appear under `Renderer/
   heatmap (`SetClusterDebugView`), 2 = GI only (`SetGiDebugView`: ambient SH/IBL diffuse, indirect
   or probes and reflections, no direct/emissive), 3 = per-meshlet colors (`SetMeshletDebugView`,
   written by `gbuffer.mesh.slang` through a location 4 G-buffer attribute and passed through by
-  the lighting/composite passes). `DeferredRenderer::ReadGiProbes` waits idle and
+  the lighting/composite passes). Keep the `SceneUniform` field order identical in the gbuffer,
+  transparent, lighting, mesh and cull shaders: a missing field silently shifts every later member
+  (omitting `inverseViewProjection` made `screenSize.z` alias the cluster grid and pinned the
+  meshlet debug view on). `DeferredRenderer::ReadGiProbes` waits idle and
   reads the GPU probe buffer back via `rhi::Buffer::Read`; the sandbox rebuilds a 32x16-per-probe
   equirectangular SH irradiance atlas (`R8G8B8A8Srgb`) on a timer and shows it in the probe UI,
   retiring old textures for a few frames before releasing them (ImGui descriptors must outlive the
