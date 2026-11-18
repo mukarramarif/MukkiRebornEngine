@@ -226,6 +226,11 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
     {
         shadowStages.push_back(m_shadowMeshShader.get());
     }
+    if (m_shadowCullShader != nullptr)
+    {
+        // The shadow cull dispatch reads the shadow uniform, so set 0 must cover compute too.
+        shadowStages.push_back(m_shadowCullShader.get());
+    }
     const std::array<const rhi::Shader*, 1> giTraceStages{m_giTraceShader.get()};
     const std::array<const rhi::Shader*, 1> giTemporalStages{m_giTemporalShader.get()};
     const std::array<const rhi::Shader*, 1> giAtrousStages{m_giAtrousShader.get()};
@@ -240,6 +245,12 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
         device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(clusterStages, 0));
     m_shadowSetLayout =
         device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(shadowStages, 0));
+    if (m_shadowCullShader != nullptr)
+    {
+        const std::array<const rhi::Shader*, 1> shadowCullStages{m_shadowCullShader.get()};
+        m_shadowCullSetLayout =
+            device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(shadowCullStages, 1));
+    }
     if (m_gbufferMeshShader != nullptr)
     {
         const std::array<const rhi::Shader*, 1> meshStages{m_gbufferMeshShader.get()};
@@ -384,11 +395,16 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
     m_meshletRenderingSupported = m_gbufferMeshShader != nullptr && m_shadowMeshShader != nullptr &&
                                   m_gbufferMeshPipeline != nullptr && m_shadowMeshPipeline != nullptr &&
                                   m_meshSetLayout != nullptr &&
-                                  m_meshSets.size() == device.GetFramesInFlight();
+                                  m_meshSets.size() == device.GetFramesInFlight() &&
+                                  m_shadowMeshSets.size() == device.GetFramesInFlight();
     m_meshletRenderingEnabled = m_meshletRenderingSupported;
     if (std::getenv("MRE_MESHLETS_OFF") != nullptr)
     {
         m_meshletRenderingEnabled = false;
+    }
+    if (std::getenv("MRE_MESHLET_DEBUG") != nullptr)
+    {
+        SetMeshletDebugView(true);
     }
     if (m_meshletRenderingSupported)
     {
@@ -436,17 +452,25 @@ void DeferredRenderer::Shutdown()
     m_gbufferMeshPipeline.reset();
     m_meshletCullPipeline.reset();
     m_meshletCullSetLayout.reset();
+    m_shadowCullPipeline.reset();
+    m_shadowCullSetLayout.reset();
     m_meshSetLayout.reset();
     m_meshDrawBuffers.clear();
     m_meshletIndexBuffers.clear();
     m_meshletCommandBuffers.clear();
     m_meshSets.clear();
     m_meshletCullSets.clear();
+    m_shadowMeshletIndexBuffers.clear();
+    m_shadowMeshletCommandBuffers.clear();
+    m_shadowMeshSets.clear();
+    m_shadowCullSets.clear();
     m_meshletCount = 0;
     m_meshletTriangleCount = 0;
     m_meshletRenderingSupported = false;
     m_meshletRenderingEnabled = true;
     m_meshletCompactionActive = false;
+    m_meshletDebugView = false;
+    m_shadowMeshletCompactionActive = false;
     m_clusterCullingPipeline.reset();
     m_lightingPipeline.reset();
     m_gbufferPipeline.reset();
@@ -454,6 +478,7 @@ void DeferredRenderer::Shutdown()
     m_shadowMeshShader.reset();
     m_shadowVertexShader.reset();
     m_meshletCullShader.reset();
+    m_shadowCullShader.reset();
     m_gbufferMeshShader.reset();
     m_clusterCullingShader.reset();
     m_lightingFragmentShader.reset();
@@ -1505,6 +1530,15 @@ void DeferredRenderer::UnloadModel()
 void DeferredRenderer::SetMeshletRenderingEnabled(bool enabled)
 {
     m_meshletRenderingEnabled = enabled && m_meshletRenderingSupported;
+    if (!m_meshletRenderingEnabled)
+    {
+        m_meshletDebugView = false;
+    }
+}
+
+void DeferredRenderer::SetMeshletDebugView(bool enabled)
+{
+    m_meshletDebugView = enabled && m_meshletRenderingSupported && m_meshletRenderingEnabled;
 }
 
 void DeferredRenderer::SetModelScale(float scale)
@@ -2958,9 +2992,16 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
 
     BuildShadowCullItems();
     BuildShadowViews();
+    BuildShadowMeshletCull(frameIndex);
 
     const bool meshShadowActive =
-        meshRenderingActive && m_shadowMeshPipeline != nullptr && !m_shadowViews.empty();
+        meshRenderingActive && m_shadowMeshPipeline != nullptr &&
+        frameIndex < m_shadowMeshSets.size() && !m_shadowViews.empty();
+    const bool shadowCompactionActive = meshShadowActive && m_shadowMeshletCompactionActive;
+    if (shadowCompactionActive)
+    {
+        RecordShadowMeshletCullPass(commandList, frameIndex);
+    }
 
     if (!m_shadowViews.empty())
     {
@@ -2972,7 +3013,7 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
 
         if (useShadowSecondaries)
         {
-            RecordShadowViews(frameIndex, meshShadowActive);
+            RecordShadowViews(frameIndex, meshShadowActive, shadowCompactionActive);
 
             for (std::size_t index = 0; index < m_shadowViews.size(); ++index)
             {
@@ -3012,7 +3053,7 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
                     commandList.BindPipeline(*m_shadowMeshPipeline);
                     commandList.BindDescriptorSet(0, *m_shadowSets[frameIndex]);
                     commandList.BindDescriptorSet(1, *m_bindlessSet);
-                    commandList.BindDescriptorSet(2, *m_meshSets[frameIndex]);
+                    commandList.BindDescriptorSet(2, *m_shadowMeshSets[frameIndex]);
                     commandList.SetDepthBias(
                         m_shadowSettings.depthBias,
                         m_shadowSettings.depthBias * 1.5f,
@@ -3020,18 +3061,31 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
 
                     const std::uint32_t meshPushConstantSize =
                         m_shadowMeshPipeline->GetPushConstantSize();
-                    for (const DrawItem* item : shadowView.items)
+                    for (const ShadowMeshDraw& meshDraw : shadowView.meshDraws)
                     {
-                        if (item->meshletCount == 0)
-                        {
-                            continue;
-                        }
-                        pushConstants.object = item->pushConstants;
+                        const DrawItem& item = *meshDraw.item;
+                        pushConstants.object = item.pushConstants;
+                        pushConstants.compactedOffset = shadowCompactionActive
+                                                            ? meshDraw.compactedOffset
+                                                            : kMeshletCullDisabled;
                         commandList.SetPushConstants(
                             &pushConstants,
                             meshPushConstantSize,
                             rhi::ShaderStageMask::FragmentMesh);
-                        commandList.DrawMeshTasks(item->meshletCount);
+                        if (shadowCompactionActive &&
+                            meshDraw.compactedOffset != kMeshletCullDisabled)
+                        {
+                            commandList.DrawMeshTasksIndirect(
+                                *m_shadowMeshletCommandBuffers[frameIndex],
+                                static_cast<std::uint64_t>(meshDraw.commandIndex) *
+                                    sizeof(GpuMeshTaskCommand),
+                                1u,
+                                sizeof(GpuMeshTaskCommand));
+                        }
+                        else
+                        {
+                            commandList.DrawMeshTasks(item.meshletCount);
+                        }
                     }
                 }
 
@@ -3217,7 +3271,7 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
     commandList.BindDescriptorSet(1, *m_bindlessSet);
     commandList.Draw(3);
 
-    if (!transparentItems.empty())
+    if (!transparentItems.empty() && !m_meshletDebugView)
     {
         commandList.BeginGpuZone("Transparent");
         commandList.BindPipeline(*m_transparentPipeline);
@@ -3254,7 +3308,7 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
     if (m_compositePipeline != nullptr && m_compositeSet != nullptr)
     {
         CompositePushConstants composite{};
-        const bool passthrough = m_clusterDebugView;
+        const bool passthrough = m_clusterDebugView || m_meshletDebugView;
         const bool useSharpSource = !IsSssActive();
         const float strength = passthrough ? 0.0f
                                            : (useSharpSource ? 1.0f
@@ -3720,7 +3774,123 @@ void DeferredRenderer::BuildShadowViews()
     }
 }
 
-void DeferredRenderer::RecordShadowViews(std::uint32_t frameIndex, bool meshShadowActive)
+void DeferredRenderer::BuildShadowMeshletCull(std::uint32_t frameIndex)
+{
+    MRE_PROFILE_ZONE_N("BuildShadowMeshletCull");
+    m_shadowMeshletCompactionActive = false;
+    for (ShadowView& view : m_shadowViews)
+    {
+        view.meshDraws.clear();
+    }
+    if (m_shadowViews.empty() || !m_meshletRenderingEnabled || !m_meshletRenderingSupported ||
+        m_shadowMeshPipeline == nullptr)
+    {
+        return;
+    }
+
+    // Gather the mesh items of every view. Command indices and compacted offsets are assigned in
+    // view/item order so the cull pass and the per-view draw recording agree.
+    std::uint32_t commandCount = 0;
+    std::uint32_t meshletCount = 0;
+    for (ShadowView& view : m_shadowViews)
+    {
+        view.meshDraws.reserve(view.items.size());
+        for (const DrawItem* item : view.items)
+        {
+            if (item->meshletCount == 0)
+            {
+                continue;
+            }
+            view.meshDraws.push_back(ShadowMeshDraw{item, commandCount, meshletCount});
+            ++commandCount;
+            meshletCount += item->meshletCount;
+        }
+    }
+
+    const bool resourcesAvailable =
+        m_shadowCullPipeline != nullptr && frameIndex < m_shadowCullSets.size() &&
+        frameIndex < m_shadowMeshletIndexBuffers.size() &&
+        frameIndex < m_shadowMeshletCommandBuffers.size() &&
+        m_shadowCullSets[frameIndex] != nullptr &&
+        m_shadowMeshletIndexBuffers[frameIndex] != nullptr &&
+        m_shadowMeshletCommandBuffers[frameIndex] != nullptr;
+    const bool fits = commandCount <= kMaxShadowViews * kMaxObjectData &&
+                      meshletCount <= kShadowMeshletCompactionCapacity;
+    m_shadowMeshletCompactionActive = resourcesAvailable && fits;
+    if (!m_shadowMeshletCompactionActive)
+    {
+        for (ShadowView& view : m_shadowViews)
+        {
+            for (ShadowMeshDraw& draw : view.meshDraws)
+            {
+                draw.commandIndex = kMeshletCullDisabled;
+                draw.compactedOffset = kMeshletCullDisabled;
+            }
+        }
+        return;
+    }
+
+    // Rearm the per-view indirect commands: groupCountY/Z stay 1 and groupCountX is accumulated
+    // by the cull dispatches.
+    std::vector<std::uint32_t> commands(commandCount * 3u, 1u);
+    for (std::uint32_t command = 0; command < commandCount; ++command)
+    {
+        commands[command * 3u] = 0u;
+    }
+    if (!commands.empty())
+    {
+        m_shadowMeshletCommandBuffers[frameIndex]->Write(
+            commands.data(),
+            commands.size() * sizeof(std::uint32_t));
+    }
+}
+
+void DeferredRenderer::RecordShadowMeshletCullPass(
+    rhi::CommandList& commandList,
+    std::uint32_t frameIndex)
+{
+    MRE_PROFILE_ZONE_N("RecordShadowMeshletCullPass");
+    MRE_ASSERT(m_shadowCullPipeline != nullptr, "RecordShadowMeshletCullPass requires the cull pipeline");
+    MRE_ASSERT(
+        m_shadowMeshletCompactionActive,
+        "RecordShadowMeshletCullPass requires active compaction");
+    MRE_ASSERT(frameIndex < m_shadowSets.size(), "Frame index out of range");
+    MRE_ASSERT(frameIndex < m_shadowCullSets.size(), "Frame index out of range");
+
+    commandList.BeginGpuZone("ShadowMeshletCull");
+    commandList.BindPipeline(*m_shadowCullPipeline);
+    commandList.BindDescriptorSet(0, *m_shadowSets[frameIndex]);
+    commandList.BindDescriptorSet(1, *m_shadowCullSets[frameIndex]);
+    commandList.BindDescriptorSet(2, *m_bindlessSet);
+
+    ShadowCullPushConstants cull{};
+    for (const ShadowView& view : m_shadowViews)
+    {
+        for (const ShadowMeshDraw& meshDraw : view.meshDraws)
+        {
+            const DrawItem& item = *meshDraw.item;
+            cull.model = item.pushConstants.model;
+            cull.viewIndex = view.viewIndex;
+            cull.drawIndex = item.pushConstants.drawIndex;
+            cull.compactedOffset = meshDraw.compactedOffset;
+            cull.commandIndex = meshDraw.commandIndex;
+            cull.meshletCount = item.meshletCount;
+            commandList.SetPushConstants(&cull, sizeof(cull), rhi::ShaderStageMask::Compute);
+            commandList.Dispatch(
+                (item.meshletCount + kMeshletCullGroupSize - 1u) / kMeshletCullGroupSize,
+                1u,
+                1u);
+        }
+    }
+
+    commandList.EndGpuZone();
+    commandList.MeshTaskIndirectBarrier();
+}
+
+void DeferredRenderer::RecordShadowViews(
+    std::uint32_t frameIndex,
+    bool meshShadowActive,
+    bool meshCompactionActive)
 {
     MRE_PROFILE_ZONE_N("RecordShadowViews");
     MRE_ASSERT(m_jobSystem != nullptr, "RecordShadowViews requires a job system");
@@ -3729,8 +3899,14 @@ void DeferredRenderer::RecordShadowViews(std::uint32_t frameIndex, bool meshShad
         m_shadowViews.size() <= m_shadowSecondaries[frameIndex].size(),
         "Not enough shadow secondary command lists were allocated");
     MRE_ASSERT(
-        !meshShadowActive || (m_shadowMeshPipeline != nullptr && frameIndex < m_meshSets.size()),
+        !meshShadowActive ||
+            (m_shadowMeshPipeline != nullptr && frameIndex < m_shadowMeshSets.size()),
         "Meshlet shadow views require the mesh pipeline and descriptor set");
+    MRE_ASSERT(
+        !meshCompactionActive ||
+            (frameIndex < m_shadowMeshletCommandBuffers.size() &&
+             m_shadowMeshletCommandBuffers[frameIndex] != nullptr),
+        "Meshlet shadow views require the cull command buffer");
 
     std::vector<std::future<void>> futures{};
     futures.reserve(m_shadowViews.size());
@@ -3748,12 +3924,12 @@ void DeferredRenderer::RecordShadowViews(std::uint32_t frameIndex, bool meshShad
         desc.area = view.area;
 
         futures.push_back(m_jobSystem->Submit(
-            [this, frameIndex, secondary, &view, desc, meshShadowActive]() {
+            [this, frameIndex, secondary, &view, desc, meshShadowActive, meshCompactionActive]() {
                 RecordShadowView(
                     frameIndex,
-                    view.viewIndex,
-                    view.items,
+                    view,
                     meshShadowActive,
+                    meshCompactionActive,
                     *secondary,
                     desc);
             }));
@@ -3767,23 +3943,29 @@ void DeferredRenderer::RecordShadowViews(std::uint32_t frameIndex, bool meshShad
 
 void DeferredRenderer::RecordShadowView(
     std::uint32_t frameIndex,
-    std::uint32_t shadowViewIndex,
-    const std::vector<const DrawItem*>& items,
+    const ShadowView& view,
     bool meshShadowActive,
+    bool meshCompactionActive,
     rhi::CommandList& secondary,
     const rhi::RenderingDesc& desc)
 {
     MRE_ASSERT(m_shadowPipeline != nullptr, "RecordShadowView requires the shadow pipeline");
     MRE_ASSERT(frameIndex < m_shadowSets.size(), "Frame index out of range");
     MRE_ASSERT(
-        !meshShadowActive || (m_shadowMeshPipeline != nullptr && frameIndex < m_meshSets.size()),
+        !meshShadowActive ||
+            (m_shadowMeshPipeline != nullptr && frameIndex < m_shadowMeshSets.size()),
         "Meshlet shadow views require the mesh pipeline and descriptor set");
+    MRE_ASSERT(
+        !meshCompactionActive ||
+            (frameIndex < m_shadowMeshletCommandBuffers.size() &&
+             m_shadowMeshletCommandBuffers[frameIndex] != nullptr),
+        "Meshlet shadow views require the cull command buffer");
 
     secondary.BeginSecondary(desc);
     secondary.BeginGpuZone("ShadowView");
 
     ShadowPushConstants pushConstants{};
-    pushConstants.viewIndex = shadowViewIndex;
+    pushConstants.viewIndex = view.viewIndex;
 
     // Mesh items first so the view binds each pipeline at most once.
     if (meshShadowActive)
@@ -3791,23 +3973,34 @@ void DeferredRenderer::RecordShadowView(
         secondary.BindPipeline(*m_shadowMeshPipeline);
         secondary.BindDescriptorSet(0, *m_shadowSets[frameIndex]);
         secondary.BindDescriptorSet(1, *m_bindlessSet);
-        secondary.BindDescriptorSet(2, *m_meshSets[frameIndex]);
+        secondary.BindDescriptorSet(2, *m_shadowMeshSets[frameIndex]);
         secondary.SetDepthBias(m_shadowSettings.depthBias, m_shadowSettings.depthBias * 1.5f, 0.0f);
 
         const std::uint32_t meshPushConstantSize =
             m_shadowMeshPipeline->GetPushConstantSize();
-        for (const DrawItem* item : items)
+        for (const ShadowMeshDraw& meshDraw : view.meshDraws)
         {
-            if (item->meshletCount == 0)
-            {
-                continue;
-            }
-            pushConstants.object = item->pushConstants;
+            const DrawItem& item = *meshDraw.item;
+            pushConstants.object = item.pushConstants;
+            pushConstants.compactedOffset = meshCompactionActive ? meshDraw.compactedOffset
+                                                                : kMeshletCullDisabled;
             secondary.SetPushConstants(
                 &pushConstants,
                 meshPushConstantSize,
                 rhi::ShaderStageMask::FragmentMesh);
-            secondary.DrawMeshTasks(item->meshletCount);
+            if (meshCompactionActive && meshDraw.compactedOffset != kMeshletCullDisabled)
+            {
+                secondary.DrawMeshTasksIndirect(
+                    *m_shadowMeshletCommandBuffers[frameIndex],
+                    static_cast<std::uint64_t>(meshDraw.commandIndex) *
+                        sizeof(GpuMeshTaskCommand),
+                    1u,
+                    sizeof(GpuMeshTaskCommand));
+            }
+            else
+            {
+                secondary.DrawMeshTasks(item.meshletCount);
+            }
         }
     }
 
@@ -3817,13 +4010,14 @@ void DeferredRenderer::RecordShadowView(
     secondary.SetDepthBias(m_shadowSettings.depthBias, m_shadowSettings.depthBias * 1.5f, 0.0f);
 
     const std::uint32_t pushConstantSize = m_shadowPipeline->GetPushConstantSize();
-    for (const DrawItem* item : items)
+    for (const DrawItem* item : view.items)
     {
         if (meshShadowActive && item->meshletCount > 0)
         {
             continue;
         }
         pushConstants.object = item->pushConstants;
+        pushConstants.compactedOffset = kMeshletCullDisabled;
         secondary.BindVertexBuffer(*item->vertexBuffer);
         secondary.BindIndexBuffer(*item->indexBuffer);
         secondary.SetPushConstants(
@@ -3924,6 +4118,9 @@ bool DeferredRenderer::LoadShaders(rhi::Device& device, const std::filesystem::p
         m_shadowMeshShader = device.CreateShader(
             rhi::ShaderStage::Mesh,
             shaderDirectory / "shadow.mesh.spv");
+        m_shadowCullShader = device.CreateShader(
+            rhi::ShaderStage::Compute,
+            shaderDirectory / "shadow_cull.comp.spv");
         m_meshletCullShader = device.CreateShader(
             rhi::ShaderStage::Compute,
             shaderDirectory / "meshlet_cull.comp.spv");
@@ -3934,6 +4131,10 @@ bool DeferredRenderer::LoadShaders(rhi::Device& device, const std::filesystem::p
         if (m_meshletCullShader == nullptr)
         {
             MRE_WARN("Failed to load the meshlet cull shader; meshlets cull in the mesh shader");
+        }
+        if (m_shadowCullShader == nullptr)
+        {
+            MRE_WARN("Failed to load the shadow cull shader; shadow meshlets cull in the shader");
         }
     }
 
@@ -4146,6 +4347,25 @@ bool DeferredRenderer::CreatePipelines(rhi::Device& device)
             m_meshSetLayout.get()};
         shadowMeshPipelineDesc.depthFormat = rhi::Format::D32Sfloat;
         m_shadowMeshPipeline = device.CreatePipeline(shadowMeshPipelineDesc);
+    }
+
+    // Compute cull for the shadow views: set 0 is the shadow uniform set, set 1 the mesh
+    // draw/compaction/indirect buffers and set 2 the bindless meshlet data.
+    if (m_shadowCullShader != nullptr && m_shadowCullSetLayout != nullptr)
+    {
+        const std::array<const rhi::Shader*, 1> shadowCullStages{m_shadowCullShader.get()};
+        rhi::PipelineDesc shadowCullPipelineDesc{};
+        shadowCullPipelineDesc.computeShader = m_shadowCullShader.get();
+        rhi::ApplyShaderReflection(shadowCullPipelineDesc, shadowCullStages);
+        shadowCullPipelineDesc.descriptorSetLayouts = {
+            m_shadowSetLayout.get(),
+            m_shadowCullSetLayout.get(),
+            m_bindlessSetLayout.get()};
+        m_shadowCullPipeline = device.CreatePipeline(shadowCullPipelineDesc);
+        if (m_shadowCullPipeline == nullptr)
+        {
+            MRE_WARN("Failed to create the shadow cull pipeline; shadow meshlets cull in the shader");
+        }
     }
 
     const auto createGiPipeline = [&device](
@@ -4566,11 +4786,19 @@ void DeferredRenderer::CreateMeshletResources(rhi::Device& device)
     m_meshletCommandBuffers.clear();
     m_meshSets.clear();
     m_meshletCullSets.clear();
+    m_shadowMeshletIndexBuffers.clear();
+    m_shadowMeshletCommandBuffers.clear();
+    m_shadowMeshSets.clear();
+    m_shadowCullSets.clear();
     m_meshDrawBuffers.reserve(framesInFlight);
     m_meshletIndexBuffers.reserve(framesInFlight);
     m_meshletCommandBuffers.reserve(framesInFlight);
     m_meshSets.reserve(framesInFlight);
     m_meshletCullSets.reserve(framesInFlight);
+    m_shadowMeshletIndexBuffers.reserve(framesInFlight);
+    m_shadowMeshletCommandBuffers.reserve(framesInFlight);
+    m_shadowMeshSets.reserve(framesInFlight);
+    m_shadowCullSets.reserve(framesInFlight);
     for (std::uint32_t frame = 0; frame < framesInFlight; ++frame)
     {
         m_meshDrawBuffers.push_back(device.CreateBuffer(
@@ -4620,6 +4848,53 @@ void DeferredRenderer::CreateMeshletResources(rhi::Device& device)
             cullSet->BindBuffer(2, *m_meshletCommandBuffers.back());
             m_meshletCullSets.push_back(std::move(cullSet));
         }
+
+        if (m_shadowCullSetLayout != nullptr)
+        {
+            // Shadow views compact into their own per-frame list and indirect commands.
+            m_shadowMeshletIndexBuffers.push_back(device.CreateBuffer(rhi::BufferDesc{
+                kShadowMeshletCompactionCapacity * sizeof(std::uint32_t),
+                rhi::BufferUsage::Storage}));
+            if (m_shadowMeshletIndexBuffers.back() == nullptr)
+            {
+                MRE_CRITICAL("Failed to create the shadow meshlet compaction buffer");
+                return;
+            }
+
+            m_shadowMeshletCommandBuffers.push_back(device.CreateBuffer(rhi::BufferDesc{
+                kMaxShadowViews * kMaxObjectData * sizeof(GpuMeshTaskCommand),
+                rhi::BufferUsage::Storage,
+                true,
+                false,
+                0,
+                false,
+                true}));
+            if (m_shadowMeshletCommandBuffers.back() == nullptr)
+            {
+                MRE_CRITICAL("Failed to create the shadow meshlet cull command buffer");
+                return;
+            }
+
+            std::unique_ptr<rhi::DescriptorSet> shadowCullSet =
+                device.CreateDescriptorSet(*m_shadowCullSetLayout);
+            shadowCullSet->BindBuffer(0, *m_meshDrawBuffers.back());
+            shadowCullSet->BindBuffer(1, *m_shadowMeshletIndexBuffers.back());
+            shadowCullSet->BindBuffer(2, *m_shadowMeshletCommandBuffers.back());
+            m_shadowCullSets.push_back(std::move(shadowCullSet));
+        }
+
+        // The shadow mesh shader remaps through the shadow compaction list; bind the G-buffer list
+        // as a valid placeholder when shadow culling is unavailable (the sentinel path never reads
+        // it).
+        const rhi::Buffer* shadowIndexBuffer =
+            m_shadowMeshletIndexBuffers.size() == static_cast<std::size_t>(frame) + 1u
+                ? m_shadowMeshletIndexBuffers.back().get()
+                : m_meshletIndexBuffers.back().get();
+        std::unique_ptr<rhi::DescriptorSet> shadowMeshSet =
+            device.CreateDescriptorSet(*m_meshSetLayout);
+        shadowMeshSet->BindBuffer(0, *m_meshDrawBuffers.back());
+        shadowMeshSet->BindBuffer(1, *shadowIndexBuffer);
+        m_shadowMeshSets.push_back(std::move(shadowMeshSet));
     }
 }
 
@@ -4753,8 +5028,10 @@ void DeferredRenderer::UpdateUniforms(std::uint32_t frameIndex, const FrameView&
     m_sceneUniform.screenSize = glm::vec4{
         static_cast<float>(m_gbuffer.GetWidth()),
         static_cast<float>(m_gbuffer.GetHeight()),
-        // z: debug view selection (0 = lit, 1 = cluster light count heatmap, 2 = GI only).
-        m_giDebugView ? 2.0f : (m_clusterDebugView ? 1.0f : 0.0f),
+        // z: debug view selection (0 = lit, 1 = cluster light count heatmap, 2 = GI only,
+        // 3 = per-meshlet colors).
+        m_meshletDebugView ? 3.0f
+                           : (m_giDebugView ? 2.0f : (m_clusterDebugView ? 1.0f : 0.0f)),
         IsPerPixelGiActive() ? 1.0f : 0.0f};
     // ambientColor.w carries the active GI probe count to the lighting pass (0 disables them).
     m_sceneUniform.ambientColor.w =

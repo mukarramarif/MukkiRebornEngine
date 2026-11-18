@@ -129,19 +129,22 @@ must not expose backend types, and Vulkan types may only appear under `Renderer/
   `gbuffer.mesh.slang` / `shadow.mesh.slang` (one mesh shader workgroup per meshlet) when
   `Device::IsMeshShaderSupported()`; the RHI exposes `ShaderStage::Mesh`, `PipelineDesc::meshShader`,
   `CommandList::DrawMeshTasks`/`DrawMeshTasksIndirect` and `MeshTaskIndirectBarrier`. Culling is
-  frustum + meshoptimizer normal cone
+  frustum based; the G-buffer path additionally uses the meshoptimizer normal cone
   (`dot(center - camera, axis) >= cutoff * distance + radius`; mirrored transforms skip the cone).
   The path is enabled by default when supported (`MRE_MESHLETS_OFF` disables it, the `Scenes`
   window toggles it); transparent materials, the ground plane and items without meshlets use the
-  vertex pipeline in the same rendering scope. G-buffer meshlets are first compacted by
+  vertex pipeline in the same rendering scope. G-buffer meshlets are compacted by
   `meshlet_cull.comp.slang`: one compute dispatch per draw culls the meshlets into a per-frame
   index buffer (`kMeshletCompactionCapacity`, 64 threads per workgroup) and atomically accumulates
   the draw's `GpuMeshTaskCommand` group count, which `CommandList::DrawMeshTasksIndirect` consumes;
-  `gbuffer.mesh.slang` remaps `gl_WorkGroupID` through the compacted list. The cull writes are
-  published with `CommandList::MeshTaskIndirectBarrier`. Draws beyond the capacity, shadow views
-  and cull-shader-less devices fall back to direct mesh-task dispatch with in-shader culling. The
-  G-buffer and shadow secondary command buffers (recorded on the JobSystem) replay meshlet and
-  vertex draws in the same batch, binding each pipeline at most once.
+  `gbuffer.mesh.slang` remaps `gl_WorkGroupID` through the compacted list. Shadow views use
+  `shadow_cull.comp.slang` per (view, draw) against the shadow frustum and write into their own
+  per-frame list (`kShadowMeshletCompactionCapacity`), with `shadow.mesh.slang` remapping through
+  it. The cull writes are published with `CommandList::MeshTaskIndirectBarrier`. Draws beyond the
+  capacities and cull-shader-less devices fall back to direct mesh-task dispatch with in-shader
+  culling. The G-buffer and shadow secondary command buffers (recorded on the JobSystem) replay
+  meshlet and vertex draws in the same batch, binding each pipeline at most once. The `Scenes`
+  window's `Meshlet debug view` (`MRE_MESHLET_DEBUG`) colors each meshlet through the G-buffer.
 - Bindless: descriptor indexing is a hard device requirement. Textures get a bindless index from the
   device and are bound into a global update-after-bind `SampledImage` array set; shaders sample them
   through `Texture2D textures[]` with `NonUniformResourceIndex`.
@@ -228,7 +231,9 @@ must not expose backend types, and Vulkan types may only appear under `Renderer/
   is an include, not a standalone shader; keep `GiUniform` in sync across all gi_*.slang files.
   `SceneUniform.screenSize.z` selects the lighting debug view: 0 = lit, 1 = cluster light count
   heatmap (`SetClusterDebugView`), 2 = GI only (`SetGiDebugView`: ambient SH/IBL diffuse, indirect
-  or probes and reflections, no direct/emissive). `DeferredRenderer::ReadGiProbes` waits idle and
+  or probes and reflections, no direct/emissive), 3 = per-meshlet colors (`SetMeshletDebugView`,
+  written by `gbuffer.mesh.slang` through a location 4 G-buffer attribute and passed through by
+  the lighting/composite passes). `DeferredRenderer::ReadGiProbes` waits idle and
   reads the GPU probe buffer back via `rhi::Buffer::Read`; the sandbox rebuilds a 32x16-per-probe
   equirectangular SH irradiance atlas (`R8G8B8A8Srgb`) on a timer and shows it in the probe UI,
   retiring old textures for a few frames before releasing them (ImGui descriptors must outlive the

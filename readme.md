@@ -213,12 +213,13 @@ flowchart TB
   deduplicated vertices and packed triangles. The vertex pipeline remains for transparent
   materials, the ground plane and devices without `VK_EXT_mesh_shader`. Meshlet rendering is on by
   default when supported; the `Scenes` window toggles it and `MRE_MESHLETS_OFF` disables it. The
-  G-buffer path first runs a compute cull (`meshlet_cull.comp.slang`): each draw compacts its
-  surviving meshlets into a per-frame index buffer and accumulates an indirect mesh-task group
-  count, so `gbuffer.mesh.slang` only launches workgroups for visible meshlets. Shadow views and
-  draws beyond the compaction capacity fall back to direct dispatch with in-shader culling. Both
-  the G-buffer and shadow passes record meshlet and vertex draws into secondary command buffers on
-  the job system.
+  G-buffer and shadow paths first run compute culls (`meshlet_cull.comp.slang` /
+  `shadow_cull.comp.slang`): each (view, draw) compacts its surviving meshlets into a per-frame
+  index buffer and accumulates an indirect mesh-task group count, so `gbuffer.mesh.slang` /
+  `shadow.mesh.slang` only launch workgroups for visible meshlets. Draws beyond the compaction
+  capacities fall back to direct dispatch with in-shader culling. The `Scenes` window's `Meshlet
+  debug view` colors each G-buffer meshlet. Both the G-buffer and shadow passes record meshlet and
+  vertex draws into secondary command buffers on the job system.
 
 ## Scenes
 

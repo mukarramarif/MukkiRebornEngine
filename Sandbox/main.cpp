@@ -674,6 +674,26 @@ private:
             static_cast<unsigned long long>(m_renderer->GetMeshletCount()),
             static_cast<unsigned long long>(m_renderer->GetMeshletTriangleCount()));
 
+        bool meshletDebugView = m_renderer->IsMeshletDebugViewEnabled();
+        const bool meshletDebugAvailable =
+            meshletSupported && m_renderer->IsMeshletRenderingEnabled();
+        if (!meshletDebugAvailable)
+        {
+            ImGui::BeginDisabled();
+        }
+        if (ImGui::Checkbox("Meshlet debug view", &meshletDebugView))
+        {
+            m_renderer->SetMeshletDebugView(meshletDebugView);
+        }
+        if (!meshletDebugAvailable)
+        {
+            ImGui::EndDisabled();
+        }
+        if (ImGui::IsItemHovered())
+        {
+            ImGui::SetTooltip("Colors each meshlet; culled meshlets are not drawn.");
+        }
+
         ImGui::Separator();
         ImGui::Text("Objects: %zu   Lights: %zu", m_scene.objects.size(), m_scene.lights.size());
         ImGui::Text("Vertices: %llu", static_cast<unsigned long long>(m_renderer->GetModelVertexCount()));

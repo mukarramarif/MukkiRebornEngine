@@ -213,6 +213,7 @@ if(MRE_BUILD_SANDBOX)
         Renderer/Shaders/cluster_culling.comp.slang
         Renderer/Shaders/shadow.vert.slang
         Renderer/Shaders/shadow.mesh.slang
+        Renderer/Shaders/shadow_cull.comp.slang
         Renderer/Shaders/shadow.frag.slang
         Renderer/Shaders/gi_trace.comp.slang
         Renderer/Shaders/gi_temporal.comp.slang

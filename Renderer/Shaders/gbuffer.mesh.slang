@@ -71,7 +71,18 @@ struct VertexOutput
     [[vk::location(1)]] float3 normal : NORMAL;
     [[vk::location(2)]] float2 uv : TEXCOORD0;
     [[vk::location(3)]] float4 previousClip : PREVIOUSCLIP;
+    [[vk::location(4)]] float3 debugColor : MESHLETDEBUG;
 };
+
+// Distinct color per meshlet for the debug view. Golden-ratio hue steps keep neighbouring
+// meshlets visually separated.
+float3 MeshletDebugColor(uint meshletId)
+{
+    const float hue = frac(float(meshletId) * 0.61803398875);
+    const float3 k = float3(1.0, 2.0 / 3.0, 1.0 / 3.0);
+    const float3 p = abs(frac(float3(hue, hue, hue) + k) * 6.0 - 3.0);
+    return clamp(p - 1.0, 0.0, 1.0);
+}
 
 [shader("mesh")]
 [outputtopology("triangle")]
@@ -110,6 +121,7 @@ void meshMain(
 
     const ByteAddressBuffer vertexBuffer = gBuffers[NonUniformResourceIndex(draw.vertexBufferIndex)];
     const float4x4 previousModel = gObjects[gObject.drawIndex].previousModel;
+    const float3 debugColor = MeshletDebugColor(draw.meshletOffset + meshletIndex);
 
     for (uint vertexIndex = groupThreadID.x; vertexIndex < vertexCount; vertexIndex += 32u)
     {
@@ -127,6 +139,7 @@ void meshMain(
         output.normal = mul((float3x3)gObject.model, vertex.normal);
         output.uv = vertex.uv;
         output.previousClip = mul(gScene.previousViewProjection, previousWorldPosition);
+        output.debugColor = debugColor;
         verts[vertexIndex] = output;
     }
 

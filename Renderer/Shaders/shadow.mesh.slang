@@ -13,6 +13,7 @@ struct ShadowPushConstants
     uint2 samplerIndices;
     uint drawIndex;
     uint viewIndex;
+    uint compactedOffset; // kMeshletCullDisabled when the view draw is not compute-compacted
 };
 
 // Must match mukki::kMaxShadowViews (4 cascades + 4 spots + 4 point lights * 6 faces).
@@ -28,6 +29,7 @@ struct ShadowUniform
 [[vk::push_constant]] ConstantBuffer<ShadowPushConstants> gPush;
 [[vk::binding(2, 1)]] ByteAddressBuffer gBuffers[];
 [[vk::binding(0, 2)]] StructuredBuffer<GpuMeshDraw> gMeshDraws;
+[[vk::binding(1, 2)]] StructuredBuffer<uint> gMeshletIndices;
 
 struct VertexOutput
 {
@@ -52,19 +54,25 @@ void meshMain(
     }
 
     const ByteAddressBuffer meshletBuffer = gBuffers[NonUniformResourceIndex(draw.meshletBufferIndex)];
-    const GpuMeshlet meshlet = LoadMeshlet(meshletBuffer, draw.meshletOffset + groupID.x);
+    const bool compacted = gPush.compactedOffset != kMeshletCullDisabled;
+    const uint meshletIndex =
+        compacted ? gMeshletIndices[gPush.compactedOffset + groupID.x] : groupID.x;
+    const GpuMeshlet meshlet = LoadMeshlet(meshletBuffer, draw.meshletOffset + meshletIndex);
     const float4x4 viewProjection = gShadow.viewProjections[gPush.viewIndex];
 
-    const float3 worldCenter = mul(gPush.model, float4(meshlet.centerRadius.xyz, 1.0)).xyz;
-    const float3 axisScale = float3(
-        length(gPush.model[0].xyz),
-        length(gPush.model[1].xyz),
-        length(gPush.model[2].xyz));
-    const float worldRadius = meshlet.centerRadius.w * max(axisScale.x, max(axisScale.y, axisScale.z));
-    if (IsMeshletOutsideFrustum(viewProjection, worldCenter, worldRadius))
+    if (!compacted)
     {
-        SetMeshOutputCounts(0, 0);
-        return;
+        const float3 worldCenter = mul(gPush.model, float4(meshlet.centerRadius.xyz, 1.0)).xyz;
+        const float3 axisScale = float3(
+            length(gPush.model[0].xyz),
+            length(gPush.model[1].xyz),
+            length(gPush.model[2].xyz));
+        const float worldRadius = meshlet.centerRadius.w * max(axisScale.x, max(axisScale.y, axisScale.z));
+        if (IsMeshletOutsideFrustum(viewProjection, worldCenter, worldRadius))
+        {
+            SetMeshOutputCounts(0, 0);
+            return;
+        }
     }
 
     const uint vertexCount = meshlet.data.x;

@@ -3,6 +3,7 @@ struct SceneUniform
     float4x4 viewProjection;
     float4x4 previousViewProjection;
     float4x4 view;
+    float4x4 inverseViewProjection;
     float4 cameraPosition;
     float4 ambientColor;
     float4 clusterParams;

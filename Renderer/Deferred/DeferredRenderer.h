@@ -113,6 +113,8 @@ struct GpuMeshlet
 // writes one indirect mesh-task command per draw. Draws beyond the capacity fall back to direct
 // dispatch with in-shader culling.
 inline constexpr std::uint32_t kMeshletCompactionCapacity = 1u << 18;
+// Shadow views need their own compacted meshlet list per view; this bounds the total per frame.
+inline constexpr std::uint32_t kShadowMeshletCompactionCapacity = 1u << 20;
 inline constexpr std::uint32_t kMeshletCullDisabled = 0xFFFFFFFFu;
 inline constexpr std::uint32_t kMeshletCullGroupSize = 64;
 
@@ -178,6 +180,10 @@ public:
     void SetMeshletRenderingEnabled(bool enabled);
     [[nodiscard]] bool IsMeshletRenderingEnabled() const { return m_meshletRenderingEnabled; }
     [[nodiscard]] bool IsMeshletRenderingSupported() const { return m_meshletRenderingSupported; }
+    // Colors every opaque G-buffer meshlet with a distinct debug color. Requires the mesh shader
+    // pipeline; the transparent forward pass is skipped while active.
+    void SetMeshletDebugView(bool enabled);
+    [[nodiscard]] bool IsMeshletDebugViewEnabled() const { return m_meshletDebugView; }
     [[nodiscard]] std::uint64_t GetMeshletCount() const { return m_meshletCount; }
     [[nodiscard]] std::uint64_t GetMeshletTriangleCount() const { return m_meshletTriangleCount; }
 
@@ -440,6 +446,8 @@ private:
     {
         ObjectPushConstants object{};
         std::uint32_t viewIndex = 0;
+        // Slot in the frame's shadow meshlet list, or kMeshletCullDisabled when uncompacted.
+        std::uint32_t compactedOffset = kMeshletCullDisabled;
     };
 
     struct ShadowUniform
@@ -458,6 +466,14 @@ private:
         glm::vec4 params{0.0f}; // x: samples, y: angular radius (radians), z: frame counter, w: normal bias
     };
 
+    // One mesh item of a shadow view, drawn through the compute-compacted indirect path.
+    struct ShadowMeshDraw
+    {
+        const DrawItem* item = nullptr;
+        std::uint32_t commandIndex = kMeshletCullDisabled;
+        std::uint32_t compactedOffset = kMeshletCullDisabled;
+    };
+
     // One shadow map render view: a cascade layer, a spot layer or a point cube face (rendered
     // into a tile of the point shadow atlas).
     struct ShadowView
@@ -467,6 +483,7 @@ private:
         std::uint32_t layer = 0;
         rhi::RenderArea area{};
         std::vector<const DrawItem*> items{};
+        std::vector<ShadowMeshDraw> meshDraws{};
     };
 
     struct ShadowCullItem
@@ -532,17 +549,22 @@ private:
     [[nodiscard]] const Light* FindShadowLight() const;
     void BuildShadowCullItems();
     void BuildShadowViews();
+    void BuildShadowMeshletCull(std::uint32_t frameIndex);
     [[nodiscard]] std::vector<const DrawItem*> CollectShadowItems(
         const glm::vec3& lightPosition,
         float range) const;
-    void RecordShadowViews(std::uint32_t frameIndex, bool meshShadowActive);
+    void RecordShadowViews(
+        std::uint32_t frameIndex,
+        bool meshShadowActive,
+        bool meshCompactionActive);
     void RecordShadowView(
         std::uint32_t frameIndex,
-        std::uint32_t shadowViewIndex,
-        const std::vector<const DrawItem*>& items,
+        const ShadowView& view,
         bool meshShadowActive,
+        bool meshCompactionActive,
         rhi::CommandList& secondary,
         const rhi::RenderingDesc& desc);
+    void RecordShadowMeshletCullPass(rhi::CommandList& commandList, std::uint32_t frameIndex);
     void ApplyModelScale();
     void UpdateObjectData(std::uint32_t frameIndex);
     void BuildAccelerationStructures(rhi::CommandList& commandList, std::uint32_t frameIndex);
@@ -585,6 +607,17 @@ private:
     {
         glm::mat4 model{1.0f};
         std::uint32_t drawIndex = 0;
+        std::uint32_t meshletCount = 0;
+    };
+
+    // Per (shadow view, draw) cull push constants; must match shadow_cull.comp.slang.
+    struct ShadowCullPushConstants
+    {
+        glm::mat4 model{1.0f};
+        std::uint32_t viewIndex = 0;
+        std::uint32_t drawIndex = 0;
+        std::uint32_t compactedOffset = 0;
+        std::uint32_t commandIndex = 0;
         std::uint32_t meshletCount = 0;
     };
 
@@ -659,6 +692,14 @@ private:
     std::vector<std::vector<std::unique_ptr<rhi::CommandList>>> m_shadowSecondaries{};
     std::vector<ShadowView> m_shadowViews{};
     std::vector<ShadowCullItem> m_shadowCullItems{};
+    std::unique_ptr<rhi::Shader> m_shadowCullShader{};
+    std::unique_ptr<rhi::DescriptorSetLayout> m_shadowCullSetLayout{};
+    std::unique_ptr<rhi::Pipeline> m_shadowCullPipeline{};
+    std::vector<std::unique_ptr<rhi::Buffer>> m_shadowMeshletIndexBuffers{};
+    std::vector<std::unique_ptr<rhi::Buffer>> m_shadowMeshletCommandBuffers{};
+    std::vector<std::unique_ptr<rhi::DescriptorSet>> m_shadowMeshSets{};
+    std::vector<std::unique_ptr<rhi::DescriptorSet>> m_shadowCullSets{};
+    bool m_shadowMeshletCompactionActive = false;
     std::vector<Light> m_spotShadowLights{};
     std::vector<Light> m_pointShadowLights{};
     std::unique_ptr<rhi::DescriptorSet> m_bindlessSet{};
@@ -696,6 +737,7 @@ private:
     bool m_meshletRenderingSupported = false;
     bool m_meshletRenderingEnabled = true;
     bool m_meshletCompactionActive = false;
+    bool m_meshletDebugView = false;
     std::vector<DrawItem> m_sceneDrawItems{};
     std::vector<DrawItem> m_modelDrawItems{};
     std::vector<glm::mat4> m_modelBaseTransforms{};

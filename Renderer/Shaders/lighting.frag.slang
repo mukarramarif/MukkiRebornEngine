@@ -383,6 +383,12 @@ LightingOutput fragmentMain(VertexOutput input)
     }
 
     const float3 albedo = albedoMetalness.rgb;
+    // Meshlet debug view: the G-buffer albedo carries the per-meshlet color written by the mesh
+    // shader; skip all lighting so the colors stay readable.
+    if (gScene.screenSize.z > 2.5)
+    {
+        return MakeOutput(albedo, float3(0.0), 0.0);
+    }
     const float metalness = albedoMetalness.a;
     const float3 normal = normalize(normalRoughness.xyz * 2.0 - 1.0);
     const float roughness = clamp(normalRoughness.a, 0.04, 1.0);
@@ -623,7 +629,7 @@ LightingOutput fragmentMain(VertexOutput input)
     // GI-only debug view: the indirect signal (ambient SH/IBL diffuse, traced indirect diffuse or
     // probes and reflections) without direct lights or emissive. The composite applies the tone
     // mapping (the renderer disables the subsurface add for this view).
-    if (gScene.screenSize.z > 1.5)
+    if (gScene.screenSize.z > 1.5 && gScene.screenSize.z < 2.5)
     {
         return MakeOutput(color, float3(0.0), 0.0);
     }
