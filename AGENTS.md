@@ -127,15 +127,21 @@ must not expose backend types, and Vulkan types may only appear under `Renderer/
   SSBO (descriptor set 2, indexed by `ObjectPushConstants::drawIndex`) tells the shader where the
   meshlets and the source vertex buffer live. Opaque items with meshlets render through
   `gbuffer.mesh.slang` / `shadow.mesh.slang` (one mesh shader workgroup per meshlet) when
-  `Device::IsMeshShaderSupported()`; the RHI exposes `ShaderStage::Mesh`, `PipelineDesc::meshShader`
-  and `CommandList::DrawMeshTasks`. Culling is frustum + meshoptimizer normal cone
+  `Device::IsMeshShaderSupported()`; the RHI exposes `ShaderStage::Mesh`, `PipelineDesc::meshShader`,
+  `CommandList::DrawMeshTasks`/`DrawMeshTasksIndirect` and `MeshTaskIndirectBarrier`. Culling is
+  frustum + meshoptimizer normal cone
   (`dot(center - camera, axis) >= cutoff * distance + radius`; mirrored transforms skip the cone).
   The path is enabled by default when supported (`MRE_MESHLETS_OFF` disables it, the `Scenes`
   window toggles it); transparent materials, the ground plane and items without meshlets use the
-  vertex pipeline in the same rendering scope. The G-buffer and shadow secondary command buffers
-  (recorded on the JobSystem) replay meshlet and vertex draws in the same batch, binding each
-  pipeline at most once. Natural follow-up (not implemented): a compute cull that writes indirect
-  mesh-task dispatches (or a task shader) to compact meshlets.
+  vertex pipeline in the same rendering scope. G-buffer meshlets are first compacted by
+  `meshlet_cull.comp.slang`: one compute dispatch per draw culls the meshlets into a per-frame
+  index buffer (`kMeshletCompactionCapacity`, 64 threads per workgroup) and atomically accumulates
+  the draw's `GpuMeshTaskCommand` group count, which `CommandList::DrawMeshTasksIndirect` consumes;
+  `gbuffer.mesh.slang` remaps `gl_WorkGroupID` through the compacted list. The cull writes are
+  published with `CommandList::MeshTaskIndirectBarrier`. Draws beyond the capacity, shadow views
+  and cull-shader-less devices fall back to direct mesh-task dispatch with in-shader culling. The
+  G-buffer and shadow secondary command buffers (recorded on the JobSystem) replay meshlet and
+  vertex draws in the same batch, binding each pipeline at most once.
 - Bindless: descriptor indexing is a hard device requirement. Textures get a bindless index from the
   device and are bound into a global update-after-bind `SampledImage` array set; shaders sample them
   through `Texture2D textures[]` with `NonUniformResourceIndex`.

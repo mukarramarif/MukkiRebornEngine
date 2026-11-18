@@ -212,10 +212,13 @@ flowchart TB
   shader workgroup per meshlet, culled against the view frustum and the normal cone, emitting its
   deduplicated vertices and packed triangles. The vertex pipeline remains for transparent
   materials, the ground plane and devices without `VK_EXT_mesh_shader`. Meshlet rendering is on by
-  default when supported; the `Scenes` window toggles it and `MRE_MESHLETS_OFF` disables it. Both
+  default when supported; the `Scenes` window toggles it and `MRE_MESHLETS_OFF` disables it. The
+  G-buffer path first runs a compute cull (`meshlet_cull.comp.slang`): each draw compacts its
+  surviving meshlets into a per-frame index buffer and accumulates an indirect mesh-task group
+  count, so `gbuffer.mesh.slang` only launches workgroups for visible meshlets. Shadow views and
+  draws beyond the compaction capacity fall back to direct dispatch with in-shader culling. Both
   the G-buffer and shadow passes record meshlet and vertex draws into secondary command buffers on
-  the job system. A compute cull producing indirect mesh-task dispatches (or a task shader) for
-  meshlet compaction is a natural follow-up (not implemented).
+  the job system.
 
 ## Scenes
 

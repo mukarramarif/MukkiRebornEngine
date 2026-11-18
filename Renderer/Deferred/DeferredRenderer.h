@@ -109,6 +109,13 @@ struct GpuMeshlet
     glm::uvec4 data{0u};
 };
 
+// Compute meshlet culling compacts each draw's visible meshlets into one per-frame index list and
+// writes one indirect mesh-task command per draw. Draws beyond the capacity fall back to direct
+// dispatch with in-shader culling.
+inline constexpr std::uint32_t kMeshletCompactionCapacity = 1u << 18;
+inline constexpr std::uint32_t kMeshletCullDisabled = 0xFFFFFFFFu;
+inline constexpr std::uint32_t kMeshletCullGroupSize = 64;
+
 // Per draw item meshlet source, indexed by ObjectPushConstants::drawIndex. Must match GpuMeshDraw
 // in Renderer/Shaders/meshlet.slang.
 struct GpuMeshDraw
@@ -119,9 +126,21 @@ struct GpuMeshDraw
     std::uint32_t triangleBase = 0;       // byte offset of the packed micro triangle list
     std::uint32_t vertexBufferIndex = 0;  // bindless slot of the source vertex buffer
     std::uint32_t meshletBufferIndex = 0; // bindless slot of the meshlet data buffer
-    std::uint32_t padding0 = 0;
+    // First slot of the frame's compacted meshlet index list, or kMeshletCullDisabled when the draw
+    // uses direct mesh-task dispatch and culls in the mesh shader.
+    std::uint32_t compactedOffset = kMeshletCullDisabled;
     std::uint32_t padding1 = 0;
 };
+
+// One indirect mesh-task command, matching VkDrawMeshTasksIndirectCommandEXT and the flat uint
+// array written by meshlet_cull.comp.slang.
+struct GpuMeshTaskCommand
+{
+    std::uint32_t groupCountX = 0;
+    std::uint32_t groupCountY = 1;
+    std::uint32_t groupCountZ = 1;
+};
+static_assert(sizeof(GpuMeshTaskCommand) == 12, "Unexpected mesh task command layout");
 
 class DeferredRenderer
 {
@@ -305,6 +324,8 @@ private:
         std::uint32_t meshletVertexIndexBase = 0; // byte offset in the meshlet buffer
         std::uint32_t meshletTriangleBase = 0;    // byte offset in the meshlet buffer
         std::uint32_t meshletBufferIndex = 0;     // bindless slot of the meshlet buffer
+        // Slot of the compute-compacted meshlet list, or kMeshletCullDisabled when uncompacted.
+        std::uint32_t compactedOffset = kMeshletCullDisabled;
         // KHR_materials_specular material data (see GpuObjectData).
         glm::vec4 specular{0.0f};
         glm::uvec4 specularTextureIndices{0u};
@@ -559,6 +580,14 @@ private:
         glm::vec4 params{0.0f}; // x: strength, y: debug view, z: passthrough
     };
 
+    // Compute meshlet cull push constants; must match meshlet_cull.comp.slang.
+    struct MeshletCullPushConstants
+    {
+        glm::mat4 model{1.0f};
+        std::uint32_t drawIndex = 0;
+        std::uint32_t meshletCount = 0;
+    };
+
     bool CreateSssResources(rhi::Device& device);
     void CreateSssDescriptorSets();
     void RecordSssPasses(rhi::CommandList& commandList, const FrameView& view);
@@ -580,15 +609,21 @@ private:
         std::uint32_t frameIndex,
         const rhi::RenderingDesc& desc,
         const std::vector<const DrawItem*>& items,
-        bool meshRenderingActive);
+        bool meshRenderingActive,
+        bool meshCompactionActive);
     void RecordGBufferBatch(
         std::uint32_t frameIndex,
         const std::vector<const DrawItem*>& items,
         std::size_t begin,
         std::size_t end,
         bool meshRenderingActive,
+        bool meshCompactionActive,
         rhi::CommandList& secondary,
         const rhi::RenderingDesc& desc);
+    void RecordMeshletCullPass(
+        rhi::CommandList& commandList,
+        std::uint32_t frameIndex,
+        const std::vector<const DrawItem*>& items);
 
     rhi::Device* m_device = nullptr;
     JobSystem* m_jobSystem = nullptr;
@@ -647,13 +682,20 @@ private:
     std::unique_ptr<rhi::Pipeline> m_clusterCullingPipeline{};
     std::unique_ptr<rhi::Pipeline> m_shadowPipeline{};
     std::unique_ptr<rhi::Pipeline> m_shadowMeshPipeline{};
+    std::unique_ptr<rhi::Shader> m_meshletCullShader{};
+    std::unique_ptr<rhi::DescriptorSetLayout> m_meshletCullSetLayout{};
+    std::unique_ptr<rhi::Pipeline> m_meshletCullPipeline{};
     std::unique_ptr<rhi::DescriptorSetLayout> m_meshSetLayout{};
     std::vector<std::unique_ptr<rhi::Buffer>> m_meshDrawBuffers{};
+    std::vector<std::unique_ptr<rhi::Buffer>> m_meshletIndexBuffers{};
+    std::vector<std::unique_ptr<rhi::Buffer>> m_meshletCommandBuffers{};
     std::vector<std::unique_ptr<rhi::DescriptorSet>> m_meshSets{};
+    std::vector<std::unique_ptr<rhi::DescriptorSet>> m_meshletCullSets{};
     std::uint64_t m_meshletCount = 0;
     std::uint64_t m_meshletTriangleCount = 0;
     bool m_meshletRenderingSupported = false;
     bool m_meshletRenderingEnabled = true;
+    bool m_meshletCompactionActive = false;
     std::vector<DrawItem> m_sceneDrawItems{};
     std::vector<DrawItem> m_modelDrawItems{};
     std::vector<glm::mat4> m_modelBaseTransforms{};

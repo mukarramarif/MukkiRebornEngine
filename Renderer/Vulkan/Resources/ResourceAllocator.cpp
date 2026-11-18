@@ -114,6 +114,10 @@ std::unique_ptr<rhi::Buffer> VkResourceAllocator::CreateBuffer(
     {
         usage |= vk::BufferUsageFlagBits::eStorageBuffer;
     }
+    if (desc.indirect)
+    {
+        usage |= vk::BufferUsageFlagBits::eIndirectBuffer;
+    }
     if (desc.deviceAddress)
     {
         // Geometry buffers registered in the bindless array are read as storage buffers by ray

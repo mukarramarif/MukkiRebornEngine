@@ -140,6 +140,8 @@ struct BufferDesc
     // Also allow storage buffer descriptors. Geometry buffers need this when they are registered in
     // the bindless buffer array and read as storage buffers by mesh or ray traced shaders.
     bool storage = false;
+    // Also allow the buffer to source indirect draw commands (mesh task dispatches).
+    bool indirect = false;
 };
 
 class Buffer

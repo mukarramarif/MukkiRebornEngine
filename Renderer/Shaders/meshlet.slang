@@ -4,6 +4,9 @@
 // GltfVertex: position (12 bytes), normal (12 bytes), uv (8 bytes).
 static const uint kMeshletVertexStride = 32;
 static const uint kMeshletStride = 48;
+// Matches mukki::kMeshletCullDisabled: draws without compute compaction use direct mesh-task
+// dispatch and keep the in-shader cull.
+static const uint kMeshletCullDisabled = 0xFFFFFFFFu;
 
 struct GpuMeshlet
 {
@@ -22,7 +25,7 @@ struct GpuMeshDraw
     uint triangleBase;       // byte offset of the packed micro triangle list
     uint vertexBufferIndex;  // bindless slot of the source GltfVertex buffer
     uint meshletBufferIndex; // bindless slot of the meshlet data buffer
-    uint padding0;
+    uint compactedOffset;    // first slot of the compacted meshlet list, kMeshletCullDisabled if none
     uint padding1;
 };
 

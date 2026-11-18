@@ -75,11 +75,22 @@ public:
         std::uint32_t groupCountX,
         std::uint32_t groupCountY = 1,
         std::uint32_t groupCountZ = 1) = 0;
+    // Launches mesh shader workgroups from indirect commands (groupCountX/Y/Z per command). Requires
+    // a bound mesh pipeline and mesh shader support.
+    virtual void DrawMeshTasksIndirect(
+        const Buffer& buffer,
+        std::uint64_t offset,
+        std::uint32_t drawCount,
+        std::uint32_t stride) = 0;
     virtual void Dispatch(std::uint32_t groupCountX, std::uint32_t groupCountY, std::uint32_t groupCountZ) = 0;
 
     // Memory dependency between shader stages, used when compute-produced storage data is read by
     // a later stage within the same command buffer.
     virtual void ShaderMemoryBarrier(ShaderStageMask before, ShaderStageMask after) = 0;
+
+    // Makes compute-written meshlet compaction data and mesh-task indirect commands visible to mesh
+    // shader draws. Record after the cull dispatches and before the indirect draws.
+    virtual void MeshTaskIndirectBarrier() = 0;
 
     // Dynamic depth bias for the currently bound graphics pipeline. Pipelines must be created with
     // depthBiasEnable for the values to take effect.

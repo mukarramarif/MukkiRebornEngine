@@ -212,6 +212,11 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
     {
         sceneStages.push_back(m_gbufferMeshShader.get());
     }
+    if (m_meshletCullShader != nullptr)
+    {
+        // The cull dispatch reads the scene uniform, so set 0 must also cover the compute stage.
+        sceneStages.push_back(m_meshletCullShader.get());
+    }
     const std::array<const rhi::Shader*, 1> lightingStages{m_lightingFragmentShader.get()};
     const std::array<const rhi::Shader*, 1> clusterStages{m_clusterCullingShader.get()};
     std::vector<const rhi::Shader*> shadowStages{
@@ -240,6 +245,12 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
         const std::array<const rhi::Shader*, 1> meshStages{m_gbufferMeshShader.get()};
         m_meshSetLayout =
             device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(meshStages, 2));
+    }
+    if (m_meshletCullShader != nullptr)
+    {
+        const std::array<const rhi::Shader*, 1> cullStages{m_meshletCullShader.get()};
+        m_meshletCullSetLayout =
+            device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(cullStages, 1));
     }
     m_giTraceSetLayout =
         device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(giTraceStages, 0));
@@ -382,8 +393,9 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
     if (m_meshletRenderingSupported)
     {
         MRE_INFO(
-            "Meshlet rendering {} (mesh shader G-buffer and shadow passes)",
-            m_meshletRenderingEnabled ? "enabled" : "disabled");
+            "Meshlet rendering {} (mesh shader G-buffer and shadow passes, {})",
+            m_meshletRenderingEnabled ? "enabled" : "disabled",
+            m_meshletCullPipeline != nullptr ? "compute culling" : "in-shader culling");
     }
 
     if (!CreateRtShadowResources(device))
@@ -422,19 +434,26 @@ void DeferredRenderer::Shutdown()
     m_shadowPipeline.reset();
     m_shadowMeshPipeline.reset();
     m_gbufferMeshPipeline.reset();
+    m_meshletCullPipeline.reset();
+    m_meshletCullSetLayout.reset();
     m_meshSetLayout.reset();
     m_meshDrawBuffers.clear();
+    m_meshletIndexBuffers.clear();
+    m_meshletCommandBuffers.clear();
     m_meshSets.clear();
+    m_meshletCullSets.clear();
     m_meshletCount = 0;
     m_meshletTriangleCount = 0;
     m_meshletRenderingSupported = false;
     m_meshletRenderingEnabled = true;
+    m_meshletCompactionActive = false;
     m_clusterCullingPipeline.reset();
     m_lightingPipeline.reset();
     m_gbufferPipeline.reset();
     m_shadowFragmentShader.reset();
     m_shadowMeshShader.reset();
     m_shadowVertexShader.reset();
+    m_meshletCullShader.reset();
     m_gbufferMeshShader.reset();
     m_clusterCullingShader.reset();
     m_lightingFragmentShader.reset();
@@ -1596,6 +1615,7 @@ void DeferredRenderer::UpdateObjectData(std::uint32_t frameIndex)
         meshDraws[index].triangleBase = item.meshletTriangleBase;
         meshDraws[index].vertexBufferIndex = item.vertexBufferIndex;
         meshDraws[index].meshletBufferIndex = item.meshletBufferIndex;
+        meshDraws[index].compactedOffset = item.compactedOffset;
         m_previousModels[index] = item.pushConstants.model;
         ++index;
     };
@@ -1607,6 +1627,67 @@ void DeferredRenderer::UpdateObjectData(std::uint32_t frameIndex)
     for (DrawItem& item : m_modelDrawItems)
     {
         updateItem(item);
+    }
+
+    // Assign the per-frame compacted meshlet slices and rearm the indirect mesh-task commands. The
+    // cull shader accumulates groupCountX per draw; draws that do not fit the compaction capacity
+    // fall back to direct dispatch and cull in the mesh shader.
+    m_meshletCompactionActive =
+        m_meshletCullPipeline != nullptr && frameIndex < m_meshletIndexBuffers.size() &&
+        frameIndex < m_meshletCommandBuffers.size() && frameIndex < m_meshletCullSets.size() &&
+        m_meshletIndexBuffers[frameIndex] != nullptr &&
+        m_meshletCommandBuffers[frameIndex] != nullptr &&
+        m_meshletCullSets[frameIndex] != nullptr;
+    std::uint32_t compactedOffset = 0;
+    if (m_meshletCompactionActive)
+    {
+        for (GpuMeshDraw& draw : meshDraws)
+        {
+            if (draw.meshletCount == 0)
+            {
+                draw.compactedOffset = kMeshletCullDisabled;
+                continue;
+            }
+            draw.compactedOffset = compactedOffset;
+            compactedOffset += draw.meshletCount;
+            if (compactedOffset > kMeshletCompactionCapacity)
+            {
+                m_meshletCompactionActive = false;
+                break;
+            }
+        }
+    }
+
+    if (m_meshletCompactionActive && !meshDraws.empty())
+    {
+        // groupCountY/Z stay 1; only groupCountX is accumulated by the cull dispatch.
+        std::vector<std::uint32_t> commands(meshDraws.size() * 3u, 1u);
+        for (std::size_t draw = 0; draw < meshDraws.size(); ++draw)
+        {
+            commands[draw * 3u] = 0u;
+        }
+        m_meshletCommandBuffers[frameIndex]->Write(
+            commands.data(),
+            commands.size() * sizeof(std::uint32_t));
+    }
+    else
+    {
+        for (GpuMeshDraw& draw : meshDraws)
+        {
+            draw.compactedOffset = kMeshletCullDisabled;
+        }
+    }
+
+    index = 0;
+    for (DrawItem& item : m_sceneDrawItems)
+    {
+        item.compactedOffset = meshDraws[index].compactedOffset;
+        ++index;
+    }
+    for (DrawItem& item : m_modelDrawItems)
+    {
+        item.compactedOffset = meshDraws[index].compactedOffset;
+        ++index;
     }
 
     if (!objectData.empty())
@@ -2825,6 +2906,10 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
                                      m_gbufferMeshPipeline != nullptr &&
                                      frameIndex < m_meshSets.size() &&
                                      frameIndex < m_meshDrawBuffers.size();
+    const bool meshCompactionActive =
+        meshRenderingActive && m_meshletCompactionActive && m_meshletCullPipeline != nullptr &&
+        frameIndex < m_meshletCommandBuffers.size() &&
+        m_meshletCommandBuffers[frameIndex] != nullptr;
     // Alpha blended materials skip the opaque G-buffer and are drawn back-to-front after lighting.
     // Opaque items with meshlets use the mesh shader pipeline when it is available.
     std::vector<const DrawItem*> opaqueItems{};
@@ -2985,12 +3070,21 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
         m_jobSystem != nullptr && m_secondaryBatchCount > 1 && opaqueItems.size() > 1 &&
         frameIndex < m_gbufferSecondaries.size();
 
+    if (meshCompactionActive)
+    {
+        RecordMeshletCullPass(commandList, frameIndex, opaqueItems);
+    }
+
     commandList.BeginGpuZone("GBuffer");
 
     if (useSecondaries)
     {
-        const std::uint32_t batchCount =
-            RecordGBufferSecondaries(frameIndex, gbufferDesc, opaqueItems, meshRenderingActive);
+        const std::uint32_t batchCount = RecordGBufferSecondaries(
+            frameIndex,
+            gbufferDesc,
+            opaqueItems,
+            meshRenderingActive,
+            meshCompactionActive);
 
         std::vector<const rhi::CommandList*> secondaries{};
         secondaries.reserve(batchCount);
@@ -3028,7 +3122,19 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
                     &item->pushConstants,
                     sizeof(ObjectPushConstants),
                     rhi::ShaderStageMask::FragmentMesh);
-                commandList.DrawMeshTasks(item->meshletCount);
+                if (meshCompactionActive && item->compactedOffset != kMeshletCullDisabled)
+                {
+                    commandList.DrawMeshTasksIndirect(
+                        *m_meshletCommandBuffers[frameIndex],
+                        static_cast<std::uint64_t>(item->pushConstants.drawIndex) *
+                            sizeof(GpuMeshTaskCommand),
+                        1u,
+                        sizeof(GpuMeshTaskCommand));
+                }
+                else
+                {
+                    commandList.DrawMeshTasks(item->meshletCount);
+                }
             }
         }
 
@@ -3302,7 +3408,8 @@ std::uint32_t DeferredRenderer::RecordGBufferSecondaries(
     std::uint32_t frameIndex,
     const rhi::RenderingDesc& desc,
     const std::vector<const DrawItem*>& items,
-    bool meshRenderingActive)
+    bool meshRenderingActive,
+    bool meshCompactionActive)
 {
     MRE_PROFILE_ZONE_N("RecordGBufferSecondaries");
     MRE_ASSERT(m_jobSystem != nullptr, "RecordGBufferSecondaries requires a job system");
@@ -3312,6 +3419,11 @@ std::uint32_t DeferredRenderer::RecordGBufferSecondaries(
         !meshRenderingActive ||
             (m_gbufferMeshPipeline != nullptr && frameIndex < m_meshSets.size()),
         "Meshlet secondaries require the mesh pipeline and descriptor set");
+    MRE_ASSERT(
+        !meshCompactionActive ||
+            (m_meshletCullPipeline != nullptr && frameIndex < m_meshletCommandBuffers.size() &&
+             m_meshletCommandBuffers[frameIndex] != nullptr),
+        "Meshlet secondaries require the cull command buffer");
 
     const std::uint32_t batchCount = std::min(
         m_secondaryBatchCount,
@@ -3334,13 +3446,14 @@ std::uint32_t DeferredRenderer::RecordGBufferSecondaries(
 
         rhi::CommandList* secondary = m_gbufferSecondaries[frameIndex][batch].get();
         futures.push_back(m_jobSystem->Submit(
-            [this, frameIndex, secondary, &desc, &items, begin, end, meshRenderingActive]() {
+            [this, frameIndex, secondary, &desc, &items, begin, end, meshRenderingActive, meshCompactionActive]() {
                 RecordGBufferBatch(
                     frameIndex,
                     items,
                     begin,
                     end,
                     meshRenderingActive,
+                    meshCompactionActive,
                     *secondary,
                     desc);
             }));
@@ -3360,6 +3473,7 @@ void DeferredRenderer::RecordGBufferBatch(
     std::size_t begin,
     std::size_t end,
     bool meshRenderingActive,
+    bool meshCompactionActive,
     rhi::CommandList& secondary,
     const rhi::RenderingDesc& desc)
 {
@@ -3369,6 +3483,11 @@ void DeferredRenderer::RecordGBufferBatch(
         !meshRenderingActive ||
             (m_gbufferMeshPipeline != nullptr && frameIndex < m_meshSets.size()),
         "Meshlet batches require the mesh pipeline and descriptor set");
+    MRE_ASSERT(
+        !meshCompactionActive ||
+            (frameIndex < m_meshletCommandBuffers.size() &&
+             m_meshletCommandBuffers[frameIndex] != nullptr),
+        "Meshlet batches require the cull command buffer");
 
     secondary.BeginSecondary(desc);
     secondary.BeginGpuZone("GBufferBatch");
@@ -3396,7 +3515,19 @@ void DeferredRenderer::RecordGBufferBatch(
                 &item.pushConstants,
                 sizeof(ObjectPushConstants),
                 rhi::ShaderStageMask::FragmentMesh);
-            secondary.DrawMeshTasks(item.meshletCount);
+            if (meshCompactionActive && item.compactedOffset != kMeshletCullDisabled)
+            {
+                secondary.DrawMeshTasksIndirect(
+                    *m_meshletCommandBuffers[frameIndex],
+                    static_cast<std::uint64_t>(item.pushConstants.drawIndex) *
+                        sizeof(GpuMeshTaskCommand),
+                    1u,
+                    sizeof(GpuMeshTaskCommand));
+            }
+            else
+            {
+                secondary.DrawMeshTasks(item.meshletCount);
+            }
         }
     }
 
@@ -3426,6 +3557,45 @@ void DeferredRenderer::RecordGBufferBatch(
 
     secondary.EndGpuZone();
     secondary.End();
+}
+
+void DeferredRenderer::RecordMeshletCullPass(
+    rhi::CommandList& commandList,
+    std::uint32_t frameIndex,
+    const std::vector<const DrawItem*>& items)
+{
+    MRE_PROFILE_ZONE_N("RecordMeshletCullPass");
+    MRE_ASSERT(m_meshletCullPipeline != nullptr, "RecordMeshletCullPass requires the cull pipeline");
+    MRE_ASSERT(m_meshletCompactionActive, "RecordMeshletCullPass requires active compaction");
+    MRE_ASSERT(frameIndex < m_sceneSets.size(), "Frame index out of range");
+    MRE_ASSERT(frameIndex < m_meshletCullSets.size(), "Frame index out of range");
+
+    commandList.BeginGpuZone("MeshletCull");
+    commandList.BindPipeline(*m_meshletCullPipeline);
+    commandList.BindDescriptorSet(0, *m_sceneSets[frameIndex]);
+    commandList.BindDescriptorSet(1, *m_meshletCullSets[frameIndex]);
+    commandList.BindDescriptorSet(2, *m_bindlessSet);
+
+    MeshletCullPushConstants cull{};
+    for (const DrawItem* item : items)
+    {
+        if (item->meshletCount == 0 || item->compactedOffset == kMeshletCullDisabled)
+        {
+            continue;
+        }
+
+        cull.model = item->pushConstants.model;
+        cull.drawIndex = item->pushConstants.drawIndex;
+        cull.meshletCount = item->meshletCount;
+        commandList.SetPushConstants(&cull, sizeof(cull), rhi::ShaderStageMask::Compute);
+        commandList.Dispatch(
+            (item->meshletCount + kMeshletCullGroupSize - 1u) / kMeshletCullGroupSize,
+            1u,
+            1u);
+    }
+
+    commandList.EndGpuZone();
+    commandList.MeshTaskIndirectBarrier();
 }
 
 void DeferredRenderer::BuildShadowCullItems()
@@ -3754,9 +3924,16 @@ bool DeferredRenderer::LoadShaders(rhi::Device& device, const std::filesystem::p
         m_shadowMeshShader = device.CreateShader(
             rhi::ShaderStage::Mesh,
             shaderDirectory / "shadow.mesh.spv");
+        m_meshletCullShader = device.CreateShader(
+            rhi::ShaderStage::Compute,
+            shaderDirectory / "meshlet_cull.comp.spv");
         if (m_gbufferMeshShader == nullptr || m_shadowMeshShader == nullptr)
         {
             MRE_WARN("Failed to load the mesh shaders; meshlet rendering stays disabled");
+        }
+        if (m_meshletCullShader == nullptr)
+        {
+            MRE_WARN("Failed to load the meshlet cull shader; meshlets cull in the mesh shader");
         }
     }
 
@@ -3828,6 +4005,25 @@ bool DeferredRenderer::CreatePipelines(rhi::Device& device)
         gbufferMeshPipelineDesc.colorFormats = gbufferPipelineDesc.colorFormats;
         gbufferMeshPipelineDesc.depthFormat = rhi::Format::D32Sfloat;
         m_gbufferMeshPipeline = device.CreatePipeline(gbufferMeshPipelineDesc);
+    }
+
+    // Compute cull feeding the G-buffer meshlet draws: set 0 is the scene uniform set, set 1 the
+    // mesh draw/compaction/indirect buffers and set 2 the bindless meshlet data.
+    if (m_meshletCullShader != nullptr && m_meshletCullSetLayout != nullptr)
+    {
+        const std::array<const rhi::Shader*, 1> cullStages{m_meshletCullShader.get()};
+        rhi::PipelineDesc meshletCullPipelineDesc{};
+        meshletCullPipelineDesc.computeShader = m_meshletCullShader.get();
+        rhi::ApplyShaderReflection(meshletCullPipelineDesc, cullStages);
+        meshletCullPipelineDesc.descriptorSetLayouts = {
+            m_sceneSetLayout.get(),
+            m_meshletCullSetLayout.get(),
+            m_bindlessSetLayout.get()};
+        m_meshletCullPipeline = device.CreatePipeline(meshletCullPipelineDesc);
+        if (m_meshletCullPipeline == nullptr)
+        {
+            MRE_WARN("Failed to create the meshlet cull pipeline; meshlets cull in the mesh shader");
+        }
     }
 
     // Forward pass for alpha blended materials: shares the G-buffer vertex shader, blends over the
@@ -4366,9 +4562,15 @@ void DeferredRenderer::CreateMeshletResources(rhi::Device& device)
 
     const std::uint32_t framesInFlight = device.GetFramesInFlight();
     m_meshDrawBuffers.clear();
+    m_meshletIndexBuffers.clear();
+    m_meshletCommandBuffers.clear();
     m_meshSets.clear();
+    m_meshletCullSets.clear();
     m_meshDrawBuffers.reserve(framesInFlight);
+    m_meshletIndexBuffers.reserve(framesInFlight);
+    m_meshletCommandBuffers.reserve(framesInFlight);
     m_meshSets.reserve(framesInFlight);
+    m_meshletCullSets.reserve(framesInFlight);
     for (std::uint32_t frame = 0; frame < framesInFlight; ++frame)
     {
         m_meshDrawBuffers.push_back(device.CreateBuffer(
@@ -4379,9 +4581,45 @@ void DeferredRenderer::CreateMeshletResources(rhi::Device& device)
             return;
         }
 
+        // The compute cull writes the visible meshlet indices of every draw into this frame buffer.
+        m_meshletIndexBuffers.push_back(device.CreateBuffer(rhi::BufferDesc{
+            kMeshletCompactionCapacity * sizeof(std::uint32_t),
+            rhi::BufferUsage::Storage}));
+        if (m_meshletIndexBuffers.back() == nullptr)
+        {
+            MRE_CRITICAL("Failed to create the meshlet compaction buffer");
+            return;
+        }
+
         std::unique_ptr<rhi::DescriptorSet> meshSet = device.CreateDescriptorSet(*m_meshSetLayout);
         meshSet->BindBuffer(0, *m_meshDrawBuffers.back());
+        meshSet->BindBuffer(1, *m_meshletIndexBuffers.back());
         m_meshSets.push_back(std::move(meshSet));
+
+        if (m_meshletCullSetLayout != nullptr)
+        {
+            // Host visible so the per-frame command reset can rearm the indirect group counts.
+            m_meshletCommandBuffers.push_back(device.CreateBuffer(rhi::BufferDesc{
+                kMaxObjectData * sizeof(GpuMeshTaskCommand),
+                rhi::BufferUsage::Storage,
+                true,
+                false,
+                0,
+                false,
+                true}));
+            if (m_meshletCommandBuffers.back() == nullptr)
+            {
+                MRE_CRITICAL("Failed to create the meshlet cull command buffer");
+                return;
+            }
+
+            std::unique_ptr<rhi::DescriptorSet> cullSet =
+                device.CreateDescriptorSet(*m_meshletCullSetLayout);
+            cullSet->BindBuffer(0, *m_meshDrawBuffers.back());
+            cullSet->BindBuffer(1, *m_meshletIndexBuffers.back());
+            cullSet->BindBuffer(2, *m_meshletCommandBuffers.back());
+            m_meshletCullSets.push_back(std::move(cullSet));
+        }
     }
 }
 

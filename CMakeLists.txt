@@ -205,6 +205,7 @@ if(MRE_BUILD_SANDBOX)
     mre_add_slang_shaders(mukki_sandbox
         Renderer/Shaders/gbuffer.vert.slang
         Renderer/Shaders/gbuffer.mesh.slang
+        Renderer/Shaders/meshlet_cull.comp.slang
         Renderer/Shaders/gbuffer.frag.slang
         Renderer/Shaders/transparent.frag.slang
         Renderer/Shaders/lighting.vert.slang

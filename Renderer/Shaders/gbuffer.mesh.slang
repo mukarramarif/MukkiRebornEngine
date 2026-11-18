@@ -62,6 +62,7 @@ struct GpuObjectData
 [[vk::push_constant]] ConstantBuffer<ObjectPushConstants> gObject;
 [[vk::binding(2, 1)]] ByteAddressBuffer gBuffers[];
 [[vk::binding(0, 2)]] StructuredBuffer<GpuMeshDraw> gMeshDraws;
+[[vk::binding(1, 2)]] StructuredBuffer<uint> gMeshletIndices;
 
 struct VertexOutput
 {
@@ -88,9 +89,16 @@ void meshMain(
         return;
     }
 
+    // Compute compaction remaps the surviving meshlets. Uncompacted draws keep the direct index
+    // and still cull in the mesh shader.
+    const bool compacted = draw.compactedOffset != kMeshletCullDisabled;
+    const uint meshletIndex =
+        compacted ? gMeshletIndices[draw.compactedOffset + groupID.x] : groupID.x;
+
     const ByteAddressBuffer meshletBuffer = gBuffers[NonUniformResourceIndex(draw.meshletBufferIndex)];
-    const GpuMeshlet meshlet = LoadMeshlet(meshletBuffer, draw.meshletOffset + groupID.x);
-    if (CullMeshlet(gScene.viewProjection, gObject.model, gScene.cameraPosition.xyz, meshlet))
+    const GpuMeshlet meshlet = LoadMeshlet(meshletBuffer, draw.meshletOffset + meshletIndex);
+    if (!compacted &&
+        CullMeshlet(gScene.viewProjection, gObject.model, gScene.cameraPosition.xyz, meshlet))
     {
         SetMeshOutputCounts(0, 0);
         return;
