@@ -49,6 +49,7 @@ public:
     [[nodiscard]] virtual std::uint32_t GetFramesInFlight() const = 0;
     [[nodiscard]] virtual bool IsBindlessSupported() const = 0;
     [[nodiscard]] virtual bool IsRayTracingSupported() const = 0;
+    [[nodiscard]] virtual bool IsMeshShaderSupported() const = 0;
 
     [[nodiscard]] virtual std::unique_ptr<Buffer> CreateBuffer(
         const BufferDesc& desc,

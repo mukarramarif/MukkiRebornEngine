@@ -50,6 +50,7 @@ public:
     [[nodiscard]] std::uint32_t GetFramesInFlight() const override { return m_framesInFlight; }
     [[nodiscard]] bool IsBindlessSupported() const override { return m_descriptorIndexingSupported; }
     [[nodiscard]] bool IsRayTracingSupported() const override { return m_rayTracingSupported; }
+    [[nodiscard]] bool IsMeshShaderSupported() const override { return m_meshShaderSupported; }
 
     [[nodiscard]] std::unique_ptr<rhi::Buffer> CreateBuffer(
         const rhi::BufferDesc& desc,
@@ -121,6 +122,7 @@ private:
     vk::PhysicalDeviceDescriptorIndexingProperties m_descriptorIndexingProperties{};
     vk::PhysicalDeviceAccelerationStructureFeaturesKHR m_accelerationStructureFeatures{};
     vk::PhysicalDeviceRayQueryFeaturesKHR m_rayQueryFeatures{};
+    vk::PhysicalDeviceMeshShaderFeaturesEXT m_meshShaderFeatures{};
 #ifdef MRE_ENABLE_TRACY
     tracy::VkCtx* m_tracyContext = nullptr;
 #endif
@@ -133,6 +135,7 @@ private:
     bool m_descriptorIndexingSupported = false;
     RayTracingDispatch m_rayTracingDispatch{};
     bool m_rayTracingSupported = false;
+    bool m_meshShaderSupported = false;
     bool m_swapchainDirty = false;
     bool m_initialized = false;
     bool m_deviceFaultSupported = false;

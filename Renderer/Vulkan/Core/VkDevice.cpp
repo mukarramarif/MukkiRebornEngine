@@ -412,7 +412,9 @@ bool VkDevice::PickPhysicalDevice()
     vk::PhysicalDeviceDescriptorIndexingProperties bestIndexingProperties{};
     vk::PhysicalDeviceAccelerationStructureFeaturesKHR bestAccelerationStructureFeatures{};
     vk::PhysicalDeviceRayQueryFeaturesKHR bestRayQueryFeatures{};
+    vk::PhysicalDeviceMeshShaderFeaturesEXT bestMeshShaderFeatures{};
     bool bestRayTracingSupported = false;
+    bool bestMeshShaderSupported = false;
 
     for (const vk::raii::PhysicalDevice& candidate : devices)
     {
@@ -450,6 +452,26 @@ bool VkDevice::PickPhysicalDevice()
         const bool rayTracingSupported = accelerationStructureFeatures.accelerationStructure &&
                                          rayQueryFeatures.rayQuery &&
                                          features12.bufferDeviceAddress;
+
+        // Extension-specific feature structs may only be queried when the extension is advertised.
+        const std::vector<vk::ExtensionProperties> availableExtensions =
+            candidate.enumerateDeviceExtensionProperties();
+        const bool meshShaderExtensionAvailable = std::any_of(
+            availableExtensions.begin(),
+            availableExtensions.end(),
+            [](const vk::ExtensionProperties& extension) {
+                return std::strcmp(extension.extensionName, vk::EXTMeshShaderExtensionName) == 0;
+            });
+
+        vk::PhysicalDeviceMeshShaderFeaturesEXT meshShaderFeatures{};
+        bool meshShaderSupported = false;
+        if (meshShaderExtensionAvailable)
+        {
+            vk::PhysicalDeviceFeatures2 meshShaderFeatures2{};
+            meshShaderFeatures2.pNext = &meshShaderFeatures;
+            (*candidate).getFeatures2(&meshShaderFeatures2);
+            meshShaderSupported = meshShaderFeatures.meshShader == vk::True;
+        }
 
         const std::vector<vk::QueueFamilyProperties> families = candidate.getQueueFamilyProperties();
         std::uint32_t graphicsFamily = 0;
@@ -497,10 +519,14 @@ bool VkDevice::PickPhysicalDevice()
             break;
         }
 
-        // Prefer ray tracing capable devices within the same device class.
+        // Prefer ray tracing and mesh shader capable devices within the same device class.
         if (rayTracingSupported)
         {
             score += 500;
+        }
+        if (meshShaderSupported)
+        {
+            score += 250;
         }
 
         if (score > bestScore)
@@ -518,7 +544,9 @@ bool VkDevice::PickPhysicalDevice()
             bestIndexingProperties = indexingProperties;
             bestAccelerationStructureFeatures = accelerationStructureFeatures;
             bestRayQueryFeatures = rayQueryFeatures;
+            bestMeshShaderFeatures = meshShaderFeatures;
             bestRayTracingSupported = rayTracingSupported;
+            bestMeshShaderSupported = meshShaderSupported;
         }
     }
 
@@ -538,7 +566,9 @@ bool VkDevice::PickPhysicalDevice()
     m_descriptorIndexingSupported = true;
     m_accelerationStructureFeatures = bestAccelerationStructureFeatures;
     m_rayQueryFeatures = bestRayQueryFeatures;
+    m_meshShaderFeatures = bestMeshShaderFeatures;
     m_rayTracingSupported = bestRayTracingSupported;
+    m_meshShaderSupported = bestMeshShaderSupported;
 
     const vk::PhysicalDeviceProperties properties = best.getProperties();
     MRE_INFO(
@@ -555,6 +585,7 @@ bool VkDevice::PickPhysicalDevice()
         "Ray tracing {} (acceleration structures, ray query{})",
         m_rayTracingSupported ? "supported" : "not supported",
         m_rayTracingSupported ? ", buffer device address" : "");
+    MRE_INFO("Mesh shaders {}", m_meshShaderSupported ? "supported" : "not supported");
 
     return true;
 }
@@ -589,6 +620,13 @@ bool VkDevice::CreateLogicalDevice()
 
     MRE_ASSERT(m_descriptorIndexingSupported, "The selected physical device must support descriptor indexing");
 
+    vk::PhysicalDeviceMeshShaderFeaturesEXT meshShaderFeatures{};
+    if (m_meshShaderSupported)
+    {
+        meshShaderFeatures.meshShader = true;
+        features13.pNext = &meshShaderFeatures;
+    }
+
     vk::PhysicalDeviceAccelerationStructureFeaturesKHR accelerationStructureFeatures{};
     vk::PhysicalDeviceRayQueryFeaturesKHR rayQueryFeatures{};
     if (m_rayTracingSupported)
@@ -596,7 +634,14 @@ bool VkDevice::CreateLogicalDevice()
         features12.bufferDeviceAddress = true;
         accelerationStructureFeatures.accelerationStructure = true;
         rayQueryFeatures.rayQuery = true;
-        features13.pNext = &accelerationStructureFeatures;
+        if (m_meshShaderSupported)
+        {
+            meshShaderFeatures.pNext = &accelerationStructureFeatures;
+        }
+        else
+        {
+            features13.pNext = &accelerationStructureFeatures;
+        }
         accelerationStructureFeatures.pNext = &rayQueryFeatures;
     }
 
@@ -607,6 +652,10 @@ bool VkDevice::CreateLogicalDevice()
     features2.pNext = &features11;
 
     std::vector<const char*> extensions{vk::KHRSwapchainExtensionName};
+    if (m_meshShaderSupported)
+    {
+        extensions.push_back(vk::EXTMeshShaderExtensionName);
+    }
     if (m_rayTracingSupported)
     {
         extensions.push_back(vk::KHRDeferredHostOperationsExtensionName);
@@ -642,6 +691,10 @@ bool VkDevice::CreateLogicalDevice()
             if (m_rayTracingSupported)
             {
                 rayQueryFeatures.pNext = &faultFeatures;
+            }
+            else if (m_meshShaderSupported)
+            {
+                meshShaderFeatures.pNext = &faultFeatures;
             }
             else
             {

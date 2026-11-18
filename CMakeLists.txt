@@ -28,6 +28,7 @@ find_package(VulkanMemoryAllocator CONFIG REQUIRED)
 find_package(imgui CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(unofficial-spirv-reflect CONFIG REQUIRED)
+find_package(meshoptimizer CONFIG REQUIRED)
 find_package(Threads REQUIRED)
 
 if(MRE_ENABLE_TRACY)
@@ -122,6 +123,7 @@ add_library(mukki_engine STATIC
     Renderer/Lighting/Light.cpp
     Renderer/Lighting/ShadowCascade.cpp
     Renderer/Lighting/Subsurface.cpp
+    Renderer/Meshlets/MeshletBuilder.cpp
     Renderer/RHI/Resources.cpp
     Scene/SceneBinary.cpp
     Scene/SceneDescription.cpp
@@ -164,7 +166,7 @@ target_compile_definitions(mukki_engine PRIVATE
     VMA_STATIC_VULKAN_FUNCTIONS=1
     VMA_DYNAMIC_VULKAN_FUNCTIONS=0
 )
-target_link_libraries(mukki_engine PRIVATE nlohmann_json::nlohmann_json unofficial::spirv-reflect box3d::box3d)
+target_link_libraries(mukki_engine PRIVATE nlohmann_json::nlohmann_json unofficial::spirv-reflect box3d::box3d meshoptimizer::meshoptimizer)
 target_link_libraries(mukki_engine
     PUBLIC
         Vulkan::Vulkan
@@ -202,12 +204,14 @@ if(MRE_BUILD_SANDBOX)
 
     mre_add_slang_shaders(mukki_sandbox
         Renderer/Shaders/gbuffer.vert.slang
+        Renderer/Shaders/gbuffer.mesh.slang
         Renderer/Shaders/gbuffer.frag.slang
         Renderer/Shaders/transparent.frag.slang
         Renderer/Shaders/lighting.vert.slang
         Renderer/Shaders/lighting.frag.slang
         Renderer/Shaders/cluster_culling.comp.slang
         Renderer/Shaders/shadow.vert.slang
+        Renderer/Shaders/shadow.mesh.slang
         Renderer/Shaders/shadow.frag.slang
         Renderer/Shaders/gi_trace.comp.slang
         Renderer/Shaders/gi_temporal.comp.slang

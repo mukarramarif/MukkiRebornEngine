@@ -99,6 +99,30 @@ struct GpuObjectData
     glm::uvec4 subsurfaceSamplerIndices{0u};
 };
 
+// Meshlet header as stored at the start of a per primitive meshlet buffer. Must match GpuMeshlet
+// in Renderer/Shaders/meshlet.slang.
+struct GpuMeshlet
+{
+    glm::vec4 centerRadius{0.0f};   // xyz: local center, w: radius
+    glm::vec4 coneAxisCutoff{0.0f}; // xyz: local cone axis, w: min dot(face normal, axis)
+    // x: vertex count, y: triangle count, z: vertex list offset, w: triangle list offset
+    glm::uvec4 data{0u};
+};
+
+// Per draw item meshlet source, indexed by ObjectPushConstants::drawIndex. Must match GpuMeshDraw
+// in Renderer/Shaders/meshlet.slang.
+struct GpuMeshDraw
+{
+    std::uint32_t meshletOffset = 0;      // first meshlet of the draw
+    std::uint32_t meshletCount = 0;
+    std::uint32_t vertexIndexBase = 0;    // byte offset of the meshlet vertex index list
+    std::uint32_t triangleBase = 0;       // byte offset of the packed micro triangle list
+    std::uint32_t vertexBufferIndex = 0;  // bindless slot of the source vertex buffer
+    std::uint32_t meshletBufferIndex = 0; // bindless slot of the meshlet data buffer
+    std::uint32_t padding0 = 0;
+    std::uint32_t padding1 = 0;
+};
+
 class DeferredRenderer
 {
 public:
@@ -128,6 +152,15 @@ public:
     // not affected.
     void SetModelScale(float scale);
     [[nodiscard]] float GetModelScale() const { return m_modelScale; }
+
+    // Meshlet rendering draws opaque glTF geometry through a mesh shader pipeline. It is enabled by
+    // default when the device supports mesh shaders and automatically falls back to the vertex
+    // pipeline for items without meshlets (or when disabled).
+    void SetMeshletRenderingEnabled(bool enabled);
+    [[nodiscard]] bool IsMeshletRenderingEnabled() const { return m_meshletRenderingEnabled; }
+    [[nodiscard]] bool IsMeshletRenderingSupported() const { return m_meshletRenderingSupported; }
+    [[nodiscard]] std::uint64_t GetMeshletCount() const { return m_meshletCount; }
+    [[nodiscard]] std::uint64_t GetMeshletTriangleCount() const { return m_meshletTriangleCount; }
 
     // Built-in ground plane (20x20 world units around the origin when the extent is 10) used as
     // the default floor. The extent scales it uniformly about the origin and follows into the
@@ -266,6 +299,12 @@ private:
         const rhi::AccelerationStructure* blas = nullptr;
         std::uint32_t vertexBufferIndex = 0;
         std::uint32_t indexBufferIndex = 0;
+        // Meshlet source. Items without meshlets (meshletCount == 0) use the vertex pipeline.
+        std::uint32_t meshletOffset = 0;
+        std::uint32_t meshletCount = 0;
+        std::uint32_t meshletVertexIndexBase = 0; // byte offset in the meshlet buffer
+        std::uint32_t meshletTriangleBase = 0;    // byte offset in the meshlet buffer
+        std::uint32_t meshletBufferIndex = 0;     // bindless slot of the meshlet buffer
         // KHR_materials_specular material data (see GpuObjectData).
         glm::vec4 specular{0.0f};
         glm::uvec4 specularTextureIndices{0u};
@@ -340,6 +379,16 @@ private:
 
     struct ModelResources
     {
+        // Meshlets of one primitive. The buffer holds [GpuMeshlet array][vertex indices][packed
+        // micro triangles] and is registered in the bindless storage buffer array.
+        struct MeshletPrimitive
+        {
+            std::uint32_t meshletCount = 0;
+            std::uint32_t vertexIndexBase = 0;
+            std::uint32_t triangleBase = 0;
+            std::uint32_t bufferIndex = 0;
+        };
+
         std::string name{};
         std::vector<Material> materials{};
         std::vector<std::unique_ptr<rhi::Buffer>> vertexBuffers{};
@@ -347,6 +396,8 @@ private:
         std::vector<std::uint32_t> vertexBufferIndices{};
         std::vector<std::uint32_t> indexBufferIndices{};
         std::vector<std::unique_ptr<rhi::AccelerationStructure>> accelerationStructures{};
+        std::vector<std::unique_ptr<rhi::Buffer>> meshletBuffers{};
+        std::vector<MeshletPrimitive> meshletPrimitives{};
         std::vector<DrawItem> drawItems{};
         SceneObjectBounds fittedBounds{};
         glm::vec3 fittedMin{0.0f};
@@ -452,6 +503,7 @@ private:
     bool CreatePipelines(rhi::Device& device);
     bool CreateScene();
     bool CreateClusterResources(rhi::Device& device);
+    void CreateMeshletResources(rhi::Device& device);
     bool CreateShadowResources(rhi::Device& device);
     void CreateLightingSets(rhi::Device& device);
     void UpdateUniforms(std::uint32_t frameIndex, const FrameView& view);
@@ -462,11 +514,12 @@ private:
     [[nodiscard]] std::vector<const DrawItem*> CollectShadowItems(
         const glm::vec3& lightPosition,
         float range) const;
-    void RecordShadowViews(std::uint32_t frameIndex);
+    void RecordShadowViews(std::uint32_t frameIndex, bool meshShadowActive);
     void RecordShadowView(
         std::uint32_t frameIndex,
         std::uint32_t shadowViewIndex,
         const std::vector<const DrawItem*>& items,
+        bool meshShadowActive,
         rhi::CommandList& secondary,
         const rhi::RenderingDesc& desc);
     void ApplyModelScale();
@@ -526,12 +579,14 @@ private:
     [[nodiscard]] std::uint32_t RecordGBufferSecondaries(
         std::uint32_t frameIndex,
         const rhi::RenderingDesc& desc,
-        const std::vector<const DrawItem*>& items);
+        const std::vector<const DrawItem*>& items,
+        bool meshRenderingActive);
     void RecordGBufferBatch(
         std::uint32_t frameIndex,
         const std::vector<const DrawItem*>& items,
         std::size_t begin,
         std::size_t end,
+        bool meshRenderingActive,
         rhi::CommandList& secondary,
         const rhi::RenderingDesc& desc);
 
@@ -576,18 +631,29 @@ private:
     std::vector<std::unique_ptr<rhi::DescriptorSet>> m_lightingSets{};
     std::vector<std::unique_ptr<rhi::DescriptorSet>> m_clusterSets{};
     std::unique_ptr<rhi::Shader> m_gbufferVertexShader{};
+    std::unique_ptr<rhi::Shader> m_gbufferMeshShader{};
     std::unique_ptr<rhi::Shader> m_gbufferFragmentShader{};
     std::unique_ptr<rhi::Shader> m_transparentFragmentShader{};
     std::unique_ptr<rhi::Shader> m_lightingVertexShader{};
     std::unique_ptr<rhi::Shader> m_lightingFragmentShader{};
     std::unique_ptr<rhi::Shader> m_clusterCullingShader{};
     std::unique_ptr<rhi::Shader> m_shadowVertexShader{};
+    std::unique_ptr<rhi::Shader> m_shadowMeshShader{};
     std::unique_ptr<rhi::Shader> m_shadowFragmentShader{};
     std::unique_ptr<rhi::Pipeline> m_gbufferPipeline{};
+    std::unique_ptr<rhi::Pipeline> m_gbufferMeshPipeline{};
     std::unique_ptr<rhi::Pipeline> m_transparentPipeline{};
     std::unique_ptr<rhi::Pipeline> m_lightingPipeline{};
     std::unique_ptr<rhi::Pipeline> m_clusterCullingPipeline{};
     std::unique_ptr<rhi::Pipeline> m_shadowPipeline{};
+    std::unique_ptr<rhi::Pipeline> m_shadowMeshPipeline{};
+    std::unique_ptr<rhi::DescriptorSetLayout> m_meshSetLayout{};
+    std::vector<std::unique_ptr<rhi::Buffer>> m_meshDrawBuffers{};
+    std::vector<std::unique_ptr<rhi::DescriptorSet>> m_meshSets{};
+    std::uint64_t m_meshletCount = 0;
+    std::uint64_t m_meshletTriangleCount = 0;
+    bool m_meshletRenderingSupported = false;
+    bool m_meshletRenderingEnabled = true;
     std::vector<DrawItem> m_sceneDrawItems{};
     std::vector<DrawItem> m_modelDrawItems{};
     std::vector<glm::mat4> m_modelBaseTransforms{};

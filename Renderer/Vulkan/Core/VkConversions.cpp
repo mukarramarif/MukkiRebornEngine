@@ -125,6 +125,8 @@ vk::ShaderStageFlagBits ToVkShaderStage(rhi::ShaderStage stage)
         return vk::ShaderStageFlagBits::eFragment;
     case rhi::ShaderStage::Compute:
         return vk::ShaderStageFlagBits::eCompute;
+    case rhi::ShaderStage::Mesh:
+        return vk::ShaderStageFlagBits::eMeshEXT;
     }
 
     MRE_UNREACHABLE();
@@ -146,6 +148,10 @@ vk::ShaderStageFlags ToVkShaderStageMask(rhi::ShaderStageMask mask)
     {
         flags |= vk::ShaderStageFlagBits::eCompute;
     }
+    if ((value & static_cast<std::uint8_t>(rhi::ShaderStageMask::Mesh)) != 0)
+    {
+        flags |= vk::ShaderStageFlagBits::eMeshEXT;
+    }
     return flags;
 }
 
@@ -164,6 +170,10 @@ vk::PipelineStageFlags2 ToVkPipelineStageFlags2(rhi::ShaderStageMask mask)
     if ((value & static_cast<std::uint8_t>(rhi::ShaderStageMask::Compute)) != 0)
     {
         flags |= vk::PipelineStageFlagBits2::eComputeShader;
+    }
+    if ((value & static_cast<std::uint8_t>(rhi::ShaderStageMask::Mesh)) != 0)
+    {
+        flags |= vk::PipelineStageFlagBits2::eMeshShaderEXT;
     }
     return flags;
 }

@@ -110,6 +110,10 @@ std::unique_ptr<rhi::Buffer> VkResourceAllocator::CreateBuffer(
     const bool useStaging = initialData != nullptr && initialDataSize > 0 && !desc.hostVisible;
 
     vk::BufferUsageFlags usage = ToVkBufferUsage(desc.usage);
+    if (desc.storage)
+    {
+        usage |= vk::BufferUsageFlagBits::eStorageBuffer;
+    }
     if (desc.deviceAddress)
     {
         // Geometry buffers registered in the bindless array are read as storage buffers by ray

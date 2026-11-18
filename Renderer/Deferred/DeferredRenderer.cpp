@@ -6,6 +6,7 @@
 #include "Core/JobSystem.h"
 #include "Renderer/GlobalIllumination/GiAtrousSchedule.h"
 #include "Renderer/Lighting/Subsurface.h"
+#include "Renderer/Meshlets/MeshletBuilder.h"
 #include "Renderer/RHI/Device.h"
 #include "Scene/SceneDescription.h"
 #include "Utilities/Assert.h"
@@ -19,6 +20,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstddef>
+#include <cstring>
 #include <future>
 #include <iterator>
 #include <string>
@@ -199,18 +201,26 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
         rhi::DescriptorBinding{
             2,
             rhi::DescriptorType::StorageBuffer,
-            rhi::ShaderStageMask::FragmentCompute,
+            rhi::ShaderStageMask::FragmentComputeMesh,
             rhi::kMaxBindlessBuffers,
             true},
     };
-    const std::array<const rhi::Shader*, 2> sceneStages{
+    std::vector<const rhi::Shader*> sceneStages{
         m_gbufferVertexShader.get(),
         m_gbufferFragmentShader.get()};
+    if (m_gbufferMeshShader != nullptr)
+    {
+        sceneStages.push_back(m_gbufferMeshShader.get());
+    }
     const std::array<const rhi::Shader*, 1> lightingStages{m_lightingFragmentShader.get()};
     const std::array<const rhi::Shader*, 1> clusterStages{m_clusterCullingShader.get()};
-    const std::array<const rhi::Shader*, 2> shadowStages{
+    std::vector<const rhi::Shader*> shadowStages{
         m_shadowVertexShader.get(),
         m_shadowFragmentShader.get()};
+    if (m_shadowMeshShader != nullptr)
+    {
+        shadowStages.push_back(m_shadowMeshShader.get());
+    }
     const std::array<const rhi::Shader*, 1> giTraceStages{m_giTraceShader.get()};
     const std::array<const rhi::Shader*, 1> giTemporalStages{m_giTemporalShader.get()};
     const std::array<const rhi::Shader*, 1> giAtrousStages{m_giAtrousShader.get()};
@@ -225,6 +235,12 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
         device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(clusterStages, 0));
     m_shadowSetLayout =
         device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(shadowStages, 0));
+    if (m_gbufferMeshShader != nullptr)
+    {
+        const std::array<const rhi::Shader*, 1> meshStages{m_gbufferMeshShader.get()};
+        m_meshSetLayout =
+            device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(meshStages, 2));
+    }
     m_giTraceSetLayout =
         device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(giTraceStages, 0));
     m_giTemporalSetLayout =
@@ -309,6 +325,8 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
         m_sceneSets.push_back(std::move(sceneSet));
     }
 
+    CreateMeshletResources(device);
+
     if (!CreateClusterResources(device) || !CreateShadowResources(device))
     {
         Shutdown();
@@ -352,6 +370,22 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
         return false;
     }
 
+    m_meshletRenderingSupported = m_gbufferMeshShader != nullptr && m_shadowMeshShader != nullptr &&
+                                  m_gbufferMeshPipeline != nullptr && m_shadowMeshPipeline != nullptr &&
+                                  m_meshSetLayout != nullptr &&
+                                  m_meshSets.size() == device.GetFramesInFlight();
+    m_meshletRenderingEnabled = m_meshletRenderingSupported;
+    if (std::getenv("MRE_MESHLETS_OFF") != nullptr)
+    {
+        m_meshletRenderingEnabled = false;
+    }
+    if (m_meshletRenderingSupported)
+    {
+        MRE_INFO(
+            "Meshlet rendering {} (mesh shader G-buffer and shadow passes)",
+            m_meshletRenderingEnabled ? "enabled" : "disabled");
+    }
+
     if (!CreateRtShadowResources(device))
     {
         Shutdown();
@@ -386,11 +420,22 @@ void DeferredRenderer::Shutdown()
     m_sceneSets.clear();
     m_shadowSets.clear();
     m_shadowPipeline.reset();
+    m_shadowMeshPipeline.reset();
+    m_gbufferMeshPipeline.reset();
+    m_meshSetLayout.reset();
+    m_meshDrawBuffers.clear();
+    m_meshSets.clear();
+    m_meshletCount = 0;
+    m_meshletTriangleCount = 0;
+    m_meshletRenderingSupported = false;
+    m_meshletRenderingEnabled = true;
     m_clusterCullingPipeline.reset();
     m_lightingPipeline.reset();
     m_gbufferPipeline.reset();
     m_shadowFragmentShader.reset();
+    m_shadowMeshShader.reset();
     m_shadowVertexShader.reset();
+    m_gbufferMeshShader.reset();
     m_clusterCullingShader.reset();
     m_lightingFragmentShader.reset();
     m_lightingVertexShader.reset();
@@ -857,20 +902,23 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
     }
 
     const bool rayTracingSupported = m_device->IsRayTracingSupported();
+    const bool meshShaderSupported = m_device->IsMeshShaderSupported();
     resources->vertexBuffers.reserve(model.primitives.size());
     resources->indexBuffers.reserve(model.primitives.size());
     resources->accelerationStructures.reserve(model.primitives.size());
+    resources->meshletBuffers.reserve(model.primitives.size());
+    resources->meshletPrimitives.reserve(model.primitives.size());
     for (const GltfPrimitive& primitive : model.primitives)
     {
         const std::uint64_t vertexBytes = sizeof(GltfVertex) * primitive.vertices.size();
         const std::uint64_t indexBytes = sizeof(std::uint32_t) * primitive.indices.size();
 
         resources->vertexBuffers.push_back(m_device->CreateBuffer(
-            rhi::BufferDesc{vertexBytes, rhi::BufferUsage::Vertex, false, rayTracingSupported},
+            rhi::BufferDesc{vertexBytes, rhi::BufferUsage::Vertex, false, rayTracingSupported, 0, true},
             primitive.vertices.data(),
             vertexBytes));
         resources->indexBuffers.push_back(m_device->CreateBuffer(
-            rhi::BufferDesc{indexBytes, rhi::BufferUsage::Index, false, rayTracingSupported},
+            rhi::BufferDesc{indexBytes, rhi::BufferUsage::Index, false, rayTracingSupported, 0, true},
             primitive.indices.data(),
             indexBytes));
 
@@ -891,6 +939,71 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
                 true};
             resources->accelerationStructures.push_back(
                 m_device->CreateBottomLevelAccelerationStructure(blasDesc));
+        }
+
+        // Pack the meshlets, the vertex index list and the packed micro triangles into one
+        // storage buffer that is registered in the bindless buffer array.
+        resources->meshletPrimitives.push_back(ModelResources::MeshletPrimitive{});
+        if (meshShaderSupported)
+        {
+            const MeshletMesh meshlets = BuildMeshlets(primitive.vertices, primitive.indices);
+            if (!meshlets.Empty())
+            {
+                const std::uint32_t meshletBytes =
+                    static_cast<std::uint32_t>(meshlets.meshlets.size() * sizeof(GpuMeshlet));
+                const std::uint32_t vertexIndexBase = meshletBytes;
+                const std::uint32_t triangleBase = vertexIndexBase +
+                    static_cast<std::uint32_t>(meshlets.meshletVertices.size() * sizeof(std::uint32_t));
+                const std::uint64_t bufferSize = triangleBase +
+                    meshlets.meshletTriangles.size() * sizeof(std::uint32_t);
+
+                std::vector<GpuMeshlet> gpuMeshlets(meshlets.meshlets.size());
+                for (std::size_t index = 0; index < meshlets.meshlets.size(); ++index)
+                {
+                    const Meshlet& meshlet = meshlets.meshlets[index];
+                    gpuMeshlets[index].centerRadius = glm::vec4{
+                        meshlet.bounds.center,
+                        meshlet.bounds.radius};
+                    gpuMeshlets[index].coneAxisCutoff = glm::vec4{
+                        meshlet.bounds.coneAxis,
+                        meshlet.bounds.coneCutoff};
+                    gpuMeshlets[index].data = glm::uvec4{
+                        meshlet.vertexCount,
+                        meshlet.triangleCount,
+                        meshlet.vertexOffset,
+                        meshlet.triangleOffset};
+                }
+
+                std::vector<std::byte> bytes(static_cast<std::size_t>(bufferSize));
+                std::memcpy(bytes.data(), gpuMeshlets.data(), meshletBytes);
+                std::memcpy(
+                    bytes.data() + vertexIndexBase,
+                    meshlets.meshletVertices.data(),
+                    meshlets.meshletVertices.size() * sizeof(std::uint32_t));
+                std::memcpy(
+                    bytes.data() + triangleBase,
+                    meshlets.meshletTriangles.data(),
+                    meshlets.meshletTriangles.size() * sizeof(std::uint32_t));
+
+                resources->meshletBuffers.push_back(m_device->CreateBuffer(
+                    rhi::BufferDesc{bufferSize, rhi::BufferUsage::Storage, false},
+                    bytes.data(),
+                    bytes.size()));
+
+                ModelResources::MeshletPrimitive& meshletPrimitive =
+                    resources->meshletPrimitives.back();
+                meshletPrimitive.meshletCount =
+                    static_cast<std::uint32_t>(meshlets.meshlets.size());
+                meshletPrimitive.vertexIndexBase = vertexIndexBase;
+                meshletPrimitive.triangleBase = triangleBase;
+                meshletPrimitive.bufferIndex = m_nextBindlessBuffer++;
+                m_bindlessSet->BindStorageBuffer(
+                    2,
+                    *resources->meshletBuffers.back(),
+                    meshletPrimitive.bufferIndex);
+                m_meshletCount += meshlets.meshlets.size();
+                m_meshletTriangleCount += meshlets.meshletTriangles.size();
+            }
         }
     }
     m_blasDirty = true;
@@ -918,6 +1031,13 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
             }
             item.vertexBufferIndex = resources->vertexBufferIndices[primitiveIndex];
             item.indexBufferIndex = resources->indexBufferIndices[primitiveIndex];
+            const ModelResources::MeshletPrimitive& meshletPrimitive =
+                resources->meshletPrimitives[primitiveIndex];
+            item.meshletCount = meshletPrimitive.meshletCount;
+            item.meshletOffset = 0;
+            item.meshletVertexIndexBase = meshletPrimitive.vertexIndexBase;
+            item.meshletTriangleBase = meshletPrimitive.triangleBase;
+            item.meshletBufferIndex = meshletPrimitive.bufferIndex;
 
             const std::uint32_t whiteIndex = m_whiteTexture->GetBindlessIndex();
             const std::uint32_t defaultSamplerIndex =
@@ -1173,11 +1293,18 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
     m_modelVertexCount = m_models[modelIndex]->vertexCount;
     m_modelTriangleCount = m_models[modelIndex]->triangleCount;
 
+    std::uint64_t meshletCount = 0;
+    for (const ModelResources::MeshletPrimitive& primitive : m_models[modelIndex]->meshletPrimitives)
+    {
+        meshletCount += primitive.meshletCount;
+    }
+
     MRE_INFO(
-        "Model '{}' uploaded ({} draw items, {} textures)",
+        "Model '{}' uploaded ({} draw items, {} textures, {} meshlets)",
         m_modelName,
         m_models[modelIndex]->drawItems.size(),
-        textureCount);
+        textureCount,
+        meshletCount);
     return modelIndex;
 }
 
@@ -1337,6 +1464,8 @@ void DeferredRenderer::ClearModels()
     m_models.clear();
     m_blasDirty = true;
     m_hasSssMaterials = false;
+    m_meshletCount = 0;
+    m_meshletTriangleCount = 0;
     ++m_geometryRevision;
 }
 
@@ -1352,6 +1481,11 @@ void DeferredRenderer::UnloadModel()
     m_modelName.clear();
     m_modelVertexCount = 0;
     m_modelTriangleCount = 0;
+}
+
+void DeferredRenderer::SetMeshletRenderingEnabled(bool enabled)
+{
+    m_meshletRenderingEnabled = enabled && m_meshletRenderingSupported;
 }
 
 void DeferredRenderer::SetModelScale(float scale)
@@ -1432,9 +1566,11 @@ void DeferredRenderer::UpdateObjectData(std::uint32_t frameIndex)
 
     std::vector<GpuObjectData> objectData{};
     objectData.resize(itemCount);
+    std::vector<GpuMeshDraw> meshDraws{};
+    meshDraws.resize(itemCount);
 
     std::size_t index = 0;
-    const auto updateItem = [this, &objectData, &index](DrawItem& item) {
+    const auto updateItem = [this, &objectData, &meshDraws, &index](DrawItem& item) {
         objectData[index].previousModel = m_previousModels[index];
         objectData[index].specular = item.specular;
         objectData[index].specularTextureIndices = item.specularTextureIndices;
@@ -1454,6 +1590,12 @@ void DeferredRenderer::UpdateObjectData(std::uint32_t frameIndex)
         objectData[index].subsurfaceTextureIndices = item.subsurfaceTextureIndices;
         objectData[index].subsurfaceSamplerIndices = item.subsurfaceSamplerIndices;
         item.pushConstants.drawIndex = static_cast<std::uint32_t>(index);
+        meshDraws[index].meshletOffset = item.meshletOffset;
+        meshDraws[index].meshletCount = item.meshletCount;
+        meshDraws[index].vertexIndexBase = item.meshletVertexIndexBase;
+        meshDraws[index].triangleBase = item.meshletTriangleBase;
+        meshDraws[index].vertexBufferIndex = item.vertexBufferIndex;
+        meshDraws[index].meshletBufferIndex = item.meshletBufferIndex;
         m_previousModels[index] = item.pushConstants.model;
         ++index;
     };
@@ -1470,6 +1612,12 @@ void DeferredRenderer::UpdateObjectData(std::uint32_t frameIndex)
     if (!objectData.empty())
     {
         m_objectDataBuffers[frameIndex]->Write(objectData.data(), objectData.size() * sizeof(GpuObjectData));
+    }
+
+    if (!meshDraws.empty() && frameIndex < m_meshDrawBuffers.size() &&
+        m_meshDrawBuffers[frameIndex] != nullptr)
+    {
+        m_meshDrawBuffers[frameIndex]->Write(meshDraws.data(), meshDraws.size() * sizeof(GpuMeshDraw));
     }
 }
 
@@ -2673,19 +2821,27 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
     };
     gbufferDesc.depthAttachment = rhi::DepthAttachment{&m_gbuffer.GetDepth(), 1.0f, true};
 
+    const bool meshRenderingActive = m_meshletRenderingEnabled && m_meshletRenderingSupported &&
+                                     m_gbufferMeshPipeline != nullptr &&
+                                     frameIndex < m_meshSets.size() &&
+                                     frameIndex < m_meshDrawBuffers.size();
     // Alpha blended materials skip the opaque G-buffer and are drawn back-to-front after lighting.
-    std::vector<const DrawItem*> gbufferItems{};
+    // Opaque items with meshlets use the mesh shader pipeline when it is available.
+    std::vector<const DrawItem*> opaqueItems{};
     std::vector<const DrawItem*> transparentItems{};
-    gbufferItems.reserve(m_sceneDrawItems.size() + m_modelDrawItems.size());
+    opaqueItems.reserve(m_sceneDrawItems.size() + m_modelDrawItems.size());
     transparentItems.reserve(m_modelDrawItems.size());
-    const auto classifyItem = [&gbufferItems, &transparentItems](const DrawItem& item) {
+    const auto isMeshItem = [meshRenderingActive](const DrawItem& item) {
+        return meshRenderingActive && item.meshletCount > 0;
+    };
+    const auto classifyItem = [&opaqueItems, &transparentItems](const DrawItem& item) {
         if (item.alphaBlend)
         {
             transparentItems.push_back(&item);
         }
         else
         {
-            gbufferItems.push_back(&item);
+            opaqueItems.push_back(&item);
         }
     };
     for (const DrawItem& item : m_sceneDrawItems)
@@ -2718,6 +2874,9 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
     BuildShadowCullItems();
     BuildShadowViews();
 
+    const bool meshShadowActive =
+        meshRenderingActive && m_shadowMeshPipeline != nullptr && !m_shadowViews.empty();
+
     if (!m_shadowViews.empty())
     {
         commandList.BeginGpuZone("ShadowPass");
@@ -2728,7 +2887,7 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
 
         if (useShadowSecondaries)
         {
-            RecordShadowViews(frameIndex);
+            RecordShadowViews(frameIndex, meshShadowActive);
 
             for (std::size_t index = 0; index < m_shadowViews.size(); ++index)
             {
@@ -2759,6 +2918,38 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
                 shadowDesc.area = shadowView.area;
 
                 commandList.BeginRendering(shadowDesc);
+
+                ShadowPushConstants pushConstants{};
+                pushConstants.viewIndex = shadowView.viewIndex;
+
+                if (meshShadowActive)
+                {
+                    commandList.BindPipeline(*m_shadowMeshPipeline);
+                    commandList.BindDescriptorSet(0, *m_shadowSets[frameIndex]);
+                    commandList.BindDescriptorSet(1, *m_bindlessSet);
+                    commandList.BindDescriptorSet(2, *m_meshSets[frameIndex]);
+                    commandList.SetDepthBias(
+                        m_shadowSettings.depthBias,
+                        m_shadowSettings.depthBias * 1.5f,
+                        0.0f);
+
+                    const std::uint32_t meshPushConstantSize =
+                        m_shadowMeshPipeline->GetPushConstantSize();
+                    for (const DrawItem* item : shadowView.items)
+                    {
+                        if (item->meshletCount == 0)
+                        {
+                            continue;
+                        }
+                        pushConstants.object = item->pushConstants;
+                        commandList.SetPushConstants(
+                            &pushConstants,
+                            meshPushConstantSize,
+                            rhi::ShaderStageMask::FragmentMesh);
+                        commandList.DrawMeshTasks(item->meshletCount);
+                    }
+                }
+
                 commandList.BindPipeline(*m_shadowPipeline);
                 commandList.BindDescriptorSet(0, *m_shadowSets[frameIndex]);
                 commandList.BindDescriptorSet(1, *m_bindlessSet);
@@ -2767,11 +2958,13 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
                     m_shadowSettings.depthBias * 1.5f,
                     0.0f);
 
-                ShadowPushConstants pushConstants{};
-                pushConstants.viewIndex = shadowView.viewIndex;
                 const std::uint32_t pushConstantSize = m_shadowPipeline->GetPushConstantSize();
                 for (const DrawItem* item : shadowView.items)
                 {
+                    if (meshShadowActive && item->meshletCount > 0)
+                    {
+                        continue;
+                    }
                     pushConstants.object = item->pushConstants;
                     commandList.BindVertexBuffer(*item->vertexBuffer);
                     commandList.BindIndexBuffer(*item->indexBuffer);
@@ -2788,28 +2981,16 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
         commandList.EndGpuZone();
     }
 
-    const auto drawItems = [&commandList, frameIndex](const std::vector<const DrawItem*>& items) {
-        for (const DrawItem* item : items)
-        {
-            commandList.BindVertexBuffer(*item->vertexBuffer);
-            commandList.BindIndexBuffer(*item->indexBuffer);
-            commandList.SetPushConstants(
-                &item->pushConstants,
-                sizeof(ObjectPushConstants),
-                rhi::ShaderStageMask::VertexFragment);
-            commandList.DrawIndexed(item->indexCount, item->firstIndex);
-        }
-    };
-
     const bool useSecondaries =
-        m_jobSystem != nullptr && m_secondaryBatchCount > 1 && gbufferItems.size() > 1 &&
+        m_jobSystem != nullptr && m_secondaryBatchCount > 1 && opaqueItems.size() > 1 &&
         frameIndex < m_gbufferSecondaries.size();
 
     commandList.BeginGpuZone("GBuffer");
 
     if (useSecondaries)
     {
-        const std::uint32_t batchCount = RecordGBufferSecondaries(frameIndex, gbufferDesc, gbufferItems);
+        const std::uint32_t batchCount =
+            RecordGBufferSecondaries(frameIndex, gbufferDesc, opaqueItems, meshRenderingActive);
 
         std::vector<const rhi::CommandList*> secondaries{};
         secondaries.reserve(batchCount);
@@ -2826,10 +3007,53 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
     else
     {
         commandList.BeginRendering(gbufferDesc);
-        commandList.BindPipeline(*m_gbufferPipeline);
-        commandList.BindDescriptorSet(0, *m_sceneSets[frameIndex]);
-        commandList.BindDescriptorSet(1, *m_bindlessSet);
-        drawItems(gbufferItems);
+        if (meshRenderingActive)
+        {
+            bool meshPipelineBound = false;
+            for (const DrawItem* item : opaqueItems)
+            {
+                if (!isMeshItem(*item))
+                {
+                    continue;
+                }
+                if (!meshPipelineBound)
+                {
+                    commandList.BindPipeline(*m_gbufferMeshPipeline);
+                    commandList.BindDescriptorSet(0, *m_sceneSets[frameIndex]);
+                    commandList.BindDescriptorSet(1, *m_bindlessSet);
+                    commandList.BindDescriptorSet(2, *m_meshSets[frameIndex]);
+                    meshPipelineBound = true;
+                }
+                commandList.SetPushConstants(
+                    &item->pushConstants,
+                    sizeof(ObjectPushConstants),
+                    rhi::ShaderStageMask::FragmentMesh);
+                commandList.DrawMeshTasks(item->meshletCount);
+            }
+        }
+
+        bool vertexPipelineBound = false;
+        for (const DrawItem* item : opaqueItems)
+        {
+            if (isMeshItem(*item))
+            {
+                continue;
+            }
+            if (!vertexPipelineBound)
+            {
+                commandList.BindPipeline(*m_gbufferPipeline);
+                commandList.BindDescriptorSet(0, *m_sceneSets[frameIndex]);
+                commandList.BindDescriptorSet(1, *m_bindlessSet);
+                vertexPipelineBound = true;
+            }
+            commandList.BindVertexBuffer(*item->vertexBuffer);
+            commandList.BindIndexBuffer(*item->indexBuffer);
+            commandList.SetPushConstants(
+                &item->pushConstants,
+                sizeof(ObjectPushConstants),
+                rhi::ShaderStageMask::VertexFragment);
+            commandList.DrawIndexed(item->indexCount, item->firstIndex);
+        }
         commandList.EndRendering();
     }
 
@@ -3077,12 +3301,17 @@ void DeferredRenderer::RecordDebugLines(rhi::CommandList& commandList, const Fra
 std::uint32_t DeferredRenderer::RecordGBufferSecondaries(
     std::uint32_t frameIndex,
     const rhi::RenderingDesc& desc,
-    const std::vector<const DrawItem*>& items)
+    const std::vector<const DrawItem*>& items,
+    bool meshRenderingActive)
 {
     MRE_PROFILE_ZONE_N("RecordGBufferSecondaries");
     MRE_ASSERT(m_jobSystem != nullptr, "RecordGBufferSecondaries requires a job system");
     MRE_ASSERT(frameIndex < m_gbufferSecondaries.size(), "Frame index out of range");
     MRE_ASSERT(!items.empty(), "RecordGBufferSecondaries requires draw items");
+    MRE_ASSERT(
+        !meshRenderingActive ||
+            (m_gbufferMeshPipeline != nullptr && frameIndex < m_meshSets.size()),
+        "Meshlet secondaries require the mesh pipeline and descriptor set");
 
     const std::uint32_t batchCount = std::min(
         m_secondaryBatchCount,
@@ -3104,9 +3333,17 @@ std::uint32_t DeferredRenderer::RecordGBufferSecondaries(
         MRE_ASSERT(begin < end, "RecordGBufferSecondaries produced an empty batch");
 
         rhi::CommandList* secondary = m_gbufferSecondaries[frameIndex][batch].get();
-        futures.push_back(m_jobSystem->Submit([this, frameIndex, secondary, &desc, &items, begin, end]() {
-            RecordGBufferBatch(frameIndex, items, begin, end, *secondary, desc);
-        }));
+        futures.push_back(m_jobSystem->Submit(
+            [this, frameIndex, secondary, &desc, &items, begin, end, meshRenderingActive]() {
+                RecordGBufferBatch(
+                    frameIndex,
+                    items,
+                    begin,
+                    end,
+                    meshRenderingActive,
+                    *secondary,
+                    desc);
+            }));
     }
 
     for (std::future<void>& future : futures)
@@ -3122,22 +3359,62 @@ void DeferredRenderer::RecordGBufferBatch(
     const std::vector<const DrawItem*>& items,
     std::size_t begin,
     std::size_t end,
+    bool meshRenderingActive,
     rhi::CommandList& secondary,
     const rhi::RenderingDesc& desc)
 {
     MRE_ASSERT(m_gbufferPipeline != nullptr, "RecordGBufferBatch requires the G-buffer pipeline");
     MRE_ASSERT(frameIndex < m_sceneSets.size(), "Frame index out of range");
+    MRE_ASSERT(
+        !meshRenderingActive ||
+            (m_gbufferMeshPipeline != nullptr && frameIndex < m_meshSets.size()),
+        "Meshlet batches require the mesh pipeline and descriptor set");
 
     secondary.BeginSecondary(desc);
-    secondary.BindPipeline(*m_gbufferPipeline);
-    secondary.BindDescriptorSet(0, *m_sceneSets[frameIndex]);
-    secondary.BindDescriptorSet(1, *m_bindlessSet);
-
     secondary.BeginGpuZone("GBufferBatch");
 
+    // Mesh items first so the batch binds each pipeline at most once.
+    if (meshRenderingActive)
+    {
+        bool meshPipelineBound = false;
+        for (std::size_t index = begin; index < end; ++index)
+        {
+            const DrawItem& item = *items[index];
+            if (item.meshletCount == 0)
+            {
+                continue;
+            }
+            if (!meshPipelineBound)
+            {
+                secondary.BindPipeline(*m_gbufferMeshPipeline);
+                secondary.BindDescriptorSet(0, *m_sceneSets[frameIndex]);
+                secondary.BindDescriptorSet(1, *m_bindlessSet);
+                secondary.BindDescriptorSet(2, *m_meshSets[frameIndex]);
+                meshPipelineBound = true;
+            }
+            secondary.SetPushConstants(
+                &item.pushConstants,
+                sizeof(ObjectPushConstants),
+                rhi::ShaderStageMask::FragmentMesh);
+            secondary.DrawMeshTasks(item.meshletCount);
+        }
+    }
+
+    bool vertexPipelineBound = false;
     for (std::size_t index = begin; index < end; ++index)
     {
         const DrawItem& item = *items[index];
+        if (meshRenderingActive && item.meshletCount > 0)
+        {
+            continue;
+        }
+        if (!vertexPipelineBound)
+        {
+            secondary.BindPipeline(*m_gbufferPipeline);
+            secondary.BindDescriptorSet(0, *m_sceneSets[frameIndex]);
+            secondary.BindDescriptorSet(1, *m_bindlessSet);
+            vertexPipelineBound = true;
+        }
         secondary.BindVertexBuffer(*item.vertexBuffer);
         secondary.BindIndexBuffer(*item.indexBuffer);
         secondary.SetPushConstants(
@@ -3273,7 +3550,7 @@ void DeferredRenderer::BuildShadowViews()
     }
 }
 
-void DeferredRenderer::RecordShadowViews(std::uint32_t frameIndex)
+void DeferredRenderer::RecordShadowViews(std::uint32_t frameIndex, bool meshShadowActive)
 {
     MRE_PROFILE_ZONE_N("RecordShadowViews");
     MRE_ASSERT(m_jobSystem != nullptr, "RecordShadowViews requires a job system");
@@ -3281,6 +3558,9 @@ void DeferredRenderer::RecordShadowViews(std::uint32_t frameIndex)
     MRE_ASSERT(
         m_shadowViews.size() <= m_shadowSecondaries[frameIndex].size(),
         "Not enough shadow secondary command lists were allocated");
+    MRE_ASSERT(
+        !meshShadowActive || (m_shadowMeshPipeline != nullptr && frameIndex < m_meshSets.size()),
+        "Meshlet shadow views require the mesh pipeline and descriptor set");
 
     std::vector<std::future<void>> futures{};
     futures.reserve(m_shadowViews.size());
@@ -3297,9 +3577,16 @@ void DeferredRenderer::RecordShadowViews(std::uint32_t frameIndex)
         desc.depthAttachment.layer = view.layer;
         desc.area = view.area;
 
-        futures.push_back(m_jobSystem->Submit([this, frameIndex, secondary, &view, desc]() {
-            RecordShadowView(frameIndex, view.viewIndex, view.items, *secondary, desc);
-        }));
+        futures.push_back(m_jobSystem->Submit(
+            [this, frameIndex, secondary, &view, desc, meshShadowActive]() {
+                RecordShadowView(
+                    frameIndex,
+                    view.viewIndex,
+                    view.items,
+                    meshShadowActive,
+                    *secondary,
+                    desc);
+            }));
     }
 
     for (std::future<void>& future : futures)
@@ -3312,25 +3599,60 @@ void DeferredRenderer::RecordShadowView(
     std::uint32_t frameIndex,
     std::uint32_t shadowViewIndex,
     const std::vector<const DrawItem*>& items,
+    bool meshShadowActive,
     rhi::CommandList& secondary,
     const rhi::RenderingDesc& desc)
 {
     MRE_ASSERT(m_shadowPipeline != nullptr, "RecordShadowView requires the shadow pipeline");
     MRE_ASSERT(frameIndex < m_shadowSets.size(), "Frame index out of range");
+    MRE_ASSERT(
+        !meshShadowActive || (m_shadowMeshPipeline != nullptr && frameIndex < m_meshSets.size()),
+        "Meshlet shadow views require the mesh pipeline and descriptor set");
 
     secondary.BeginSecondary(desc);
-    secondary.BindPipeline(*m_shadowPipeline);
-    secondary.BindDescriptorSet(0, *m_shadowSets[frameIndex]);
-    secondary.BindDescriptorSet(1, *m_bindlessSet);
-    secondary.SetDepthBias(m_shadowSettings.depthBias, m_shadowSettings.depthBias * 1.5f, 0.0f);
     secondary.BeginGpuZone("ShadowView");
 
     ShadowPushConstants pushConstants{};
     pushConstants.viewIndex = shadowViewIndex;
 
+    // Mesh items first so the view binds each pipeline at most once.
+    if (meshShadowActive)
+    {
+        secondary.BindPipeline(*m_shadowMeshPipeline);
+        secondary.BindDescriptorSet(0, *m_shadowSets[frameIndex]);
+        secondary.BindDescriptorSet(1, *m_bindlessSet);
+        secondary.BindDescriptorSet(2, *m_meshSets[frameIndex]);
+        secondary.SetDepthBias(m_shadowSettings.depthBias, m_shadowSettings.depthBias * 1.5f, 0.0f);
+
+        const std::uint32_t meshPushConstantSize =
+            m_shadowMeshPipeline->GetPushConstantSize();
+        for (const DrawItem* item : items)
+        {
+            if (item->meshletCount == 0)
+            {
+                continue;
+            }
+            pushConstants.object = item->pushConstants;
+            secondary.SetPushConstants(
+                &pushConstants,
+                meshPushConstantSize,
+                rhi::ShaderStageMask::FragmentMesh);
+            secondary.DrawMeshTasks(item->meshletCount);
+        }
+    }
+
+    secondary.BindPipeline(*m_shadowPipeline);
+    secondary.BindDescriptorSet(0, *m_shadowSets[frameIndex]);
+    secondary.BindDescriptorSet(1, *m_bindlessSet);
+    secondary.SetDepthBias(m_shadowSettings.depthBias, m_shadowSettings.depthBias * 1.5f, 0.0f);
+
     const std::uint32_t pushConstantSize = m_shadowPipeline->GetPushConstantSize();
     for (const DrawItem* item : items)
     {
+        if (meshShadowActive && item->meshletCount > 0)
+        {
+            continue;
+        }
         pushConstants.object = item->pushConstants;
         secondary.BindVertexBuffer(*item->vertexBuffer);
         secondary.BindIndexBuffer(*item->indexBuffer);
@@ -3423,6 +3745,21 @@ bool DeferredRenderer::LoadShaders(rhi::Device& device, const std::filesystem::p
         rhi::ShaderStage::Fragment,
         shaderDirectory / "composite.frag.spv");
 
+    // Meshlet rendering is optional: devices without mesh shaders keep the vertex pipeline.
+    if (device.IsMeshShaderSupported())
+    {
+        m_gbufferMeshShader = device.CreateShader(
+            rhi::ShaderStage::Mesh,
+            shaderDirectory / "gbuffer.mesh.spv");
+        m_shadowMeshShader = device.CreateShader(
+            rhi::ShaderStage::Mesh,
+            shaderDirectory / "shadow.mesh.spv");
+        if (m_gbufferMeshShader == nullptr || m_shadowMeshShader == nullptr)
+        {
+            MRE_WARN("Failed to load the mesh shaders; meshlet rendering stays disabled");
+        }
+    }
+
     if (m_gbufferVertexShader == nullptr || m_gbufferFragmentShader == nullptr ||
         m_transparentFragmentShader == nullptr ||
         m_lightingVertexShader == nullptr || m_lightingFragmentShader == nullptr ||
@@ -3469,6 +3806,29 @@ bool DeferredRenderer::CreatePipelines(rhi::Device& device)
         rhi::Format::R8G8B8A8Unorm};
     gbufferPipelineDesc.depthFormat = rhi::Format::D32Sfloat;
     m_gbufferPipeline = device.CreatePipeline(gbufferPipelineDesc);
+
+    // Meshlet variant of the opaque G-buffer pass; the fragment stage and attachments match.
+    if (m_gbufferMeshShader != nullptr && m_meshSetLayout != nullptr)
+    {
+        const std::array<const rhi::Shader*, 2> gbufferMeshStages{
+            m_gbufferMeshShader.get(),
+            m_gbufferFragmentShader.get()};
+        rhi::PipelineDesc gbufferMeshPipelineDesc{};
+        gbufferMeshPipelineDesc.meshShader = m_gbufferMeshShader.get();
+        gbufferMeshPipelineDesc.fragmentShader = m_gbufferFragmentShader.get();
+        rhi::ApplyShaderReflection(gbufferMeshPipelineDesc, gbufferMeshStages);
+        gbufferMeshPipelineDesc.depthTest = true;
+        gbufferMeshPipelineDesc.depthWrite = true;
+        gbufferMeshPipelineDesc.blend = false;
+        gbufferMeshPipelineDesc.cullMode = rhi::CullMode::None;
+        gbufferMeshPipelineDesc.descriptorSetLayouts = {
+            m_sceneSetLayout.get(),
+            m_bindlessSetLayout.get(),
+            m_meshSetLayout.get()};
+        gbufferMeshPipelineDesc.colorFormats = gbufferPipelineDesc.colorFormats;
+        gbufferMeshPipelineDesc.depthFormat = rhi::Format::D32Sfloat;
+        m_gbufferMeshPipeline = device.CreatePipeline(gbufferMeshPipelineDesc);
+    }
 
     // Forward pass for alpha blended materials: shares the G-buffer vertex shader, blends over the
     // lit image and tests against the opaque depth without writing it.
@@ -3570,6 +3930,27 @@ bool DeferredRenderer::CreatePipelines(rhi::Device& device)
     shadowPipelineDesc.descriptorSetLayouts = {m_shadowSetLayout.get(), m_bindlessSetLayout.get()};
     shadowPipelineDesc.depthFormat = rhi::Format::D32Sfloat;
     m_shadowPipeline = device.CreatePipeline(shadowPipelineDesc);
+
+    if (m_shadowMeshShader != nullptr && m_meshSetLayout != nullptr)
+    {
+        const std::array<const rhi::Shader*, 2> shadowMeshStages{
+            m_shadowMeshShader.get(),
+            m_shadowFragmentShader.get()};
+        rhi::PipelineDesc shadowMeshPipelineDesc{};
+        shadowMeshPipelineDesc.meshShader = m_shadowMeshShader.get();
+        shadowMeshPipelineDesc.fragmentShader = m_shadowFragmentShader.get();
+        rhi::ApplyShaderReflection(shadowMeshPipelineDesc, shadowMeshStages);
+        shadowMeshPipelineDesc.depthTest = true;
+        shadowMeshPipelineDesc.depthWrite = true;
+        shadowMeshPipelineDesc.depthBiasEnable = true;
+        shadowMeshPipelineDesc.cullMode = rhi::CullMode::None;
+        shadowMeshPipelineDesc.descriptorSetLayouts = {
+            m_shadowSetLayout.get(),
+            m_bindlessSetLayout.get(),
+            m_meshSetLayout.get()};
+        shadowMeshPipelineDesc.depthFormat = rhi::Format::D32Sfloat;
+        m_shadowMeshPipeline = device.CreatePipeline(shadowMeshPipelineDesc);
+    }
 
     const auto createGiPipeline = [&device](
                                       const rhi::Shader& shader,
@@ -3974,6 +4355,34 @@ bool DeferredRenderer::CreateClusterResources(rhi::Device& device)
         m_clusterGrid.count,
         kMaxLightsPerCluster);
     return true;
+}
+
+void DeferredRenderer::CreateMeshletResources(rhi::Device& device)
+{
+    if (m_meshSetLayout == nullptr)
+    {
+        return;
+    }
+
+    const std::uint32_t framesInFlight = device.GetFramesInFlight();
+    m_meshDrawBuffers.clear();
+    m_meshSets.clear();
+    m_meshDrawBuffers.reserve(framesInFlight);
+    m_meshSets.reserve(framesInFlight);
+    for (std::uint32_t frame = 0; frame < framesInFlight; ++frame)
+    {
+        m_meshDrawBuffers.push_back(device.CreateBuffer(
+            rhi::BufferDesc{kMaxObjectData * sizeof(GpuMeshDraw), rhi::BufferUsage::Storage, true}));
+        if (m_meshDrawBuffers.back() == nullptr)
+        {
+            MRE_CRITICAL("Failed to create the mesh draw data buffer");
+            return;
+        }
+
+        std::unique_ptr<rhi::DescriptorSet> meshSet = device.CreateDescriptorSet(*m_meshSetLayout);
+        meshSet->BindBuffer(0, *m_meshDrawBuffers.back());
+        m_meshSets.push_back(std::move(meshSet));
+    }
 }
 
 void DeferredRenderer::SetLights(std::span<const Light> lights)

@@ -1,15 +1,13 @@
-struct ObjectPushConstants
+// Flattened so the std430 block matches mukki::DeferredRenderer::ShadowPushConstants; Slang
+// pads nested structs to 16 bytes, which would move viewIndex past the C++ layout.
+struct ShadowPushConstants
 {
     float4x4 model;
     float4 baseColorFactor;
     float4 params;
     uint2 textureIndices;
     uint2 samplerIndices;
-};
-
-struct ShadowPushConstants
-{
-    ObjectPushConstants object;
+    uint drawIndex;
     uint viewIndex;
 };
 
@@ -40,7 +38,7 @@ struct VertexOutput
 [shader("vertex")]
 VertexOutput vertexMain(VertexInput input)
 {
-    const float4 worldPosition = mul(gPush.object.model, float4(input.position, 1.0));
+    const float4 worldPosition = mul(gPush.model, float4(input.position, 1.0));
 
     VertexOutput output;
     output.position = mul(gShadow.viewProjections[gPush.viewIndex], worldPosition);

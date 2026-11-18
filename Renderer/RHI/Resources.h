@@ -59,6 +59,7 @@ enum class ShaderStage : std::uint8_t
     Vertex = 0,
     Fragment,
     Compute,
+    Mesh,
 };
 
 enum class ShaderStageMask : std::uint8_t
@@ -67,8 +68,11 @@ enum class ShaderStageMask : std::uint8_t
     Vertex = 1,
     Fragment = 2,
     Compute = 4,
+    Mesh = 8,
     VertexFragment = 3,
     FragmentCompute = 6,
+    FragmentMesh = 10,
+    FragmentComputeMesh = 14,
 };
 
 enum class CullMode : std::uint8_t
@@ -133,6 +137,9 @@ struct BufferDesc
     bool hostVisible = false;
     bool deviceAddress = false; // expose a buffer device address (ray tracing)
     std::uint32_t alignment = 0; // optional allocation alignment, 0 for the backend default
+    // Also allow storage buffer descriptors. Geometry buffers need this when they are registered in
+    // the bindless buffer array and read as storage buffers by mesh or ray traced shaders.
+    bool storage = false;
 };
 
 class Buffer
@@ -401,10 +408,13 @@ protected:
 
 struct PipelineDesc
 {
+    // A graphics pipeline produces primitives with either the vertex or the mesh stage.
     const Shader* vertexShader = nullptr;
+    const Shader* meshShader = nullptr;
     const Shader* fragmentShader = nullptr;
     const Shader* computeShader = nullptr;
     std::string_view vertexEntryPoint = "vertexMain";
+    std::string_view meshEntryPoint = "meshMain";
     std::string_view fragmentEntryPoint = "fragmentMain";
     std::string_view computeEntryPoint = "computeMain";
     VertexLayout vertexLayout{};

@@ -133,7 +133,7 @@ flowchart TB
     UPLOAD --> AS["Acceleration structures<br/>BLAS per primitive (rebuild when dirty)<br/>+ per-frame TLAS + geometry SSBO"]
 
     AS --> SHADOW["Shadow pass<br/>CSM · spot · point<br/>(secondary command buffers)"]
-    SHADOW --> GBUFFER["G-buffer pass<br/>albedo · normal+roughness · position · motion<br/>specularF0 · transmission · attenuation · sheen · depth"]
+    GBUFFER["G-buffer pass<br/>mesh shader meshlets or vertex path<br/>albedo · normal+roughness · position · motion<br/>specularF0 · transmission · attenuation · sheen · depth"]
     GBUFFER --> RTSHADOW["RT sun shadow mask<br/>jittered rays, full-res R16F (optional)"]
     AS --> RTSHADOW
 
@@ -206,6 +206,16 @@ flowchart TB
   a-trous kernel with GI and fades into the GI specular signal at the roughness cutoff.
 - **Lighting** composites direct clustered lights, indirect GI (or probes) and reflections in one
   pass, applies ACES tonemapping, and transparent `BLEND` geometry is drawn over the result.
+- **Meshlets**: opaque glTF geometry is clustered with [meshoptimizer](https://github.com/zeux/meshoptimizer)
+  (`Renderer/Meshlets/MeshletBuilder`) into meshlets of up to 64 vertices and 124 triangles. The
+  G-buffer and shadow passes render them with `gbuffer.mesh.slang` / `shadow.mesh.slang`: one mesh
+  shader workgroup per meshlet, culled against the view frustum and the normal cone, emitting its
+  deduplicated vertices and packed triangles. The vertex pipeline remains for transparent
+  materials, the ground plane and devices without `VK_EXT_mesh_shader`. Meshlet rendering is on by
+  default when supported; the `Scenes` window toggles it and `MRE_MESHLETS_OFF` disables it. Both
+  the G-buffer and shadow passes record meshlet and vertex draws into secondary command buffers on
+  the job system. A compute cull producing indirect mesh-task dispatches (or a task shader) for
+  meshlet compaction is a natural follow-up (not implemented).
 
 ## Scenes
 

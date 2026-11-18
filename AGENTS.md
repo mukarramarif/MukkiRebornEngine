@@ -120,6 +120,22 @@ must not expose backend types, and Vulkan types may only appear under `Renderer/
 - Multithreading: `Core/JobSystem` is the shared thread pool. glTF parsing runs asynchronously
   (`Assets/AsyncGltfLoader`) and the G-buffer draw calls are recorded into secondary command buffers
   on worker threads, then replayed from the primary command list with `ExecuteCommands`.
+- Meshlets: `Renderer/Meshlets/MeshletBuilder` clusters glTF triangle lists with meshoptimizer
+  (`meshopt_buildMeshlets`, 64 vertices / 124 triangles, `meshopt_computeMeshletBounds`) and packs
+  `[GpuMeshlet array][vertex index list][packed micro triangles]` into one storage buffer per
+  primitive. The buffer is bound in the bindless storage buffer array; a per-frame `GpuMeshDraw`
+  SSBO (descriptor set 2, indexed by `ObjectPushConstants::drawIndex`) tells the shader where the
+  meshlets and the source vertex buffer live. Opaque items with meshlets render through
+  `gbuffer.mesh.slang` / `shadow.mesh.slang` (one mesh shader workgroup per meshlet) when
+  `Device::IsMeshShaderSupported()`; the RHI exposes `ShaderStage::Mesh`, `PipelineDesc::meshShader`
+  and `CommandList::DrawMeshTasks`. Culling is frustum + meshoptimizer normal cone
+  (`dot(center - camera, axis) >= cutoff * distance + radius`; mirrored transforms skip the cone).
+  The path is enabled by default when supported (`MRE_MESHLETS_OFF` disables it, the `Scenes`
+  window toggles it); transparent materials, the ground plane and items without meshlets use the
+  vertex pipeline in the same rendering scope. The G-buffer and shadow secondary command buffers
+  (recorded on the JobSystem) replay meshlet and vertex draws in the same batch, binding each
+  pipeline at most once. Natural follow-up (not implemented): a compute cull that writes indirect
+  mesh-task dispatches (or a task shader) to compact meshlets.
 - Bindless: descriptor indexing is a hard device requirement. Textures get a bindless index from the
   device and are bound into a global update-after-bind `SampledImage` array set; shaders sample them
   through `Texture2D textures[]` with `NonUniformResourceIndex`.

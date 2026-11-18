@@ -15,6 +15,7 @@ add_executable(mukki_tests
     test_keybinds.cpp
     test_light_selection.cpp
     test_log.cpp
+    test_meshlet_builder.cpp
     test_path_utils.cpp
     test_physics.cpp
     test_plane_controller.cpp

@@ -652,6 +652,28 @@ private:
             RebuildPhysics();
         }
 
+        ImGui::SeparatorText("Meshlets");
+        const bool meshletSupported = m_renderer->IsMeshletRenderingSupported();
+        bool meshletEnabled = m_renderer->IsMeshletRenderingEnabled();
+        if (!meshletSupported)
+        {
+            ImGui::BeginDisabled();
+        }
+        if (ImGui::Checkbox("Mesh shader pipeline", &meshletEnabled))
+        {
+            m_renderer->SetMeshletRenderingEnabled(meshletEnabled);
+        }
+        if (!meshletSupported)
+        {
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::TextUnformatted("(VK_EXT_mesh_shader unavailable)");
+        }
+        ImGui::Text(
+            "Meshlets: %llu   Triangles: %llu",
+            static_cast<unsigned long long>(m_renderer->GetMeshletCount()),
+            static_cast<unsigned long long>(m_renderer->GetMeshletTriangleCount()));
+
         ImGui::Separator();
         ImGui::Text("Objects: %zu   Lights: %zu", m_scene.objects.size(), m_scene.lights.size());
         ImGui::Text("Vertices: %llu", static_cast<unsigned long long>(m_renderer->GetModelVertexCount()));

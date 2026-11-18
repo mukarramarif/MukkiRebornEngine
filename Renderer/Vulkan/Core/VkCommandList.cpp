@@ -645,6 +645,21 @@ void VkCommandList::DrawIndexed(std::uint32_t indexCount, std::uint32_t firstInd
     m_commandBuffer.drawIndexed(indexCount, 1, firstIndex, 0, 0);
 }
 
+void VkCommandList::DrawMeshTasks(
+    std::uint32_t groupCountX,
+    std::uint32_t groupCountY,
+    std::uint32_t groupCountZ)
+{
+    MRE_ASSERT(m_recording, "VkCommandList::DrawMeshTasks called outside of a recording scope");
+    MRE_ASSERT(m_rendering, "VkCommandList::DrawMeshTasks called outside of a rendering scope");
+    MRE_ASSERT(m_hasBoundPipeline, "VkCommandList::DrawMeshTasks requires a bound pipeline");
+    MRE_ASSERT(
+        m_boundPipelineBindPoint == vk::PipelineBindPoint::eGraphics,
+        "VkCommandList::DrawMeshTasks requires a bound graphics pipeline");
+
+    m_commandBuffer.drawMeshTasksEXT(groupCountX, groupCountY, groupCountZ);
+}
+
 void VkCommandList::Dispatch(std::uint32_t groupCountX, std::uint32_t groupCountY, std::uint32_t groupCountZ)
 {
     MRE_ASSERT(m_recording, "VkCommandList::Dispatch called outside of a recording scope");
