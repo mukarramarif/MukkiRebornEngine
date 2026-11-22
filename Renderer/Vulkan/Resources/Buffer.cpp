@@ -64,4 +64,26 @@ void VkBuffer::Write(const void* data, std::uint64_t size, std::uint64_t offset)
     vmaUnmapMemory(m_allocator, m_allocation);
 }
 
+bool VkBuffer::Read(void* data, std::uint64_t size, std::uint64_t offset)
+{
+    MRE_ASSERT(data != nullptr, "VkBuffer::Read requires a data pointer");
+    if (!m_hostVisible || offset + size > m_size)
+    {
+        return false;
+    }
+
+    void* mapped = nullptr;
+    const VkResult result = vmaMapMemory(m_allocator, m_allocation, &mapped);
+    if (result != VK_SUCCESS || mapped == nullptr)
+    {
+        MRE_ERROR("Failed to map a buffer (VkResult {})", static_cast<int>(result));
+        return false;
+    }
+
+    vmaInvalidateAllocation(m_allocator, m_allocation, offset, size);
+    std::memcpy(data, static_cast<const std::byte*>(mapped) + offset, size);
+    vmaUnmapMemory(m_allocator, m_allocation);
+    return true;
+}
+
 } // namespace mukki::vulkan

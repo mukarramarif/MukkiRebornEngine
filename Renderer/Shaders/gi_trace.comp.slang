@@ -105,7 +105,11 @@ void computeMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         const float3 halfVector = SampleGgxVndf(normal, viewDirection, specularUv, alpha);
         const float3 specularDirection = reflect(-viewDirection, halfVector);
 
-        diffuseAccum += diffuseRadiance;
+        // Skip non-finite rays so single floating point edge cases do not poison the pixel.
+        if (all(isfinite(diffuseRadiance)))
+        {
+            diffuseAccum += diffuseRadiance;
+        }
 
         const float nDotL = dot(normal, specularDirection);
         if (nDotL > 0.0)
@@ -137,9 +141,12 @@ void computeMain(uint3 dispatchThreadId : SV_DispatchThreadID)
             const float nDotV = saturate(dot(normal, viewDirection));
             const float vDotH = saturate(dot(viewDirection, halfVector));
             const float3 fresnel = f0 + (1.0 - f0) * pow(1.0 - vDotH, 5.0);
-            specularAccum +=
-                specularRadiance * fresnel * SpecularVndfWeight(nDotV, nDotL, alpha) *
-                specularCoverage;
+            const float3 specularSample = specularRadiance * fresnel *
+                                          SpecularVndfWeight(nDotV, nDotL, alpha) * specularCoverage;
+            if (all(isfinite(specularSample)))
+            {
+                specularAccum += specularSample;
+            }
         }
 
         hitDistanceAccum += diffuseHitDistance;

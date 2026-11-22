@@ -59,6 +59,7 @@ enum class ShaderStage : std::uint8_t
     Vertex = 0,
     Fragment,
     Compute,
+    Mesh,
 };
 
 enum class ShaderStageMask : std::uint8_t
@@ -67,8 +68,11 @@ enum class ShaderStageMask : std::uint8_t
     Vertex = 1,
     Fragment = 2,
     Compute = 4,
+    Mesh = 8,
     VertexFragment = 3,
     FragmentCompute = 6,
+    FragmentMesh = 10,
+    FragmentComputeMesh = 14,
 };
 
 enum class CullMode : std::uint8_t
@@ -133,6 +137,11 @@ struct BufferDesc
     bool hostVisible = false;
     bool deviceAddress = false; // expose a buffer device address (ray tracing)
     std::uint32_t alignment = 0; // optional allocation alignment, 0 for the backend default
+    // Also allow storage buffer descriptors. Geometry buffers need this when they are registered in
+    // the bindless buffer array and read as storage buffers by mesh or ray traced shaders.
+    bool storage = false;
+    // Also allow the buffer to source indirect draw commands (mesh task dispatches).
+    bool indirect = false;
 };
 
 class Buffer
@@ -147,6 +156,11 @@ public:
     [[nodiscard]] virtual bool IsHostVisible() const = 0;
     [[nodiscard]] virtual std::uint64_t GetDeviceAddress() const = 0;
     virtual void Write(const void* data, std::uint64_t size, std::uint64_t offset = 0) = 0;
+
+    // Reads back host-visible contents (debug UI, diagnostics). Returns false when the buffer is
+    // not host visible or the request is out of range. Wait for the device to be idle first for
+    // GPU-written data.
+    [[nodiscard]] virtual bool Read(void* data, std::uint64_t size, std::uint64_t offset = 0) = 0;
 
 protected:
     Buffer() = default;
@@ -396,10 +410,13 @@ protected:
 
 struct PipelineDesc
 {
+    // A graphics pipeline produces primitives with either the vertex or the mesh stage.
     const Shader* vertexShader = nullptr;
+    const Shader* meshShader = nullptr;
     const Shader* fragmentShader = nullptr;
     const Shader* computeShader = nullptr;
     std::string_view vertexEntryPoint = "vertexMain";
+    std::string_view meshEntryPoint = "meshMain";
     std::string_view fragmentEntryPoint = "fragmentMain";
     std::string_view computeEntryPoint = "computeMain";
     VertexLayout vertexLayout{};

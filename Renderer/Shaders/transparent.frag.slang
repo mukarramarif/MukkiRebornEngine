@@ -3,6 +3,7 @@ struct SceneUniform
     float4x4 viewProjection;
     float4x4 previousViewProjection;
     float4x4 view;
+    float4x4 inverseViewProjection;
     float4 cameraPosition;
     float4 ambientColor;
     float4 clusterParams;
@@ -41,6 +42,9 @@ struct GpuObjectData
     float4 emissive; // rgb: emissiveFactor (incl. strength)
     uint4 emissiveTextureIndices;
     uint4 emissiveSamplerIndices;
+    float4 subsurface;            // rgb: diffuseTransmissionColor, a: factor
+    uint4 subsurfaceTextureIndices; // x: diffuseTransmissionTexture, y: color texture
+    uint4 subsurfaceSamplerIndices;
 };
 
 struct VertexOutput

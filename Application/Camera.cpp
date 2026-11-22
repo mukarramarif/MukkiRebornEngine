@@ -46,6 +46,19 @@ void Camera::SetRotation(float yawRadians, float pitchRadians)
     RecalculateView();
 }
 
+void Camera::SetView(const glm::vec3& position, const glm::vec3& forward, const glm::vec3& up)
+{
+    MRE_ASSERT(glm::length(forward) > 0.0f, "Camera view forward must not be zero");
+    MRE_ASSERT(glm::length(up) > 0.0f, "Camera view up must not be zero");
+
+    m_position = position;
+    const glm::vec3 direction = glm::normalize(forward);
+    m_yaw = std::atan2(direction.x, -direction.z);
+    m_pitch = std::asin(std::clamp(direction.y, -1.0f, 1.0f));
+    m_view = glm::lookAt(m_position, m_position + direction, glm::normalize(up));
+    m_viewProjection = m_projection * m_view;
+}
+
 glm::vec3 Camera::GetForward() const
 {
     const float cosPitch = std::cos(m_pitch);

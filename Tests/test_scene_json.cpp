@@ -12,16 +12,51 @@ namespace
 constexpr const char* kSceneText = R"({
   "name": "Test Scene",
   "assetRoot": "models",
+  "physics": {
+    "gravity": [0.0, -12.0, 0.0],
+    "stepHz": 90.0,
+    "subSteps": 2
+  },
+  "environment": {
+    "map": "env/sunrise.hdr",
+    "intensity": 0.8
+  },
+  "clouds": {
+    "enabled": true,
+    "coverage": 0.62,
+    "cloudType": 0.33,
+    "density": 0.03,
+    "layerBottomKm": 0.9,
+    "layerTopKm": 2.8,
+    "windSpeed": 25.0,
+    "windDirectionRadians": 0.7,
+    "coverageVariation": 0.5,
+    "temporalBlend": 0.85
+  },
+  "playerPlane": "Box",
   "objects": [
     {
       "name": "Box",
       "model": "Box/glTF/Box.gltf",
       "position": [1.0, 2.0, 3.0],
       "rotation": [10.0, 20.0, 30.0],
-      "scale": [2.0, 2.0, 2.0]
+      "scale": [2.0, 2.0, 2.0],
+      "physics": {
+        "body": "dynamic",
+        "shape": "box",
+        "halfExtents": [0.5, 0.5, 0.5],
+        "density": 400.0,
+        "friction": 0.7,
+        "restitution": 0.1
+      }
     },
     {
-      "model": "Duck.gltf"
+      "model": "Duck.gltf",
+      "physics": {
+        "body": "static",
+        "shape": "sphere",
+        "radius": 0.25
+      }
     }
   ],
   "probes": [
@@ -92,6 +127,35 @@ TEST(SceneJson, ParsesObjectsAndLights)
     EXPECT_EQ(scene.objects[1].name, "Object 1");
     EXPECT_FLOAT_EQ(scene.objects[1].scale.y, 1.0f);
 
+    EXPECT_EQ(scene.objects[0].physics.body, mukki::ScenePhysicsBody::Dynamic);
+    EXPECT_EQ(scene.objects[0].physics.shape, mukki::ScenePhysicsShape::Box);
+    EXPECT_FLOAT_EQ(scene.objects[0].physics.halfExtents.x, 0.5f);
+    EXPECT_FLOAT_EQ(scene.objects[0].physics.density, 400.0f);
+    EXPECT_FLOAT_EQ(scene.objects[0].physics.friction, 0.7f);
+    EXPECT_FLOAT_EQ(scene.objects[0].physics.restitution, 0.1f);
+    EXPECT_EQ(scene.objects[1].physics.body, mukki::ScenePhysicsBody::Static);
+    EXPECT_EQ(scene.objects[1].physics.shape, mukki::ScenePhysicsShape::Sphere);
+    EXPECT_FLOAT_EQ(scene.objects[1].physics.radius, 0.25f);
+    EXPECT_FLOAT_EQ(scene.physics.gravity.y, -12.0f);
+    EXPECT_FLOAT_EQ(scene.physics.stepHz, 90.0f);
+    EXPECT_EQ(scene.physics.subSteps, 2u);
+
+    EXPECT_TRUE(scene.hasEnvironment);
+    EXPECT_EQ(scene.environment.map, std::filesystem::path{"env/sunrise.hdr"});
+    EXPECT_FLOAT_EQ(scene.environment.intensity, 0.8f);
+
+    EXPECT_TRUE(scene.hasClouds);
+    EXPECT_TRUE(scene.clouds.enabled);
+    EXPECT_FLOAT_EQ(scene.clouds.coverage, 0.62f);
+    EXPECT_FLOAT_EQ(scene.clouds.layerBottomKm, 0.9f);
+    EXPECT_FLOAT_EQ(scene.clouds.layerTopKm, 2.8f);
+    EXPECT_FLOAT_EQ(scene.clouds.windSpeed, 25.0f);
+    EXPECT_FLOAT_EQ(scene.clouds.temporalBlend, 0.85f);
+    EXPECT_EQ(scene.clouds.primarySteps, 64u);
+    EXPECT_EQ(scene.clouds.lightSteps, 6u);
+
+    EXPECT_EQ(scene.playerPlane, "Box");
+
     ASSERT_EQ(scene.probes.size(), 2u);
     EXPECT_EQ(scene.probes[0].name, "Center");
     EXPECT_FLOAT_EQ(scene.probes[0].position.y, 2.5f);
@@ -140,7 +204,47 @@ TEST(SceneJson, RoundTripsThroughSerialization)
         EXPECT_FLOAT_EQ(reloaded.objects[index].position.x, scene.objects[index].position.x);
         EXPECT_FLOAT_EQ(reloaded.objects[index].rotation.z, scene.objects[index].rotation.z);
         EXPECT_FLOAT_EQ(reloaded.objects[index].scale.z, scene.objects[index].scale.z);
+        EXPECT_EQ(reloaded.objects[index].physics.body, scene.objects[index].physics.body);
+        EXPECT_EQ(reloaded.objects[index].physics.shape, scene.objects[index].physics.shape);
+        EXPECT_FLOAT_EQ(
+            reloaded.objects[index].physics.halfExtents.z,
+            scene.objects[index].physics.halfExtents.z);
+        EXPECT_FLOAT_EQ(reloaded.objects[index].physics.radius, scene.objects[index].physics.radius);
+        EXPECT_FLOAT_EQ(reloaded.objects[index].physics.density, scene.objects[index].physics.density);
+        EXPECT_FLOAT_EQ(reloaded.objects[index].physics.friction, scene.objects[index].physics.friction);
+        EXPECT_FLOAT_EQ(
+            reloaded.objects[index].physics.restitution,
+            scene.objects[index].physics.restitution);
     }
+
+    EXPECT_FLOAT_EQ(reloaded.physics.gravity.y, scene.physics.gravity.y);
+    EXPECT_FLOAT_EQ(reloaded.physics.stepHz, scene.physics.stepHz);
+    EXPECT_EQ(reloaded.physics.subSteps, scene.physics.subSteps);
+
+    EXPECT_TRUE(reloaded.hasEnvironment);
+    EXPECT_EQ(reloaded.environment.map, scene.environment.map);
+    EXPECT_FLOAT_EQ(reloaded.environment.intensity, scene.environment.intensity);
+
+    EXPECT_TRUE(reloaded.hasClouds);
+    EXPECT_EQ(reloaded.clouds.enabled, scene.clouds.enabled);
+    EXPECT_FLOAT_EQ(reloaded.clouds.coverage, scene.clouds.coverage);
+    EXPECT_FLOAT_EQ(reloaded.clouds.cloudType, scene.clouds.cloudType);
+    EXPECT_FLOAT_EQ(reloaded.clouds.density, scene.clouds.density);
+    EXPECT_FLOAT_EQ(reloaded.clouds.detailStrength, scene.clouds.detailStrength);
+    EXPECT_FLOAT_EQ(reloaded.clouds.layerBottomKm, scene.clouds.layerBottomKm);
+    EXPECT_FLOAT_EQ(reloaded.clouds.layerTopKm, scene.clouds.layerTopKm);
+    EXPECT_FLOAT_EQ(reloaded.clouds.altitudeVariationKm, scene.clouds.altitudeVariationKm);
+    EXPECT_FLOAT_EQ(reloaded.clouds.windSpeed, scene.clouds.windSpeed);
+    EXPECT_FLOAT_EQ(reloaded.clouds.windDirectionRadians, scene.clouds.windDirectionRadians);
+    EXPECT_FLOAT_EQ(reloaded.clouds.curlStrength, scene.clouds.curlStrength);
+    EXPECT_FLOAT_EQ(reloaded.clouds.coverageVariation, scene.clouds.coverageVariation);
+    EXPECT_EQ(reloaded.clouds.primarySteps, scene.clouds.primarySteps);
+    EXPECT_EQ(reloaded.clouds.lightSteps, scene.clouds.lightSteps);
+    EXPECT_FLOAT_EQ(reloaded.clouds.resolutionScale, scene.clouds.resolutionScale);
+    EXPECT_FLOAT_EQ(reloaded.clouds.temporalBlend, scene.clouds.temporalBlend);
+    EXPECT_FLOAT_EQ(reloaded.clouds.godRayIntensity, scene.clouds.godRayIntensity);
+
+    EXPECT_EQ(reloaded.playerPlane, scene.playerPlane);
 
     for (std::size_t index = 0; index < scene.probes.size(); ++index)
     {
@@ -190,6 +294,65 @@ TEST(SceneJson, RejectsInvalidInput)
         base,
         scene,
         error));
+
+    EXPECT_FALSE(mukki::SceneJson::Parse(
+        R"({"objects": [{"model": "Box.gltf", "physics": {"body": "bouncy"}}]})",
+        base,
+        scene,
+        error));
+    EXPECT_NE(error.find("bouncy"), std::string::npos);
+
+    EXPECT_FALSE(mukki::SceneJson::Parse(
+        R"({"objects": [{"model": "Box.gltf", "physics": {"body": "dynamic", "shape": "torus"}}]})",
+        base,
+        scene,
+        error));
+    EXPECT_NE(error.find("torus"), std::string::npos);
+
+    EXPECT_FALSE(mukki::SceneJson::Parse(
+        R"({"physics": {"stepHz": 500.0}})",
+        base,
+        scene,
+        error));
+
+    EXPECT_FALSE(mukki::SceneJson::Parse(
+        R"({"physics": {"subSteps": 0}})",
+        base,
+        scene,
+        error));
+
+    EXPECT_FALSE(mukki::SceneJson::Parse(
+        R"({"clouds": {"layerBottomKm": 1.0, "layerTopKm": 0.5}})",
+        base,
+        scene,
+        error));
+
+    EXPECT_FALSE(mukki::SceneJson::Parse(
+        R"({"clouds": {"primarySteps": 0}})",
+        base,
+        scene,
+        error));
+
+    EXPECT_FALSE(mukki::SceneJson::Parse(R"({"environment": []})", base, scene, error));
+
+    EXPECT_FALSE(mukki::SceneJson::Parse(R"({"playerPlane": 5})", base, scene, error));
+}
+
+TEST(SceneJson, SceneSettingsAreOptional)
+{
+    mukki::SceneDescription scene{};
+    std::string error{};
+    ASSERT_TRUE(mukki::SceneJson::Parse(R"({"name": "Bare"})", TestBaseDirectory(), scene, error))
+        << error;
+
+    EXPECT_FALSE(scene.hasEnvironment);
+    EXPECT_FALSE(scene.hasClouds);
+    EXPECT_TRUE(scene.playerPlane.empty());
+
+    const std::string serialized = mukki::SceneJson::Serialize(scene);
+    EXPECT_EQ(serialized.find("\"environment\""), std::string::npos);
+    EXPECT_EQ(serialized.find("\"clouds\""), std::string::npos);
+    EXPECT_EQ(serialized.find("\"playerPlane\""), std::string::npos);
 }
 
 } // namespace

@@ -60,6 +60,9 @@ struct GpuGeometryData
     float4 emissive;            // rgb: emissiveFactor (incl. strength)
     uint4 emissiveTextureIndices; // x: emissiveTexture
     uint4 emissiveSamplerIndices; // x: emissive sampler
+    float4 subsurface;            // rgb: diffuseTransmissionColor, a: factor
+    uint4 subsurfaceTextureIndices; // x: diffuseTransmissionTexture, y: color texture
+    uint4 subsurfaceSamplerIndices;
 };
 
 struct GpuGiProbe
@@ -69,4 +72,8 @@ struct GpuGiProbe
     float4 shX;
     float4 shY;
     float4 shZ;
+    // x: mean hit distance (misses count as the GI ray length), y: mean squared distance,
+    // z: valid flag (0 while the probe is embedded in geometry), w: fraction of committed hits
+    // that are backfaces.
+    float4 depth;
 };

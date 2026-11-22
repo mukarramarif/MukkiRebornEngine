@@ -3,6 +3,7 @@ struct SceneUniform
     float4x4 viewProjection;
     float4x4 previousViewProjection;
     float4x4 view;
+    float4x4 inverseViewProjection;
     float4 cameraPosition;
     float4 ambientColor;
     float4 clusterParams;
@@ -40,6 +41,9 @@ struct GpuObjectData
     float4 emissive;               // rgb: emissiveFactor (incl. strength)
     uint4 emissiveTextureIndices;  // x: emissiveTexture
     uint4 emissiveSamplerIndices;  // x: emissive sampler
+    float4 subsurface;            // rgb: diffuseTransmissionColor, a: factor
+    uint4 subsurfaceTextureIndices; // x: diffuseTransmissionTexture, y: color texture
+    uint4 subsurfaceSamplerIndices;
 };
 
 [[vk::binding(0, 0)]] ConstantBuffer<SceneUniform> gScene;
@@ -60,6 +64,7 @@ struct VertexOutput
     [[vk::location(1)]] float3 normal : NORMAL;
     [[vk::location(2)]] float2 uv : TEXCOORD0;
     [[vk::location(3)]] float4 previousClip : PREVIOUSCLIP;
+    [[vk::location(4)]] float3 debugColor : MESHLETDEBUG;
 };
 
 [shader("vertex")]
@@ -75,5 +80,7 @@ VertexOutput vertexMain(VertexInput input)
     output.normal = mul((float3x3)gObject.model, input.normal);
     output.uv = input.uv;
     output.previousClip = mul(gScene.previousViewProjection, previousWorldPosition);
+    // Vertex-pipeline geometry is not split into meshlets; keep it dark in the debug view.
+    output.debugColor = float3(0.08, 0.08, 0.08);
     return output;
 }

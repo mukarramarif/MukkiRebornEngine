@@ -645,6 +645,44 @@ void VkCommandList::DrawIndexed(std::uint32_t indexCount, std::uint32_t firstInd
     m_commandBuffer.drawIndexed(indexCount, 1, firstIndex, 0, 0);
 }
 
+void VkCommandList::DrawMeshTasks(
+    std::uint32_t groupCountX,
+    std::uint32_t groupCountY,
+    std::uint32_t groupCountZ)
+{
+    MRE_ASSERT(m_recording, "VkCommandList::DrawMeshTasks called outside of a recording scope");
+    MRE_ASSERT(m_rendering, "VkCommandList::DrawMeshTasks called outside of a rendering scope");
+    MRE_ASSERT(m_hasBoundPipeline, "VkCommandList::DrawMeshTasks requires a bound pipeline");
+    MRE_ASSERT(
+        m_boundPipelineBindPoint == vk::PipelineBindPoint::eGraphics,
+        "VkCommandList::DrawMeshTasks requires a bound graphics pipeline");
+
+    m_commandBuffer.drawMeshTasksEXT(groupCountX, groupCountY, groupCountZ);
+}
+
+void VkCommandList::DrawMeshTasksIndirect(
+    const rhi::Buffer& buffer,
+    std::uint64_t offset,
+    std::uint32_t drawCount,
+    std::uint32_t stride)
+{
+    MRE_ASSERT(
+        m_recording,
+        "VkCommandList::DrawMeshTasksIndirect called outside of a recording scope");
+    MRE_ASSERT(
+        m_rendering,
+        "VkCommandList::DrawMeshTasksIndirect called outside of a rendering scope");
+    MRE_ASSERT(
+        m_hasBoundPipeline,
+        "VkCommandList::DrawMeshTasksIndirect requires a bound pipeline");
+    MRE_ASSERT(
+        m_boundPipelineBindPoint == vk::PipelineBindPoint::eGraphics,
+        "VkCommandList::DrawMeshTasksIndirect requires a bound graphics pipeline");
+
+    const auto& vkBuffer = static_cast<const VkBuffer&>(buffer);
+    m_commandBuffer.drawMeshTasksIndirectEXT(vkBuffer.GetHandle(), offset, drawCount, stride);
+}
+
 void VkCommandList::Dispatch(std::uint32_t groupCountX, std::uint32_t groupCountY, std::uint32_t groupCountZ)
 {
     MRE_ASSERT(m_recording, "VkCommandList::Dispatch called outside of a recording scope");
@@ -666,6 +704,24 @@ void VkCommandList::ShaderMemoryBarrier(rhi::ShaderStageMask before, rhi::Shader
                                            .setSrcAccessMask(vk::AccessFlagBits2::eShaderWrite)
                                            .setDstStageMask(ToVkPipelineStageFlags2(after))
                                            .setDstAccessMask(vk::AccessFlagBits2::eShaderRead);
+    m_commandBuffer.pipelineBarrier2(vk::DependencyInfo{}.setMemoryBarriers(barrier));
+}
+
+void VkCommandList::MeshTaskIndirectBarrier()
+{
+    MRE_ASSERT(
+        m_recording,
+        "VkCommandList::MeshTaskIndirectBarrier called outside of a recording scope");
+
+    const vk::MemoryBarrier2 barrier = vk::MemoryBarrier2{}
+                                           .setSrcStageMask(vk::PipelineStageFlagBits2::eComputeShader)
+                                           .setSrcAccessMask(vk::AccessFlagBits2::eShaderWrite)
+                                           .setDstStageMask(
+                                               vk::PipelineStageFlagBits2::eMeshShaderEXT |
+                                               vk::PipelineStageFlagBits2::eDrawIndirect)
+                                           .setDstAccessMask(
+                                               vk::AccessFlagBits2::eShaderRead |
+                                               vk::AccessFlagBits2::eIndirectCommandRead);
     m_commandBuffer.pipelineBarrier2(vk::DependencyInfo{}.setMemoryBarriers(barrier));
 }
 

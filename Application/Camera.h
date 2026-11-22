@@ -14,6 +14,11 @@ public:
     void SetPosition(const glm::vec3& position);
     void SetRotation(float yawRadians, float pitchRadians);
 
+    // Sets the view from an explicit orientation frame, so the camera can roll (flight chase
+    // camera). The yaw/pitch members are derived from the forward direction, keeping GetForward()
+    // and the free camera controller usable after the call.
+    void SetView(const glm::vec3& position, const glm::vec3& forward, const glm::vec3& up);
+
     [[nodiscard]] const glm::mat4& GetViewMatrix() const { return m_view; }
     [[nodiscard]] const glm::mat4& GetProjectionMatrix() const { return m_projection; }
     [[nodiscard]] const glm::mat4& GetViewProjectionMatrix() const { return m_viewProjection; }

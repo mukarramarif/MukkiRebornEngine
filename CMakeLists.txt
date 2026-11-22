@@ -21,12 +21,14 @@ option(MRE_BUILD_TESTS "Build the unit tests" ON)
 option(MRE_ENABLE_TRACY "Enable Tracy profiler instrumentation" OFF)
 
 find_package(Vulkan REQUIRED)
+find_package(box3d CONFIG REQUIRED)
 find_package(glfw3 CONFIG REQUIRED)
 find_package(glm CONFIG REQUIRED)
 find_package(VulkanMemoryAllocator CONFIG REQUIRED)
 find_package(imgui CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(unofficial-spirv-reflect CONFIG REQUIRED)
+find_package(meshoptimizer CONFIG REQUIRED)
 find_package(Threads REQUIRED)
 
 if(MRE_ENABLE_TRACY)
@@ -100,6 +102,7 @@ add_library(mukki_engine STATIC
     Application/Camera.cpp
     Application/Input.cpp
     Application/Keybinds.cpp
+    Application/PlaneController.cpp
     Application/UI/UiStyles.cpp
     Application/Window.cpp
     Assets/AsyncGltfLoader.cpp
@@ -108,16 +111,19 @@ add_library(mukki_engine STATIC
     Core/Engine.cpp
     Core/JobSystem.cpp
     Core/Time.cpp
+    Physics/PhysicsWorld.cpp
     Renderer/BufferManager.cpp
     Renderer/Clouds/CloudNoise.cpp
     Renderer/Debug/DebugLines.cpp
     Renderer/Deferred/DeferredRenderer.cpp
     Renderer/Deferred/GBuffer.cpp
     Renderer/GlobalIllumination/GiAtrousSchedule.cpp
-Renderer/Lighting/ClusterGrid.cpp
-Renderer/Lighting/Environment.cpp
-Renderer/Lighting/Light.cpp
-Renderer/Lighting/ShadowCascade.cpp
+    Renderer/Lighting/ClusterGrid.cpp
+    Renderer/Lighting/Environment.cpp
+    Renderer/Lighting/Light.cpp
+    Renderer/Lighting/ShadowCascade.cpp
+    Renderer/Lighting/Subsurface.cpp
+    Renderer/Meshlets/MeshletBuilder.cpp
     Renderer/RHI/Resources.cpp
     Scene/SceneBinary.cpp
     Scene/SceneDescription.cpp
@@ -160,7 +166,7 @@ target_compile_definitions(mukki_engine PRIVATE
     VMA_STATIC_VULKAN_FUNCTIONS=1
     VMA_DYNAMIC_VULKAN_FUNCTIONS=0
 )
-target_link_libraries(mukki_engine PRIVATE nlohmann_json::nlohmann_json unofficial::spirv-reflect)
+target_link_libraries(mukki_engine PRIVATE nlohmann_json::nlohmann_json unofficial::spirv-reflect box3d::box3d meshoptimizer::meshoptimizer)
 target_link_libraries(mukki_engine
     PUBLIC
         Vulkan::Vulkan
@@ -198,12 +204,16 @@ if(MRE_BUILD_SANDBOX)
 
     mre_add_slang_shaders(mukki_sandbox
         Renderer/Shaders/gbuffer.vert.slang
+        Renderer/Shaders/gbuffer.mesh.slang
+        Renderer/Shaders/meshlet_cull.comp.slang
         Renderer/Shaders/gbuffer.frag.slang
         Renderer/Shaders/transparent.frag.slang
         Renderer/Shaders/lighting.vert.slang
         Renderer/Shaders/lighting.frag.slang
         Renderer/Shaders/cluster_culling.comp.slang
         Renderer/Shaders/shadow.vert.slang
+        Renderer/Shaders/shadow.mesh.slang
+        Renderer/Shaders/shadow_cull.comp.slang
         Renderer/Shaders/shadow.frag.slang
         Renderer/Shaders/gi_trace.comp.slang
         Renderer/Shaders/gi_temporal.comp.slang
@@ -220,6 +230,8 @@ if(MRE_BUILD_SANDBOX)
         Renderer/Shaders/cloud_upsample.comp.slang
         Renderer/Shaders/debug_line.vert.slang
         Renderer/Shaders/debug_line.frag.slang
+        Renderer/Shaders/sss_blur.comp.slang
+        Renderer/Shaders/composite.frag.slang
     )
 endif()
 

@@ -15,12 +15,17 @@ add_executable(mukki_tests
     test_keybinds.cpp
     test_light_selection.cpp
     test_log.cpp
+    test_meshlet_builder.cpp
     test_path_utils.cpp
+    test_physics.cpp
+    test_plane_controller.cpp
     test_resources.cpp
     test_scene_binary.cpp
+    test_scene_description.cpp
     test_scene_json.cpp
     test_shader_reflection.cpp
     test_shadow_cascades.cpp
+    test_subsurface.cpp
     test_vk_conversions.cpp
 )
 target_compile_definitions(mukki_tests PRIVATE MRE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/..")

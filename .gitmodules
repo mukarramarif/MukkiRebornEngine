@@ -2,3 +2,7 @@
 	path = ThirdParty/glTF-Sample-Models
 	url = https://github.com/KhronosGroup/glTF-Sample-Models.git
 	shallow = true
+[submodule "ThirdParty/glTF-Sample-Assets"]
+	path = ThirdParty/glTF-Sample-Assets
+	url = https://github.com/KhronosGroup/glTF-Sample-Assets.git
+	shallow = true

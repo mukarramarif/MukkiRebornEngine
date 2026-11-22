@@ -22,7 +22,7 @@ must not expose backend types, and Vulkan types may only appear under `Renderer/
   `Renderer/Vulkan/`); `rhi::MergeShaderReflectionBindings` and `rhi::ApplyShaderReflection` build
   descriptor set layouts, vertex input layouts and push constant ranges from the shader interface.
   Only the bindless set (update-after-bind runtime arrays) is declared by hand.
-- The engine will be using tinygltf and ktx libraries for loading glTF and KTX2 assets, respectively. The engine will support PBR materials and textures, as well as animation and skinning. tinygltf is pinned to 2.9.3 via a `vcpkg.json` override and served from `overlay-ports/tinygltf` because the registry port hashes are stale after GitHub regenerated its release tarballs. Sample models live in the shallow `ThirdParty/glTF-Sample-Models` submodule.
+- The engine will be using tinygltf and ktx libraries for loading glTF and KTX2 assets, respectively. The engine will support PBR materials and textures, as well as animation and skinning. tinygltf is pinned to 2.9.3 via a `vcpkg.json` override and served from `overlay-ports/tinygltf` because the registry port hashes are stale after GitHub regenerated its release tarballs. Sample models live in the shallow `ThirdParty/glTF-Sample-Models` submodule; the Khronos `ThirdParty/glTF-Sample-Assets` submodule is shallow + sparse (`Models/DiffuseTransmissionPlant`) for the SSS demo.
 - Scenes: authored as JSON with nlohmann/json under `Scene/` (`SceneJson`), compiled offline or
   in-tool into the little-endian `SceneBinary` bytecode (magic `MRES`), and loaded by the engine
   from that bytecode at runtime. `SceneDescription` holds glTF object instances (model path plus
@@ -30,6 +30,60 @@ must not expose backend types, and Vulkan types may only appear under `Renderer/
   [scene.mres]`; the sandbox compiles and loads `Sandbox/Scenes/demo.scene.json`. `DeferredRenderer
   ::LoadScene` loads/caches the referenced glTF models and instantiates them. A scene graph and
   entity-component-system architecture is still planned.
+- Physics: optional per-object Box3D rigid bodies (`ScenePhysics`: `body` none/static/dynamic,
+  `shape` box/sphere/capsule, fitted to the model bounds unless `halfExtents`/`radius`/`height` are
+  authored). `Physics/` (`PhysicsWorld`, pimpl) is the only place Box3D types appear; the port is a
+  local overlay (`overlay-ports/box3d`, static MSVC runtime line removed). The world is single
+  threaded (`workerCount=1`) and advanced by `PhysicsWorld::Step` through a fixed-step accumulator
+  (`stepHz`/`subSteps`); callers sync dynamic transforms after stepping (post-step, no render
+  interpolation) — the sandbox writes them into `SceneDescription::objects` and calls
+  `DeferredRenderer::UpdateSceneObjectTransform`. A ground box collider is created by default; scene
+  gravity/stepHz/subSteps live in the JSON root and are editable in the UI, and the `Objects &
+  Physics` `Static floor` section adjusts the runtime-only ground collider (enable, top Y, XZ
+  center/size, thickness; editing it recreates only the ground body). Colliders are built from
+  `DeferredRenderer::GetSceneObjectFittedBounds`; `PhysicsWorld::BuildDebugLines` feeds collision
+  gizmos through `DeferredRenderer::SetPhysicsDebugLines`. Scene binary v5 added the physics data
+  (v4 still decodes with defaults); v6 adds the scene settings below.
+- Scene settings (binary v6): optional root `environment` (`map` path resolved against `assetRoot`
+  plus `intensity`) and `clouds` (all `CloudSettings` fields) override the renderer on scene load;
+  absent blocks leave the current environment/clouds untouched so `--env` and UI edits survive
+  older scenes. Root `playerPlane` names the scene object that enters flight mode. `SceneJson`
+  parses/serializes both blocks and `SceneBinary` writes them after the physics block; v4/v5 still
+  decode with defaults.
+- Subsurface scattering (Phases 1+2): `KHR_materials_diffuse_transmission` is parsed into
+  `GltfMaterial`/`DrawItem`/`GpuObjectData` (factor in texture alpha, sRGB color texture) and
+  `GpuGeometryData`; `brdf.slang` exposes `SubsurfaceTransmissionRadiance` (back-lit diffuse BTDF)
+  and the diffuse BRDF albedo is scaled by `(1 - factor)`. The lighting pass now renders offscreen
+  with two attachments (`m_lightingColor` + `m_sssSource`, both RGBA16F) and the transparent pass
+  runs in that HDR scope; ACES moved to `composite.frag.slang` (adds the blurred SSS, then tone
+  maps; cluster-heatmap/GI-only debug views pass through). `sss_blur.comp.slang` is a separable
+  depth-aware diffusion at half resolution using the radius-parameterized LUT from
+  `Renderer/Lighting/Subsurface.h` (`BuildSubsurfaceLut`, 128x16, tap distance x log radius bucket,
+  per-channel radii); the sets are created lazily after the first lighting pass because the color
+  targets start in the undefined layout. `DeferredRenderer::SssSettings` (enabled/radius/strength/
+  depth tolerance/iterations/debug view) is exposed in the `Subsurface scattering` UI section and
+  `m_hasSssMaterials` (set when a material has a factor, cleared with the models) gates the passes.
+  `Sandbox/Scenes/sss.scene.json` uses `ThirdParty/glTF-Sample-Assets` (shallow + sparse:
+  `Models/DiffuseTransmissionPlant`); `Tests/test_subsurface.cpp` and the loader test cover the LUT
+  and the extension parsing.
+- Flight demo: `Sandbox/Scenes/flight.scene.json` spawns a glass skyscraper city with a low-poly
+  airplane as the `playerPlane` object (flight mode auto-enables on load), a 0.9-2.8 km cloud layer
+  and the sunrise HDR environment.
+  `Application/PlaneController` is the arcade flight model (body-local rates scaled by airspeed,
+  bank->turn coupling, auto-level, throttle -> target speed) with tests; the sandbox syncs the
+  plane object through `DeferredRenderer::UpdateSceneObjectTransform` and drives a banked chase
+  camera via `Camera::SetView(position, forward, up)`. Crash detection tests the plane sphere
+  against cached building AABBs (`GetSceneObjectFittedBounds`), the floor top and a 12 km boundary;
+  a crash freezes the plane, respawns after ~1.6 s and counts attempts (`R` resets). Flight near
+  plane is 1 m / 25 km at 70 degrees FOV. `DeferredRenderer::SetGroundPlaneExtent`/`SetGroundVisible`
+  scale the built-in ground plane (also updates its shadow cull radius); flight mode uses a 9 km
+  extent. Sandbox shutdown calls `Device::WaitIdle` before the UI/renderer release resources.
+- Sandbox UI: ImGui docking is enabled in `Renderer/Vulkan/UiLayer`; `Sandbox/main.cpp` builds a
+  default dock layout with the `imgui_internal.h` DockBuilder API — `Stats`/`Scenes`/`G-buffer`
+  tabbed in the left group and `GI & Lights`/`Objects & Physics`/`Volumetrics`/`Flight` tabbed in
+  the main group. The layout persists in `imgui.ini` next to the executable (`io.IniFilename`); the
+  `Stats` `View` menu toggles windows and has `Reset layout`; layouts that predate the marker
+  windows are rebuilt automatically.
 - Materials: glTF `alphaMode = MASK` is supported. The flag and `alphaCutoff` are packed into
   `ObjectPushConstants.params.z/.w` (set by `DeferredRenderer` from `GltfMaterial`), the G-buffer
   discards `baseColor.a * baseColorFactor.a < cutoff`, and the shadow fragment stage alpha-tests
@@ -57,7 +111,7 @@ must not expose backend types, and Vulkan types may only appear under `Renderer/
 - Debug gizmos: `Renderer/Debug/DebugLines.h` builds CPU line lists (`DebugLines`) for light and
   probe markers; `DeferredRenderer::RecordDebugLines` draws them at the end of the swapchain
   lighting scope with a `PrimitiveTopology::LineList` pipeline (push constant viewProjection, no
-  depth). World space GI probes are authored as `SceneDescription::probes` (JSON + scene binary v4);
+  depth). World space GI probes are authored as `SceneDescription::probes` (JSON + scene binary v4+);
   the sandbox feeds `GiProbe` markers through `SetGiProbes` and toggles them with `SetGizmoView`.
   The probe UI can `Fill scene`/`Maximize probes`, distributing a Halton set of up to
   `kMaxGiProbes` probes over `DeferredRenderer::GetSceneBounds`.
@@ -66,6 +120,31 @@ must not expose backend types, and Vulkan types may only appear under `Renderer/
 - Multithreading: `Core/JobSystem` is the shared thread pool. glTF parsing runs asynchronously
   (`Assets/AsyncGltfLoader`) and the G-buffer draw calls are recorded into secondary command buffers
   on worker threads, then replayed from the primary command list with `ExecuteCommands`.
+- Meshlets: `Renderer/Meshlets/MeshletBuilder` clusters glTF triangle lists with meshoptimizer
+  (`meshopt_buildMeshlets`, 64 vertices / 124 triangles, `meshopt_computeMeshletBounds`) and packs
+  `[GpuMeshlet array][vertex index list][packed micro triangles]` into one storage buffer per
+  primitive. The buffer is bound in the bindless storage buffer array; a per-frame `GpuMeshDraw`
+  SSBO (descriptor set 2, indexed by `ObjectPushConstants::drawIndex`) tells the shader where the
+  meshlets and the source vertex buffer live. Opaque items with meshlets render through
+  `gbuffer.mesh.slang` / `shadow.mesh.slang` (one mesh shader workgroup per meshlet) when
+  `Device::IsMeshShaderSupported()`; the RHI exposes `ShaderStage::Mesh`, `PipelineDesc::meshShader`,
+  `CommandList::DrawMeshTasks`/`DrawMeshTasksIndirect` and `MeshTaskIndirectBarrier`. Culling is
+  frustum based; the G-buffer path additionally uses the meshoptimizer normal cone
+  (`dot(center - camera, axis) >= cutoff * distance + radius`; mirrored transforms skip the cone).
+  The path is enabled by default when supported (`MRE_MESHLETS_OFF` disables it, the `Scenes`
+  window toggles it); transparent materials, the ground plane and items without meshlets use the
+  vertex pipeline in the same rendering scope. G-buffer meshlets are compacted by
+  `meshlet_cull.comp.slang`: one compute dispatch per draw culls the meshlets into a per-frame
+  index buffer (`kMeshletCompactionCapacity`, 64 threads per workgroup) and atomically accumulates
+  the draw's `GpuMeshTaskCommand` group count, which `CommandList::DrawMeshTasksIndirect` consumes;
+  `gbuffer.mesh.slang` remaps `gl_WorkGroupID` through the compacted list. Shadow views use
+  `shadow_cull.comp.slang` per (view, draw) against the shadow frustum and write into their own
+  per-frame list (`kShadowMeshletCompactionCapacity`), with `shadow.mesh.slang` remapping through
+  it. The cull writes are published with `CommandList::MeshTaskIndirectBarrier`. Draws beyond the
+  capacities and cull-shader-less devices fall back to direct mesh-task dispatch with in-shader
+  culling. The G-buffer and shadow secondary command buffers (recorded on the JobSystem) replay
+  meshlet and vertex draws in the same batch, binding each pipeline at most once. The `Scenes`
+  window's `Meshlet debug view` (`MRE_MESHLET_DEBUG`) colors each meshlet through the G-buffer.
 - Bindless: descriptor indexing is a hard device requirement. Textures get a bindless index from the
   device and are bound into a global update-after-bind `SampledImage` array set; shaders sample them
   through `Texture2D textures[]` with `NonUniformResourceIndex`.
@@ -150,6 +229,30 @@ must not expose backend types, and Vulkan types may only appear under `Renderer/
   the probes (binding 14, count in `SceneUniform.ambientColor.w`) and the per-pixel trace + SVGF
   denoiser are skipped so indirect is not double counted (`IsPerPixelGiActive`). `gi_shading.slang`
   is an include, not a standalone shader; keep `GiUniform` in sync across all gi_*.slang files.
+  `SceneUniform.screenSize.z` selects the lighting debug view: 0 = lit, 1 = cluster light count
+  heatmap (`SetClusterDebugView`), 2 = GI only (`SetGiDebugView`: ambient SH/IBL diffuse, indirect
+  or probes and reflections, no direct/emissive), 3 = per-meshlet colors (`SetMeshletDebugView`,
+  written by `gbuffer.mesh.slang` through a location 4 G-buffer attribute and passed through by
+  the lighting/composite passes). Keep the `SceneUniform` field order identical in the gbuffer,
+  transparent, lighting, mesh and cull shaders: a missing field silently shifts every later member
+  (omitting `inverseViewProjection` made `screenSize.z` alias the cluster grid and pinned the
+  meshlet debug view on). `DeferredRenderer::ReadGiProbes` waits idle and
+  reads the GPU probe buffer back via `rhi::Buffer::Read`; the sandbox rebuilds a 32x16-per-probe
+  equirectangular SH irradiance atlas (`R8G8B8A8Srgb`) on a timer and shows it in the probe UI,
+  retiring old textures for a few frames before releasing them (ImGui descriptors must outlive the
+  frames that referenced them). Non-finite ray results are skipped in `gi_probes.comp.slang` /
+  `gi_trace.comp.slang`, and the shared BRDF guards degenerate normalizations (retroreflection
+  half vector, zero-length interpolated normals) because a single NaN ray would permanently poison
+  a probe (hysteresis) and blacken the probe-blended scene. Probe depth checks: `GpuGiProbe.depth`
+  carries x = mean hit distance, y = mean squared, z = valid flag, w = smoothed backface fraction
+  (hardware `RayQuery.CommittedTriangleFrontFace`, so node rotations/mirrored transforms are
+  handled); probes above 0.6 backfaces are treated as embedded in geometry, skipped by the
+  lighting pass and tinted red by the gizmos, and fills auto-remove them. Lighting weights valid
+  probes with a Chebyshev visibility from the depth mean/variance to stop light bleeding through
+  walls. Probe placement helpers: `Fill scene` covers the whole scene bounds and `Fill target` (or
+  the object editor's `Fill probes inside`) a single object's `GetSceneObjectFittedBounds` box
+  (e.g. a Sponza interior), both Halton-distributed with inset and vertical-bottom/top sliders
+  (`FillProbesInBounds` in the sandbox).
 - Global illumination: optional hardware ray tracing (`VK_KHR_acceleration_structure`,
   `VK_KHR_ray_query`, `VK_KHR_deferred_host_operations`; `Device::IsRayTracingSupported()`). The RT
   entry points are loaded manually by `Renderer/Vulkan/Core/VkRayTracingDispatch` because the Vulkan

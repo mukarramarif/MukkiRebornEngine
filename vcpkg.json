@@ -24,6 +24,11 @@
     }
   },
   "dependencies": [
+    "meshoptimizer",
+    {
+      "name": "box3d",
+      "version>=": "0.1.0"
+    },
     "glfw3",
     "glm",
     "gtest",

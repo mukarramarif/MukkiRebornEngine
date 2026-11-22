@@ -53,8 +53,18 @@ public:
     void SetPushConstants(const void* data, std::uint32_t size, rhi::ShaderStageMask stages) override;
     void Draw(std::uint32_t vertexCount, std::uint32_t firstVertex) override;
     void DrawIndexed(std::uint32_t indexCount, std::uint32_t firstIndex) override;
+    void DrawMeshTasks(
+        std::uint32_t groupCountX,
+        std::uint32_t groupCountY,
+        std::uint32_t groupCountZ) override;
+    void DrawMeshTasksIndirect(
+        const rhi::Buffer& buffer,
+        std::uint64_t offset,
+        std::uint32_t drawCount,
+        std::uint32_t stride) override;
     void Dispatch(std::uint32_t groupCountX, std::uint32_t groupCountY, std::uint32_t groupCountZ) override;
     void ShaderMemoryBarrier(rhi::ShaderStageMask before, rhi::ShaderStageMask after) override;
+    void MeshTaskIndirectBarrier() override;
     void SetDepthBias(float constantFactor, float slopeFactor, float clamp) override;
     void BuildAccelerationStructure(const rhi::AccelerationStructure& accelerationStructure) override;
     void AccelerationStructureBarrier() override;

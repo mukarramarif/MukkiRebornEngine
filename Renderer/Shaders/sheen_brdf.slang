@@ -17,7 +17,11 @@ float3 EvaluateSheenBRDF(
         return 0.0;
     }
 
-    const float3 halfVector = normalize(viewDirection + lightDirection);
+    // Guard the degenerate retroreflection configuration (see brdf.slang).
+    const float3 halfSum = viewDirection + lightDirection;
+    const float halfSumLengthSquared = dot(halfSum, halfSum);
+    const float3 halfVector =
+        halfSumLengthSquared > 1e-8 ? halfSum * rsqrt(halfSumLengthSquared) : normal;
     const float nDotV = max(dot(normal, viewDirection), 1e-4);
     const float nDotH = max(dot(normal, halfVector), 0.0);
 

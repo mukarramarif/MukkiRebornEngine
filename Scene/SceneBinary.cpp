@@ -137,6 +137,15 @@ std::vector<std::byte> SceneBinary::Encode(const SceneDescription& scene)
         writer.Vec3(object.position);
         writer.Vec3(object.rotation);
         writer.Vec3(object.scale);
+        writer.U32(static_cast<std::uint32_t>(object.physics.body));
+        writer.U32(static_cast<std::uint32_t>(object.physics.shape));
+        writer.Vec3(object.physics.halfExtents);
+        writer.F32(object.physics.radius);
+        writer.F32(object.physics.height);
+        writer.Vec3(object.physics.offset);
+        writer.F32(object.physics.density);
+        writer.F32(object.physics.friction);
+        writer.F32(object.physics.restitution);
     }
 
     writer.U32(static_cast<std::uint32_t>(scene.probes.size()));
@@ -164,6 +173,40 @@ std::vector<std::byte> SceneBinary::Encode(const SceneDescription& scene)
         writer.U32(light.castShadows ? 1u : 0u);
     }
 
+    writer.Vec3(scene.physics.gravity);
+    writer.F32(scene.physics.stepHz);
+    writer.U32(scene.physics.subSteps);
+
+    writer.String(scene.playerPlane);
+    writer.U32(scene.hasEnvironment ? 1u : 0u);
+    if (scene.hasEnvironment)
+    {
+        writer.String(PathToUtf8(scene.environment.map));
+        writer.F32(scene.environment.intensity);
+    }
+    writer.U32(scene.hasClouds ? 1u : 0u);
+    if (scene.hasClouds)
+    {
+        const CloudSettings& clouds = scene.clouds;
+        writer.U32(clouds.enabled ? 1u : 0u);
+        writer.F32(clouds.coverage);
+        writer.F32(clouds.cloudType);
+        writer.F32(clouds.density);
+        writer.F32(clouds.detailStrength);
+        writer.F32(clouds.layerBottomKm);
+        writer.F32(clouds.layerTopKm);
+        writer.F32(clouds.altitudeVariationKm);
+        writer.F32(clouds.windSpeed);
+        writer.F32(clouds.windDirectionRadians);
+        writer.F32(clouds.curlStrength);
+        writer.F32(clouds.coverageVariation);
+        writer.U32(clouds.primarySteps);
+        writer.U32(clouds.lightSteps);
+        writer.F32(clouds.resolutionScale);
+        writer.F32(clouds.temporalBlend);
+        writer.F32(clouds.godRayIntensity);
+    }
+
     return writer.Take();
 }
 
@@ -184,11 +227,13 @@ bool SceneBinary::Decode(std::span<const std::byte> data, SceneDescription& scen
         error = "scene binary has an invalid magic header";
         return false;
     }
-    if (version != kVersion)
+    if (version != kVersion && version != kLegacyVersion && version != 5u)
     {
         error = "unsupported scene binary version " + std::to_string(version);
         return false;
     }
+    const bool hasPhysics = version >= 5;
+    const bool hasSceneSettings = version >= 6;
 
     SceneDescription result{};
 
@@ -219,6 +264,30 @@ bool SceneBinary::Decode(std::span<const std::byte> data, SceneDescription& scen
             error = "scene binary is truncated while reading objects";
             return false;
         }
+
+        if (hasPhysics)
+        {
+            std::uint32_t body = 0;
+            std::uint32_t shape = 0;
+            if (!reader.U32(body) || !reader.U32(shape) ||
+                !reader.Vec3(object.physics.halfExtents) || !reader.F32(object.physics.radius) ||
+                !reader.F32(object.physics.height) || !reader.Vec3(object.physics.offset) ||
+                !reader.F32(object.physics.density) || !reader.F32(object.physics.friction) ||
+                !reader.F32(object.physics.restitution))
+            {
+                error = "scene binary is truncated while reading object physics";
+                return false;
+            }
+            if (body > static_cast<std::uint32_t>(ScenePhysicsBody::Dynamic) ||
+                shape > static_cast<std::uint32_t>(ScenePhysicsShape::Capsule))
+            {
+                error = "scene binary contains an unknown physics type";
+                return false;
+            }
+            object.physics.body = static_cast<ScenePhysicsBody>(body);
+            object.physics.shape = static_cast<ScenePhysicsShape>(shape);
+        }
+
         result.objects.push_back(std::move(object));
     }
 
@@ -274,6 +343,64 @@ bool SceneBinary::Decode(std::span<const std::byte> data, SceneDescription& scen
         sceneLight.light.type = static_cast<LightType>(type);
         sceneLight.light.castShadows = castShadows != 0;
         result.lights.push_back(std::move(sceneLight));
+    }
+
+    if (hasPhysics)
+    {
+        if (!reader.Vec3(result.physics.gravity) || !reader.F32(result.physics.stepHz) ||
+            !reader.U32(result.physics.subSteps))
+        {
+            error = "scene binary is truncated while reading scene physics";
+            return false;
+        }
+    }
+
+    if (hasSceneSettings)
+    {
+        std::uint32_t hasEnvironment = 0;
+        if (!reader.String(result.playerPlane) || !reader.U32(hasEnvironment))
+        {
+            error = "scene binary is truncated while reading the scene settings";
+            return false;
+        }
+        result.hasEnvironment = hasEnvironment != 0;
+        if (result.hasEnvironment)
+        {
+            std::string map{};
+            if (!reader.String(map) || !reader.F32(result.environment.intensity))
+            {
+                error = "scene binary is truncated while reading the environment";
+                return false;
+            }
+            result.environment.map = PathFromUtf8(map);
+        }
+
+        std::uint32_t hasClouds = 0;
+        if (!reader.U32(hasClouds))
+        {
+            error = "scene binary is truncated while reading the cloud settings";
+            return false;
+        }
+        result.hasClouds = hasClouds != 0;
+        if (result.hasClouds)
+        {
+            CloudSettings& clouds = result.clouds;
+            std::uint32_t enabled = 1;
+            if (!reader.U32(enabled) || !reader.F32(clouds.coverage) ||
+                !reader.F32(clouds.cloudType) || !reader.F32(clouds.density) ||
+                !reader.F32(clouds.detailStrength) || !reader.F32(clouds.layerBottomKm) ||
+                !reader.F32(clouds.layerTopKm) || !reader.F32(clouds.altitudeVariationKm) ||
+                !reader.F32(clouds.windSpeed) || !reader.F32(clouds.windDirectionRadians) ||
+                !reader.F32(clouds.curlStrength) || !reader.F32(clouds.coverageVariation) ||
+                !reader.U32(clouds.primarySteps) || !reader.U32(clouds.lightSteps) ||
+                !reader.F32(clouds.resolutionScale) || !reader.F32(clouds.temporalBlend) ||
+                !reader.F32(clouds.godRayIntensity))
+            {
+                error = "scene binary is truncated while reading the cloud settings";
+                return false;
+            }
+            clouds.enabled = enabled != 0;
+        }
     }
 
     scene = std::move(result);

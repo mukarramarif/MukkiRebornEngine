@@ -26,6 +26,7 @@ public:
     [[nodiscard]] bool IsHostVisible() const override { return m_hostVisible; }
     [[nodiscard]] std::uint64_t GetDeviceAddress() const override { return m_deviceAddress; }
     void Write(const void* data, std::uint64_t size, std::uint64_t offset) override;
+    [[nodiscard]] bool Read(void* data, std::uint64_t size, std::uint64_t offset) override;
 
     [[nodiscard]] vk::Buffer GetHandle() const { return m_buffer; }
 

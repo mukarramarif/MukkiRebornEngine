@@ -94,7 +94,55 @@ struct GpuObjectData
     glm::vec4 emissive{0.0f};           // rgb: emissiveFactor (incl. strength)
     glm::uvec4 emissiveTextureIndices{0u}; // x: emissiveTexture
     glm::uvec4 emissiveSamplerIndices{0u}; // x: emissive sampler
+    glm::vec4 subsurface{0.0f};            // rgb: diffuseTransmissionColor, a: factor
+    glm::uvec4 subsurfaceTextureIndices{0u}; // x: diffuseTransmissionTexture, y: color texture
+    glm::uvec4 subsurfaceSamplerIndices{0u};
 };
+
+// Meshlet header as stored at the start of a per primitive meshlet buffer. Must match GpuMeshlet
+// in Renderer/Shaders/meshlet.slang.
+struct GpuMeshlet
+{
+    glm::vec4 centerRadius{0.0f};   // xyz: local center, w: radius
+    glm::vec4 coneAxisCutoff{0.0f}; // xyz: local cone axis, w: min dot(face normal, axis)
+    // x: vertex count, y: triangle count, z: vertex list offset, w: triangle list offset
+    glm::uvec4 data{0u};
+};
+
+// Compute meshlet culling compacts each draw's visible meshlets into one per-frame index list and
+// writes one indirect mesh-task command per draw. Draws beyond the capacity fall back to direct
+// dispatch with in-shader culling.
+inline constexpr std::uint32_t kMeshletCompactionCapacity = 1u << 18;
+// Shadow views need their own compacted meshlet list per view; this bounds the total per frame.
+inline constexpr std::uint32_t kShadowMeshletCompactionCapacity = 1u << 20;
+inline constexpr std::uint32_t kMeshletCullDisabled = 0xFFFFFFFFu;
+inline constexpr std::uint32_t kMeshletCullGroupSize = 64;
+
+// Per draw item meshlet source, indexed by ObjectPushConstants::drawIndex. Must match GpuMeshDraw
+// in Renderer/Shaders/meshlet.slang.
+struct GpuMeshDraw
+{
+    std::uint32_t meshletOffset = 0;      // first meshlet of the draw
+    std::uint32_t meshletCount = 0;
+    std::uint32_t vertexIndexBase = 0;    // byte offset of the meshlet vertex index list
+    std::uint32_t triangleBase = 0;       // byte offset of the packed micro triangle list
+    std::uint32_t vertexBufferIndex = 0;  // bindless slot of the source vertex buffer
+    std::uint32_t meshletBufferIndex = 0; // bindless slot of the meshlet data buffer
+    // First slot of the frame's compacted meshlet index list, or kMeshletCullDisabled when the draw
+    // uses direct mesh-task dispatch and culls in the mesh shader.
+    std::uint32_t compactedOffset = kMeshletCullDisabled;
+    std::uint32_t padding1 = 0;
+};
+
+// One indirect mesh-task command, matching VkDrawMeshTasksIndirectCommandEXT and the flat uint
+// array written by meshlet_cull.comp.slang.
+struct GpuMeshTaskCommand
+{
+    std::uint32_t groupCountX = 0;
+    std::uint32_t groupCountY = 1;
+    std::uint32_t groupCountZ = 1;
+};
+static_assert(sizeof(GpuMeshTaskCommand) == 12, "Unexpected mesh task command layout");
 
 class DeferredRenderer
 {
@@ -126,6 +174,27 @@ public:
     void SetModelScale(float scale);
     [[nodiscard]] float GetModelScale() const { return m_modelScale; }
 
+    // Meshlet rendering draws opaque glTF geometry through a mesh shader pipeline. It is enabled by
+    // default when the device supports mesh shaders and automatically falls back to the vertex
+    // pipeline for items without meshlets (or when disabled).
+    void SetMeshletRenderingEnabled(bool enabled);
+    [[nodiscard]] bool IsMeshletRenderingEnabled() const { return m_meshletRenderingEnabled; }
+    [[nodiscard]] bool IsMeshletRenderingSupported() const { return m_meshletRenderingSupported; }
+    // Colors every opaque G-buffer meshlet with a distinct debug color. Requires the mesh shader
+    // pipeline; the transparent forward pass is skipped while active.
+    void SetMeshletDebugView(bool enabled);
+    [[nodiscard]] bool IsMeshletDebugViewEnabled() const { return m_meshletDebugView; }
+    [[nodiscard]] std::uint64_t GetMeshletCount() const { return m_meshletCount; }
+    [[nodiscard]] std::uint64_t GetMeshletTriangleCount() const { return m_meshletTriangleCount; }
+
+    // Built-in ground plane (20x20 world units around the origin when the extent is 10) used as
+    // the default floor. The extent scales it uniformly about the origin and follows into the
+    // shadow culling radius and the ray traced instance transform.
+    void SetGroundPlaneExtent(float halfExtent);
+    [[nodiscard]] float GetGroundPlaneExtent() const { return m_groundPlaneExtent; }
+    void SetGroundVisible(bool visible);
+    [[nodiscard]] bool IsGroundVisible() const { return m_groundVisible; }
+
     // Updates the transform of a scene object instantiated by LoadScene. Object indices follow the
     // order of SceneDescription::objects.
     void UpdateSceneObjectTransform(std::size_t objectIndex, const glm::mat4& transform);
@@ -134,9 +203,52 @@ public:
     // World space bounds of the instantiated scene objects. Returns false when no object is loaded.
     [[nodiscard]] bool GetSceneBounds(glm::vec3& outMin, glm::vec3& outMax) const;
 
+    // World space axis aligned bounds of one instantiated scene object (fitted model bounds,
+    // including the object transform and the uniform model scale but not the object rotation).
+    // Used to fit physics colliders. Returns false when the index is not instantiated.
+    [[nodiscard]] bool GetSceneObjectFittedBounds(
+        std::size_t objectIndex,
+        glm::vec3& outMin,
+        glm::vec3& outMax) const;
+
+    // Extra world space debug lines appended to the gizmo pass after lights and probes (physics
+    // colliders). The lines are only drawn while SetPhysicsGizmoView(true) is set.
+    void SetPhysicsDebugLines(DebugLines lines) { m_physicsDebugLines = std::move(lines); }
+    void SetPhysicsGizmoView(bool enabled) { m_showPhysicsGizmos = enabled; }
+    [[nodiscard]] bool ArePhysicsGizmosEnabled() const { return m_showPhysicsGizmos; }
+
     // Replaces the lit image with a heatmap of the clustered light counts for debugging.
     void SetClusterDebugView(bool enabled) { m_clusterDebugView = enabled; }
     [[nodiscard]] bool IsClusterDebugViewEnabled() const { return m_clusterDebugView; }
+
+    // Debug view that shows only the indirect (GI) lighting: ambient SH/IBL diffuse, the traced
+    // indirect diffuse (per-pixel or probes) and the traced reflections, without direct lights.
+    void SetGiDebugView(bool enabled) { m_giDebugView = enabled; }
+    [[nodiscard]] bool IsGiDebugViewEnabled() const { return m_giDebugView; }
+
+    // Screen space subsurface scattering (KHR_materials_diffuse_transmission). The lighting pass
+    // moves the back-lit diffuse transmission into a source buffer, blurs it with a
+    // radius-parameterized diffusion LUT and composites the result before tone mapping.
+    struct SssSettings
+    {
+        bool enabled = true;
+        float radiusPixels = 18.0f;   // diffusion radius in half-resolution pixels
+        float strength = 1.0f;
+        float depthTolerance = 2.0f;  // multiples of the local pixel world size
+        std::uint32_t iterations = 2; // 1..3 ping-pong pairs (larger halos)
+        int debugView = 0;            // 0 = off, 1 = blurred SSS, 2 = sharp SSS source
+    };
+
+    void SetSssSettings(const SssSettings& settings) { m_sssSettings = settings; }
+    [[nodiscard]] const SssSettings& GetSssSettings() const { return m_sssSettings; }
+
+    // True when the GI trace is currently replaced by the irradiance probes.
+    [[nodiscard]] bool IsProbeGiActive() const;
+
+    // Reads back the GPU-resident irradiance probe coefficients (waits for the device to be idle).
+    // The CPU probe copy is refreshed so the probe gizmos reflect the accumulated SH (including
+    // the punctual-light contribution). Returns false when there are no probes or no probe buffer.
+    [[nodiscard]] bool ReadGiProbes(std::vector<GpuGiProbe>& out);
 
     // World space debug gizmos: wireframe markers for lights and world space GI probes.
     void SetGiProbes(std::span<const GiProbe> probes);
@@ -212,6 +324,14 @@ private:
         const rhi::AccelerationStructure* blas = nullptr;
         std::uint32_t vertexBufferIndex = 0;
         std::uint32_t indexBufferIndex = 0;
+        // Meshlet source. Items without meshlets (meshletCount == 0) use the vertex pipeline.
+        std::uint32_t meshletOffset = 0;
+        std::uint32_t meshletCount = 0;
+        std::uint32_t meshletVertexIndexBase = 0; // byte offset in the meshlet buffer
+        std::uint32_t meshletTriangleBase = 0;    // byte offset in the meshlet buffer
+        std::uint32_t meshletBufferIndex = 0;     // bindless slot of the meshlet buffer
+        // Slot of the compute-compacted meshlet list, or kMeshletCullDisabled when uncompacted.
+        std::uint32_t compactedOffset = kMeshletCullDisabled;
         // KHR_materials_specular material data (see GpuObjectData).
         glm::vec4 specular{0.0f};
         glm::uvec4 specularTextureIndices{0u};
@@ -226,11 +346,16 @@ private:
         glm::vec4 sheen{0.0f};
         glm::uvec4 sheenTextureIndices{0u};
         glm::uvec4 sheenSamplerIndices{0u};
-        // Emissive: rgb = emissiveFactor (scaled by emissive strength), a = 1 when any emissive.
-        glm::vec4 emissive{0.0f};
-        glm::uvec4 emissiveTextureIndices{0u};
-        glm::uvec4 emissiveSamplerIndices{0u};
+    // Emissive: rgb = emissiveFactor (scaled by emissive strength), a = 1 when any emissive.
+    glm::vec4 emissive{0.0f};
+    glm::uvec4 emissiveTextureIndices{0u};
+    glm::uvec4 emissiveSamplerIndices{0u};
+    // KHR_materials_diffuse_transmission (see GpuObjectData).
+    glm::vec4 subsurface{0.0f};               // rgb: diffuseTransmissionColorFactor, a: factor
+    glm::uvec4 subsurfaceTextureIndices{0u};  // x: diffuseTransmissionTexture, y: color texture
+    glm::uvec4 subsurfaceSamplerIndices{0u};
     };
+
 
     // Per draw item data read by ray traced effects (global illumination color bleeding).
     struct GpuGeometryData
@@ -247,10 +372,14 @@ private:
         glm::vec4 sheen{0.0f};               // rgb: sheenColorFactor, a: sheenRoughnessFactor
         glm::uvec4 sheenTextureIndices{0u};  // x: sheenColorTexture, y: sheenRoughnessTexture
         glm::uvec4 sheenSamplerIndices{0u};
-        glm::vec4 emissive{0.0f};             // rgb: emissiveFactor (incl. strength), a: unused
-        glm::uvec4 emissiveTextureIndices{0u}; // x: emissiveTexture
-        glm::uvec4 emissiveSamplerIndices{0u}; // x: emissive sampler
+    glm::vec4 emissive{0.0f};             // rgb: emissiveFactor (incl. strength), a: unused
+    glm::uvec4 emissiveTextureIndices{0u}; // x: emissiveTexture
+    glm::uvec4 emissiveSamplerIndices{0u}; // x: emissive sampler
+    glm::vec4 subsurface{0.0f};            // rgb: diffuseTransmissionColor, a: factor
+    glm::uvec4 subsurfaceTextureIndices{0u}; // x: diffuseTransmissionTexture, y: color texture
+    glm::uvec4 subsurfaceSamplerIndices{0u};
     };
+
 
     inline static constexpr std::uint32_t kMaxObjectData = 2048;
 
@@ -265,6 +394,8 @@ private:
         std::unique_ptr<rhi::Texture> sheenColorTexture{};
         std::unique_ptr<rhi::Texture> sheenRoughnessTexture{};
         std::unique_ptr<rhi::Texture> emissiveTexture{};
+        std::unique_ptr<rhi::Texture> diffuseTransmissionTexture{};
+        std::unique_ptr<rhi::Texture> diffuseTransmissionColorTexture{};
     };
 
     struct SceneObjectBounds
@@ -275,6 +406,16 @@ private:
 
     struct ModelResources
     {
+        // Meshlets of one primitive. The buffer holds [GpuMeshlet array][vertex indices][packed
+        // micro triangles] and is registered in the bindless storage buffer array.
+        struct MeshletPrimitive
+        {
+            std::uint32_t meshletCount = 0;
+            std::uint32_t vertexIndexBase = 0;
+            std::uint32_t triangleBase = 0;
+            std::uint32_t bufferIndex = 0;
+        };
+
         std::string name{};
         std::vector<Material> materials{};
         std::vector<std::unique_ptr<rhi::Buffer>> vertexBuffers{};
@@ -282,8 +423,12 @@ private:
         std::vector<std::uint32_t> vertexBufferIndices{};
         std::vector<std::uint32_t> indexBufferIndices{};
         std::vector<std::unique_ptr<rhi::AccelerationStructure>> accelerationStructures{};
+        std::vector<std::unique_ptr<rhi::Buffer>> meshletBuffers{};
+        std::vector<MeshletPrimitive> meshletPrimitives{};
         std::vector<DrawItem> drawItems{};
         SceneObjectBounds fittedBounds{};
+        glm::vec3 fittedMin{0.0f};
+        glm::vec3 fittedMax{0.0f};
         std::uint64_t vertexCount = 0;
         std::uint64_t triangleCount = 0;
     };
@@ -301,6 +446,8 @@ private:
     {
         ObjectPushConstants object{};
         std::uint32_t viewIndex = 0;
+        // Slot in the frame's shadow meshlet list, or kMeshletCullDisabled when uncompacted.
+        std::uint32_t compactedOffset = kMeshletCullDisabled;
     };
 
     struct ShadowUniform
@@ -319,6 +466,14 @@ private:
         glm::vec4 params{0.0f}; // x: samples, y: angular radius (radians), z: frame counter, w: normal bias
     };
 
+    // One mesh item of a shadow view, drawn through the compute-compacted indirect path.
+    struct ShadowMeshDraw
+    {
+        const DrawItem* item = nullptr;
+        std::uint32_t commandIndex = kMeshletCullDisabled;
+        std::uint32_t compactedOffset = kMeshletCullDisabled;
+    };
+
     // One shadow map render view: a cascade layer, a spot layer or a point cube face (rendered
     // into a tile of the point shadow atlas).
     struct ShadowView
@@ -328,6 +483,7 @@ private:
         std::uint32_t layer = 0;
         rhi::RenderArea area{};
         std::vector<const DrawItem*> items{};
+        std::vector<ShadowMeshDraw> meshDraws{};
     };
 
     struct ShadowCullItem
@@ -385,6 +541,7 @@ private:
     bool CreatePipelines(rhi::Device& device);
     bool CreateScene();
     bool CreateClusterResources(rhi::Device& device);
+    void CreateMeshletResources(rhi::Device& device);
     bool CreateShadowResources(rhi::Device& device);
     void CreateLightingSets(rhi::Device& device);
     void UpdateUniforms(std::uint32_t frameIndex, const FrameView& view);
@@ -392,16 +549,22 @@ private:
     [[nodiscard]] const Light* FindShadowLight() const;
     void BuildShadowCullItems();
     void BuildShadowViews();
+    void BuildShadowMeshletCull(std::uint32_t frameIndex);
     [[nodiscard]] std::vector<const DrawItem*> CollectShadowItems(
         const glm::vec3& lightPosition,
         float range) const;
-    void RecordShadowViews(std::uint32_t frameIndex);
+    void RecordShadowViews(
+        std::uint32_t frameIndex,
+        bool meshShadowActive,
+        bool meshCompactionActive);
     void RecordShadowView(
         std::uint32_t frameIndex,
-        std::uint32_t shadowViewIndex,
-        const std::vector<const DrawItem*>& items,
+        const ShadowView& view,
+        bool meshShadowActive,
+        bool meshCompactionActive,
         rhi::CommandList& secondary,
         const rhi::RenderingDesc& desc);
+    void RecordShadowMeshletCullPass(rhi::CommandList& commandList, std::uint32_t frameIndex);
     void ApplyModelScale();
     void UpdateObjectData(std::uint32_t frameIndex);
     void BuildAccelerationStructures(rhi::CommandList& commandList, std::uint32_t frameIndex);
@@ -420,7 +583,48 @@ private:
     [[nodiscard]] bool IsRtShadowActive() const;
     bool CreateGiProbeResources(rhi::Device& device);
     void RecordGiProbes(rhi::CommandList& commandList, std::uint32_t frameIndex);
-    [[nodiscard]] bool IsProbeGiActive() const;
+
+    // Screen space subsurface scattering resources and passes.
+    struct SssBlurPushConstants
+    {
+        glm::vec4 params{0.0f};     // x: radius px, y: depth tolerance, z: tap spacing px
+        glm::vec4 fullSize{0.0f};   // xy: full resolution
+        glm::vec4 sourceSize{0.0f}; // xy: source resolution
+        glm::vec4 destSize{0.0f};   // xy: destination resolution
+        glm::vec4 direction{0.0f};  // xy: blur axis
+        glm::vec4 cameraPosition{0.0f};
+        glm::vec4 projection{0.0f}; // x: tan(fovY / 2), y: full height
+        glm::vec4 lutParams{0.0f};  // x/y: bucket mapping
+    };
+
+    struct CompositePushConstants
+    {
+        glm::vec4 params{0.0f}; // x: strength, y: debug view, z: passthrough
+    };
+
+    // Compute meshlet cull push constants; must match meshlet_cull.comp.slang.
+    struct MeshletCullPushConstants
+    {
+        glm::mat4 model{1.0f};
+        std::uint32_t drawIndex = 0;
+        std::uint32_t meshletCount = 0;
+    };
+
+    // Per (shadow view, draw) cull push constants; must match shadow_cull.comp.slang.
+    struct ShadowCullPushConstants
+    {
+        glm::mat4 model{1.0f};
+        std::uint32_t viewIndex = 0;
+        std::uint32_t drawIndex = 0;
+        std::uint32_t compactedOffset = 0;
+        std::uint32_t commandIndex = 0;
+        std::uint32_t meshletCount = 0;
+    };
+
+    bool CreateSssResources(rhi::Device& device);
+    void CreateSssDescriptorSets();
+    void RecordSssPasses(rhi::CommandList& commandList, const FrameView& view);
+    [[nodiscard]] bool IsSssActive() const;
     [[nodiscard]] bool IsPerPixelGiActive() const;
     bool CreateReflectionResources(rhi::Device& device);
     void UpdateReflectionUniform(std::uint32_t frameIndex);
@@ -437,14 +641,22 @@ private:
     [[nodiscard]] std::uint32_t RecordGBufferSecondaries(
         std::uint32_t frameIndex,
         const rhi::RenderingDesc& desc,
-        const std::vector<const DrawItem*>& items);
+        const std::vector<const DrawItem*>& items,
+        bool meshRenderingActive,
+        bool meshCompactionActive);
     void RecordGBufferBatch(
         std::uint32_t frameIndex,
         const std::vector<const DrawItem*>& items,
         std::size_t begin,
         std::size_t end,
+        bool meshRenderingActive,
+        bool meshCompactionActive,
         rhi::CommandList& secondary,
         const rhi::RenderingDesc& desc);
+    void RecordMeshletCullPass(
+        rhi::CommandList& commandList,
+        std::uint32_t frameIndex,
+        const std::vector<const DrawItem*>& items);
 
     rhi::Device* m_device = nullptr;
     JobSystem* m_jobSystem = nullptr;
@@ -454,6 +666,10 @@ private:
     std::vector<std::unique_ptr<rhi::Buffer>> m_uniformBuffers{};
     rhi::Buffer* m_planeVertexBuffer = nullptr;
     rhi::Buffer* m_planeIndexBuffer = nullptr;
+    DrawItem m_groundDrawItem{};
+    bool m_groundDrawItemValid = false;
+    float m_groundPlaneExtent = 10.0f;
+    bool m_groundVisible = true;
     std::unique_ptr<rhi::Sampler> m_gbufferSampler{};
     std::vector<std::unique_ptr<rhi::Sampler>> m_bindlessSamplers{};
     std::unordered_map<std::uint32_t, std::uint32_t> m_samplerCache{};
@@ -476,6 +692,14 @@ private:
     std::vector<std::vector<std::unique_ptr<rhi::CommandList>>> m_shadowSecondaries{};
     std::vector<ShadowView> m_shadowViews{};
     std::vector<ShadowCullItem> m_shadowCullItems{};
+    std::unique_ptr<rhi::Shader> m_shadowCullShader{};
+    std::unique_ptr<rhi::DescriptorSetLayout> m_shadowCullSetLayout{};
+    std::unique_ptr<rhi::Pipeline> m_shadowCullPipeline{};
+    std::vector<std::unique_ptr<rhi::Buffer>> m_shadowMeshletIndexBuffers{};
+    std::vector<std::unique_ptr<rhi::Buffer>> m_shadowMeshletCommandBuffers{};
+    std::vector<std::unique_ptr<rhi::DescriptorSet>> m_shadowMeshSets{};
+    std::vector<std::unique_ptr<rhi::DescriptorSet>> m_shadowCullSets{};
+    bool m_shadowMeshletCompactionActive = false;
     std::vector<Light> m_spotShadowLights{};
     std::vector<Light> m_pointShadowLights{};
     std::unique_ptr<rhi::DescriptorSet> m_bindlessSet{};
@@ -483,18 +707,37 @@ private:
     std::vector<std::unique_ptr<rhi::DescriptorSet>> m_lightingSets{};
     std::vector<std::unique_ptr<rhi::DescriptorSet>> m_clusterSets{};
     std::unique_ptr<rhi::Shader> m_gbufferVertexShader{};
+    std::unique_ptr<rhi::Shader> m_gbufferMeshShader{};
     std::unique_ptr<rhi::Shader> m_gbufferFragmentShader{};
     std::unique_ptr<rhi::Shader> m_transparentFragmentShader{};
     std::unique_ptr<rhi::Shader> m_lightingVertexShader{};
     std::unique_ptr<rhi::Shader> m_lightingFragmentShader{};
     std::unique_ptr<rhi::Shader> m_clusterCullingShader{};
     std::unique_ptr<rhi::Shader> m_shadowVertexShader{};
+    std::unique_ptr<rhi::Shader> m_shadowMeshShader{};
     std::unique_ptr<rhi::Shader> m_shadowFragmentShader{};
     std::unique_ptr<rhi::Pipeline> m_gbufferPipeline{};
+    std::unique_ptr<rhi::Pipeline> m_gbufferMeshPipeline{};
     std::unique_ptr<rhi::Pipeline> m_transparentPipeline{};
     std::unique_ptr<rhi::Pipeline> m_lightingPipeline{};
     std::unique_ptr<rhi::Pipeline> m_clusterCullingPipeline{};
     std::unique_ptr<rhi::Pipeline> m_shadowPipeline{};
+    std::unique_ptr<rhi::Pipeline> m_shadowMeshPipeline{};
+    std::unique_ptr<rhi::Shader> m_meshletCullShader{};
+    std::unique_ptr<rhi::DescriptorSetLayout> m_meshletCullSetLayout{};
+    std::unique_ptr<rhi::Pipeline> m_meshletCullPipeline{};
+    std::unique_ptr<rhi::DescriptorSetLayout> m_meshSetLayout{};
+    std::vector<std::unique_ptr<rhi::Buffer>> m_meshDrawBuffers{};
+    std::vector<std::unique_ptr<rhi::Buffer>> m_meshletIndexBuffers{};
+    std::vector<std::unique_ptr<rhi::Buffer>> m_meshletCommandBuffers{};
+    std::vector<std::unique_ptr<rhi::DescriptorSet>> m_meshSets{};
+    std::vector<std::unique_ptr<rhi::DescriptorSet>> m_meshletCullSets{};
+    std::uint64_t m_meshletCount = 0;
+    std::uint64_t m_meshletTriangleCount = 0;
+    bool m_meshletRenderingSupported = false;
+    bool m_meshletRenderingEnabled = true;
+    bool m_meshletCompactionActive = false;
+    bool m_meshletDebugView = false;
     std::vector<DrawItem> m_sceneDrawItems{};
     std::vector<DrawItem> m_modelDrawItems{};
     std::vector<glm::mat4> m_modelBaseTransforms{};
@@ -604,8 +847,28 @@ private:
     std::vector<std::unique_ptr<rhi::Buffer>> m_debugLineBuffers{};
     std::size_t m_debugLineBufferCapacity = 0;
     std::vector<GiProbe> m_giProbes{};
+    // Screen space subsurface scattering (KHR_materials_diffuse_transmission).
+    SssSettings m_sssSettings{};
+    bool m_hasSssMaterials = false;
+    std::unique_ptr<rhi::Shader> m_sssBlurShader{};
+    std::unique_ptr<rhi::Shader> m_compositeShader{};
+    std::unique_ptr<rhi::Pipeline> m_sssBlurPipeline{};
+    std::unique_ptr<rhi::Pipeline> m_compositePipeline{};
+    std::unique_ptr<rhi::DescriptorSetLayout> m_sssBlurSetLayout{};
+    std::unique_ptr<rhi::DescriptorSetLayout> m_compositeSetLayout{};
+    std::unique_ptr<rhi::Texture> m_lightingColor{};
+    std::unique_ptr<rhi::Texture> m_sssSource{};
+    std::unique_ptr<rhi::Texture> m_sssBlurTargets[2]{};
+    std::unique_ptr<rhi::Texture> m_sssLut{};
+    std::unique_ptr<rhi::Sampler> m_sssSampler{};
+    std::vector<std::unique_ptr<rhi::DescriptorSet>> m_sssBlurSets{};
+    std::unique_ptr<rhi::DescriptorSet> m_compositeSet{};
+    std::uint32_t m_sssHalfWidth = 0;
+    std::uint32_t m_sssHalfHeight = 0;
     bool m_showLightGizmos = true;
     bool m_showProbeGizmos = true;
+    bool m_showPhysicsGizmos = false;
+    DebugLines m_physicsDebugLines{};
     glm::mat4 m_inverseViewProjection{1.0f};
     std::vector<std::unique_ptr<rhi::AccelerationStructure>> m_tlas{};
     std::vector<std::unique_ptr<rhi::Buffer>> m_geometryDataBuffers{};
@@ -635,6 +898,7 @@ private:
     std::uint32_t m_secondaryBatchCount = 1;
     bool m_lightingSetsDirty = true;
     bool m_clusterDebugView = false;
+    bool m_giDebugView = false;
     bool m_initialized = false;
 };
 

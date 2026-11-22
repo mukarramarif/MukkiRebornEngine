@@ -68,6 +68,41 @@ TEST(Camera, ViewProjectionIsProjectionTimesView)
     EXPECT_EQ(camera.GetViewProjectionMatrix(), expected);
 }
 
+TEST(Camera, SetViewMapsFrameAndKeepsRoll)
+{
+    mukki::Camera camera{};
+    camera.SetPerspective(1.0471975512f, 1.0f, 0.1f, 100.0f);
+
+    const glm::vec3 position{3.0f, 4.0f, 5.0f};
+    const glm::vec3 forward = glm::normalize(glm::vec3{0.0f, 0.3f, -1.0f});
+    const glm::vec3 right = glm::normalize(glm::cross(forward, glm::vec3{0.0f, 1.0f, 0.0f}));
+    const glm::vec3 up = glm::normalize(glm::cross(right, forward));
+    camera.SetView(position, forward, up);
+
+    const glm::mat4 view = camera.GetViewMatrix();
+    const glm::vec4 viewPosition = view * glm::vec4{position, 1.0f};
+    EXPECT_NEAR(viewPosition.x, 0.0f, kEpsilon);
+    EXPECT_NEAR(viewPosition.y, 0.0f, kEpsilon);
+    EXPECT_NEAR(viewPosition.z, 0.0f, kEpsilon);
+
+    // The forward point maps to negative Z and the up point to positive Y in view space.
+    const glm::vec4 forwardPoint = view * glm::vec4{position + forward, 1.0f};
+    EXPECT_NEAR(forwardPoint.x, 0.0f, kEpsilon);
+    EXPECT_NEAR(forwardPoint.y, 0.0f, kEpsilon);
+    EXPECT_NEAR(forwardPoint.z, -1.0f, kEpsilon);
+
+    const glm::vec4 upPoint = view * glm::vec4{position + up, 1.0f};
+    EXPECT_NEAR(upPoint.x, 0.0f, kEpsilon);
+    EXPECT_NEAR(upPoint.y, 1.0f, kEpsilon);
+    EXPECT_NEAR(upPoint.z, 0.0f, kEpsilon);
+
+    // The Euler members stay in sync with the horizontal forward direction.
+    const glm::vec3 derivedForward = camera.GetForward();
+    EXPECT_NEAR(derivedForward.x, forward.x, kEpsilon);
+    EXPECT_NEAR(derivedForward.y, forward.y, kEpsilon);
+    EXPECT_NEAR(derivedForward.z, forward.z, kEpsilon);
+}
+
 TEST(FlyCameraController, MovesAlongForward)
 {
     mukki::Camera camera{};

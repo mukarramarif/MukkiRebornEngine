@@ -1,6 +1,7 @@
 #include "Scene/SceneJson.h"
 
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <utility>
 
@@ -50,6 +51,74 @@ std::string_view LightTypeName(LightType type)
         return "spot";
     }
     return "point";
+}
+
+std::string_view PhysicsBodyName(ScenePhysicsBody body)
+{
+    switch (body)
+    {
+    case ScenePhysicsBody::None:
+        return "none";
+    case ScenePhysicsBody::Static:
+        return "static";
+    case ScenePhysicsBody::Dynamic:
+        return "dynamic";
+    }
+    return "none";
+}
+
+bool ParsePhysicsBody(std::string_view text, ScenePhysicsBody& body)
+{
+    if (text == "none")
+    {
+        body = ScenePhysicsBody::None;
+        return true;
+    }
+    if (text == "static")
+    {
+        body = ScenePhysicsBody::Static;
+        return true;
+    }
+    if (text == "dynamic")
+    {
+        body = ScenePhysicsBody::Dynamic;
+        return true;
+    }
+    return false;
+}
+
+std::string_view PhysicsShapeName(ScenePhysicsShape shape)
+{
+    switch (shape)
+    {
+    case ScenePhysicsShape::Box:
+        return "box";
+    case ScenePhysicsShape::Sphere:
+        return "sphere";
+    case ScenePhysicsShape::Capsule:
+        return "capsule";
+    }
+    return "box";
+}
+
+bool ParsePhysicsShape(std::string_view text, ScenePhysicsShape& shape)
+{
+    if (text == "box")
+    {
+        shape = ScenePhysicsShape::Box;
+        return true;
+    }
+    if (text == "sphere")
+    {
+        shape = ScenePhysicsShape::Sphere;
+        return true;
+    }
+    if (text == "capsule")
+    {
+        shape = ScenePhysicsShape::Capsule;
+        return true;
+    }
+    return false;
 }
 
 bool ReadString(const Json& node, const char* key, std::string& out, bool required, std::string& error)
@@ -105,6 +174,28 @@ bool ReadFloat(const Json& node, const char* key, float& out, std::string& error
     return true;
 }
 
+bool ReadU32(const Json& node, const char* key, std::uint32_t& out, std::string& error)
+{
+    const auto it = node.find(key);
+    if (it == node.end())
+    {
+        return true;
+    }
+    if (!it->is_number_integer())
+    {
+        error = std::string{"'"} + key + "' must be an integer";
+        return false;
+    }
+    const std::int64_t value = it->get<std::int64_t>();
+    if (value < 0 || value > static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max()))
+    {
+        error = std::string{"'"} + key + "' is out of range";
+        return false;
+    }
+    out = static_cast<std::uint32_t>(value);
+    return true;
+}
+
 bool ReadVec3(const Json& node, const char* key, glm::vec3& out, std::string& error)
 {
     const auto it = node.find(key);
@@ -129,9 +220,118 @@ bool ReadVec3(const Json& node, const char* key, glm::vec3& out, std::string& er
     return true;
 }
 
+// Parses the optional per-object "physics" block. An absent block (or "body": "none") leaves the
+// object render-only.
+bool ReadScenePhysics(const Json& node, ScenePhysics& physics, std::string& error)
+{
+    const auto it = node.find("physics");
+    if (it == node.end())
+    {
+        return true;
+    }
+    if (!it->is_object())
+    {
+        error = "'physics' must be an object";
+        return false;
+    }
+
+    std::string bodyText{};
+    std::string shapeText{};
+    if (!ReadString(*it, "body", bodyText, false, error) ||
+        !ReadString(*it, "shape", shapeText, false, error) ||
+        !ReadVec3(*it, "halfExtents", physics.halfExtents, error) ||
+        !ReadVec3(*it, "offset", physics.offset, error) ||
+        !ReadFloat(*it, "radius", physics.radius, error) ||
+        !ReadFloat(*it, "height", physics.height, error) ||
+        !ReadFloat(*it, "density", physics.density, error) ||
+        !ReadFloat(*it, "friction", physics.friction, error) ||
+        !ReadFloat(*it, "restitution", physics.restitution, error))
+    {
+        return false;
+    }
+
+    if (!bodyText.empty() && !ParsePhysicsBody(bodyText, physics.body))
+    {
+        error = "physics 'body' must be none, static or dynamic, got '" + bodyText + "'";
+        return false;
+    }
+    if (!shapeText.empty() && !ParsePhysicsShape(shapeText, physics.shape))
+    {
+        error = "physics 'shape' must be box, sphere or capsule, got '" + shapeText + "'";
+        return false;
+    }
+    if (physics.density < 0.0f || physics.friction < 0.0f || physics.restitution < 0.0f)
+    {
+        error = "physics density, friction and restitution must not be negative";
+        return false;
+    }
+    return true;
+}
+
 std::string Indexed(std::string_view collection, std::size_t index, std::string message)
 {
     return std::string{collection} + "[" + std::to_string(index) + "]: " + std::move(message);
+}
+
+// Parses the optional scene root "clouds" block into the engine cloud settings.
+bool ReadClouds(const Json& node, CloudSettings& clouds, std::string& error)
+{
+    const auto it = node.find("clouds");
+    if (it == node.end())
+    {
+        return true;
+    }
+    if (!it->is_object())
+    {
+        error = "'clouds' must be an object";
+        return false;
+    }
+
+    if (!ReadBool(*it, "enabled", clouds.enabled, error) ||
+        !ReadFloat(*it, "coverage", clouds.coverage, error) ||
+        !ReadFloat(*it, "cloudType", clouds.cloudType, error) ||
+        !ReadFloat(*it, "density", clouds.density, error) ||
+        !ReadFloat(*it, "detailStrength", clouds.detailStrength, error) ||
+        !ReadFloat(*it, "layerBottomKm", clouds.layerBottomKm, error) ||
+        !ReadFloat(*it, "layerTopKm", clouds.layerTopKm, error) ||
+        !ReadFloat(*it, "altitudeVariationKm", clouds.altitudeVariationKm, error) ||
+        !ReadFloat(*it, "windSpeed", clouds.windSpeed, error) ||
+        !ReadFloat(*it, "windDirectionRadians", clouds.windDirectionRadians, error) ||
+        !ReadFloat(*it, "curlStrength", clouds.curlStrength, error) ||
+        !ReadFloat(*it, "coverageVariation", clouds.coverageVariation, error) ||
+        !ReadU32(*it, "primarySteps", clouds.primarySteps, error) ||
+        !ReadU32(*it, "lightSteps", clouds.lightSteps, error) ||
+        !ReadFloat(*it, "resolutionScale", clouds.resolutionScale, error) ||
+        !ReadFloat(*it, "temporalBlend", clouds.temporalBlend, error) ||
+        !ReadFloat(*it, "godRayIntensity", clouds.godRayIntensity, error))
+    {
+        return false;
+    }
+
+    if (clouds.density < 0.0f || clouds.layerBottomKm <= 0.0f ||
+        clouds.layerTopKm <= clouds.layerBottomKm || clouds.altitudeVariationKm < 0.0f ||
+        clouds.windSpeed < 0.0f || clouds.curlStrength < 0.0f)
+    {
+        error = "clouds density, layer heights, altitude variation, wind speed and curl must be valid";
+        return false;
+    }
+    if (clouds.primarySteps < 1 || clouds.primarySteps > 256 || clouds.lightSteps < 1 ||
+        clouds.lightSteps > 16)
+    {
+        error = "clouds primarySteps must be in [1, 256] and lightSteps in [1, 16]";
+        return false;
+    }
+    if (clouds.resolutionScale < 0.1f || clouds.resolutionScale > 1.0f)
+    {
+        error = "clouds resolutionScale must be in [0.1, 1.0]";
+        return false;
+    }
+    if (clouds.temporalBlend < 0.0f || clouds.temporalBlend >= 1.0f)
+    {
+        error = "clouds temporalBlend must be in [0, 1)";
+        return false;
+    }
+    return true;
 }
 
 Json Vec3ToJson(const glm::vec3& value)
@@ -192,6 +392,60 @@ bool SceneJson::Parse(
     const std::filesystem::path canonical = std::filesystem::weakly_canonical(assetRoot, pathError);
     scene.assetRoot = pathError ? assetRoot.lexically_normal() : canonical;
 
+    if (const auto physicsIt = root.find("physics"); physicsIt != root.end())
+    {
+        if (!physicsIt->is_object())
+        {
+            error = "'physics' must be an object";
+            return false;
+        }
+        if (!ReadVec3(*physicsIt, "gravity", scene.physics.gravity, error) ||
+            !ReadFloat(*physicsIt, "stepHz", scene.physics.stepHz, error) ||
+            !ReadU32(*physicsIt, "subSteps", scene.physics.subSteps, error))
+        {
+            return false;
+        }
+        if (scene.physics.stepHz < 15.0f || scene.physics.stepHz > 240.0f)
+        {
+            error = "physics 'stepHz' must be between 15 and 240";
+            return false;
+        }
+        if (scene.physics.subSteps < 1 || scene.physics.subSteps > 8)
+        {
+            error = "physics 'subSteps' must be between 1 and 8";
+            return false;
+        }
+    }
+
+    if (const auto environmentIt = root.find("environment"); environmentIt != root.end())
+    {
+        if (!environmentIt->is_object())
+        {
+            error = "'environment' must be an object";
+            return false;
+        }
+        std::string mapText{};
+        if (!ReadString(*environmentIt, "map", mapText, false, error) ||
+            !ReadFloat(*environmentIt, "intensity", scene.environment.intensity, error))
+        {
+            return false;
+        }
+        scene.environment.map = PathFromUtf8(mapText);
+        if (scene.environment.intensity < 0.0f)
+        {
+            error = "environment 'intensity' must not be negative";
+            return false;
+        }
+        scene.hasEnvironment = true;
+    }
+
+    scene.hasClouds = root.contains("clouds");
+    if (!ReadClouds(root, scene.clouds, error) ||
+        !ReadString(root, "playerPlane", scene.playerPlane, false, error))
+    {
+        return false;
+    }
+
     if (const auto objectsIt = root.find("objects"); objectsIt != root.end())
     {
         if (!objectsIt->is_array())
@@ -215,7 +469,8 @@ bool SceneJson::Parse(
                 !ReadString(node, "model", object.modelPath, true, entryError) ||
                 !ReadVec3(node, "position", object.position, entryError) ||
                 !ReadVec3(node, "rotation", object.rotation, entryError) ||
-                !ReadVec3(node, "scale", object.scale, entryError))
+                !ReadVec3(node, "scale", object.scale, entryError) ||
+                !ReadScenePhysics(node, object.physics, entryError))
             {
                 error = Indexed("objects", index, std::move(entryError));
                 return false;
@@ -340,6 +595,49 @@ std::string SceneJson::Serialize(const SceneDescription& scene)
     root["name"] = scene.name;
     root["assetRoot"] = PathToUtf8(scene.assetRoot);
 
+    Json physicsNode;
+    physicsNode["gravity"] = Vec3ToJson(scene.physics.gravity);
+    physicsNode["stepHz"] = scene.physics.stepHz;
+    physicsNode["subSteps"] = scene.physics.subSteps;
+    root["physics"] = std::move(physicsNode);
+
+    if (scene.hasEnvironment)
+    {
+        Json environment;
+        environment["map"] = PathToUtf8(scene.environment.map);
+        environment["intensity"] = scene.environment.intensity;
+        root["environment"] = std::move(environment);
+    }
+
+    if (scene.hasClouds)
+    {
+        const CloudSettings& clouds = scene.clouds;
+        Json cloudsNode;
+        cloudsNode["enabled"] = clouds.enabled;
+        cloudsNode["coverage"] = clouds.coverage;
+        cloudsNode["cloudType"] = clouds.cloudType;
+        cloudsNode["density"] = clouds.density;
+        cloudsNode["detailStrength"] = clouds.detailStrength;
+        cloudsNode["layerBottomKm"] = clouds.layerBottomKm;
+        cloudsNode["layerTopKm"] = clouds.layerTopKm;
+        cloudsNode["altitudeVariationKm"] = clouds.altitudeVariationKm;
+        cloudsNode["windSpeed"] = clouds.windSpeed;
+        cloudsNode["windDirectionRadians"] = clouds.windDirectionRadians;
+        cloudsNode["curlStrength"] = clouds.curlStrength;
+        cloudsNode["coverageVariation"] = clouds.coverageVariation;
+        cloudsNode["primarySteps"] = clouds.primarySteps;
+        cloudsNode["lightSteps"] = clouds.lightSteps;
+        cloudsNode["resolutionScale"] = clouds.resolutionScale;
+        cloudsNode["temporalBlend"] = clouds.temporalBlend;
+        cloudsNode["godRayIntensity"] = clouds.godRayIntensity;
+        root["clouds"] = std::move(cloudsNode);
+    }
+
+    if (!scene.playerPlane.empty())
+    {
+        root["playerPlane"] = scene.playerPlane;
+    }
+
     Json objects = Json::array();
     for (const SceneObject& object : scene.objects)
     {
@@ -349,6 +647,22 @@ std::string SceneJson::Serialize(const SceneDescription& scene)
         node["position"] = Vec3ToJson(object.position);
         node["rotation"] = Vec3ToJson(object.rotation);
         node["scale"] = Vec3ToJson(object.scale);
+
+        if (object.physics.body != ScenePhysicsBody::None)
+        {
+            Json physics;
+            physics["body"] = std::string{PhysicsBodyName(object.physics.body)};
+            physics["shape"] = std::string{PhysicsShapeName(object.physics.shape)};
+            physics["halfExtents"] = Vec3ToJson(object.physics.halfExtents);
+            physics["radius"] = object.physics.radius;
+            physics["height"] = object.physics.height;
+            physics["offset"] = Vec3ToJson(object.physics.offset);
+            physics["density"] = object.physics.density;
+            physics["friction"] = object.physics.friction;
+            physics["restitution"] = object.physics.restitution;
+            node["physics"] = std::move(physics);
+        }
+
         objects.push_back(std::move(node));
     }
     root["objects"] = std::move(objects);

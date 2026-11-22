@@ -246,7 +246,35 @@ struct SurfaceSample
     float3 sheenColor;
     float sheenRoughness;
     float3 emissive;
+    float3 subsurfaceColor;
+    float subsurfaceFactor;
 };
+
+// Interpolated geometric normal of a hit. Cheap enough for probe depth checks (three vertex
+// loads); returns a zero vector for degenerate triangles.
+float3 LoadGeometricNormal(
+    uint geometryIndex,
+    uint primitiveIndex,
+    float2 barycentrics)
+{
+    const GpuGeometryData geometry = gGeometry[geometryIndex];
+    const ByteAddressBuffer vertexBuffer = gBuffers[NonUniformResourceIndex(geometry.bufferIndices.x)];
+    const ByteAddressBuffer indexBuffer = gBuffers[NonUniformResourceIndex(geometry.bufferIndices.y)];
+    const uint stride = geometry.bufferIndices.z;
+
+    const uint base = primitiveIndex * 12u;
+    const uint i0 = indexBuffer.Load(base);
+    const uint i1 = indexBuffer.Load(base + 4u);
+    const uint i2 = indexBuffer.Load(base + 8u);
+
+    const float w0 = 1.0 - barycentrics.x - barycentrics.y;
+    const float3 normalSum =
+        LoadFloat3(vertexBuffer, i0 * stride + 12u) * w0 +
+        LoadFloat3(vertexBuffer, i1 * stride + 12u) * barycentrics.x +
+        LoadFloat3(vertexBuffer, i2 * stride + 12u) * barycentrics.y;
+    const float lengthSquared = dot(normalSum, normalSum);
+    return lengthSquared > 1e-8 ? normalSum * rsqrt(lengthSquared) : float3(0.0, 0.0, 0.0);
+}
 
 SurfaceSample LoadSurface(
     uint geometryIndex,
@@ -267,10 +295,13 @@ SurfaceSample LoadSurface(
     const uint i2 = indexBuffer.Load(base + 8u);
 
     const float w0 = 1.0 - barycentrics.x - barycentrics.y;
-    const float3 n0 = LoadFloat3(vertexBuffer, i0 * stride + 12u);
-    const float3 n1 = LoadFloat3(vertexBuffer, i1 * stride + 12u);
-    const float3 n2 = LoadFloat3(vertexBuffer, i2 * stride + 12u);
-    const float3 geometricNormal = normalize(n0 * w0 + n1 * barycentrics.x + n2 * barycentrics.y);
+    float3 geometricNormal = LoadGeometricNormal(geometryIndex, primitiveIndex, barycentrics);
+    // Degenerate normals would turn every downstream term into NaN; fall back to a normal facing
+    // the ray origin.
+    if (dot(geometricNormal, geometricNormal) < 1e-8)
+    {
+        geometricNormal = -rayDirection;
+    }
 
     const float2 uv0 = LoadFloat2(vertexBuffer, i0 * stride + 24u);
     const float2 uv1 = LoadFloat2(vertexBuffer, i1 * stride + 24u);
@@ -307,6 +338,16 @@ SurfaceSample LoadSurface(
             gSamplers[NonUniformResourceIndex(geometry.emissiveSamplerIndices.x)],
             uv,
             0.0).rgb;
+    const float subsurfaceFactorSample =
+        gTextures[NonUniformResourceIndex(geometry.subsurfaceTextureIndices.x)].SampleLevel(
+            gSamplers[NonUniformResourceIndex(geometry.subsurfaceSamplerIndices.x)],
+            uv,
+            0.0).a;
+    const float3 subsurfaceColorSample =
+        gTextures[NonUniformResourceIndex(geometry.subsurfaceTextureIndices.y)].SampleLevel(
+            gSamplers[NonUniformResourceIndex(geometry.subsurfaceSamplerIndices.y)],
+            uv,
+            0.0).rgb;
 
     SurfaceSample surface;
     surface.position = rayOrigin + rayDirection * hitDistance;
@@ -330,6 +371,8 @@ SurfaceSample LoadSurface(
     surface.sheenColor = geometry.sheen.rgb * sheenColorSample;
     surface.sheenRoughness = saturate(geometry.sheen.a * sheenRoughnessSample);
     surface.emissive = geometry.emissive.rgb * emissiveSample;
+    surface.subsurfaceColor = geometry.subsurface.rgb * subsurfaceColorSample;
+    surface.subsurfaceFactor = saturate(geometry.subsurface.a * subsurfaceFactorSample);
     return surface;
 }
 
@@ -409,13 +452,16 @@ float3 ShadeOpaqueSurface(
     const float roughness = clamp(surface.roughness, 0.04, 1.0);
 
     const float3 sunDirection = gGi.sunDirectionIntensity.xyz;
-    const float sunNdotL = max(dot(normal, sunDirection), 0.0);
+    const float rawSunNdotL = dot(normal, sunDirection);
+    const float sunNdotL = max(rawSunNdotL, 0.0);
     const bool sunActive =
-        gGi.params3.z > 0.5 && gGi.sunDirectionIntensity.w > 0.0 && sunNdotL > 0.0;
+        gGi.params3.z > 0.5 && gGi.sunDirectionIntensity.w > 0.0 && (sunNdotL > 0.0 || surface.subsurfaceFactor > 0.0);
 
     // Sky/ambient stays diffuse; direct lights are shaded with the full BRDF. Emissive surfaces
-    // add their emitted radiance regardless of lighting.
-    float3 radiance = surface.baseColor * GiIrradianceOverPi(normal) + surface.emissive;
+    // add their emitted radiance regardless of lighting. Subsurface materials move part of the
+    // diffuse lobe into the back-lit diffuse transmission term added below.
+    const float3 diffuseAlbedo = surface.baseColor * (1.0 - surface.subsurfaceFactor);
+    float3 radiance = diffuseAlbedo * GiIrradianceOverPi(normal) + surface.emissive;
 
     if (sunActive)
     {
@@ -471,7 +517,7 @@ float3 ShadeOpaqueSurface(
         const float3 sunRadiance =
             gGi.sunColor.rgb * gGi.sunDirectionIntensity.w * visibility;
         radiance += EvaluateCookTorrance(
-            surface.baseColor,
+            diffuseAlbedo,
             f0,
             surface.metalness,
             roughness,
@@ -479,6 +525,15 @@ float3 ShadeOpaqueSurface(
             viewDirection,
             sunDirection,
             sunRadiance);
+        if (surface.subsurfaceFactor > 0.0)
+        {
+            radiance += SubsurfaceTransmissionRadiance(
+                surface.subsurfaceColor,
+                surface.subsurfaceFactor,
+                surface.metalness,
+                rawSunNdotL,
+                sunRadiance);
+        }
         if (any(surface.sheenColor > 1e-5))
         {
             radiance += EvaluateSheenBRDF(
@@ -523,8 +578,9 @@ float3 ShadeOpaqueSurface(
                 }
             }
 
-            const float nDotL = dot(normal, lightDirection);
-            if (nDotL <= 0.0)
+            const float rawNdotL = dot(normal, lightDirection);
+            const bool backLit = surface.subsurfaceFactor > 0.0 && rawNdotL < 0.0;
+            if (rawNdotL <= 0.0 && !backLit)
             {
                 continue;
             }
@@ -534,7 +590,7 @@ float3 ShadeOpaqueSurface(
             {
                 visibility = TraceLightVisibility(
                     hitPosition,
-                    normal,
+                    backLit ? -normal : normal,
                     lightDirection,
                     distance,
                     shadowBias);
@@ -543,7 +599,7 @@ float3 ShadeOpaqueSurface(
             const float3 lightRadiance =
                 light.color.rgb * light.directionIntensity.w * attenuation * cone * visibility;
             radiance += EvaluateCookTorrance(
-                surface.baseColor,
+                diffuseAlbedo,
                 f0,
                 surface.metalness,
                 roughness,
@@ -551,6 +607,15 @@ float3 ShadeOpaqueSurface(
                 viewDirection,
                 lightDirection,
                 lightRadiance);
+            if (backLit)
+            {
+                radiance += SubsurfaceTransmissionRadiance(
+                    surface.subsurfaceColor,
+                    surface.subsurfaceFactor,
+                    surface.metalness,
+                    rawNdotL,
+                    lightRadiance);
+            }
             if (any(surface.sheenColor > 1e-5))
             {
                 radiance += EvaluateSheenBRDF(
@@ -560,7 +625,7 @@ float3 ShadeOpaqueSurface(
                     viewDirection,
                     lightDirection,
                     lightRadiance,
-                    saturate(nDotL));
+                    saturate(rawNdotL));
             }
         }
     }

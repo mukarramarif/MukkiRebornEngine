@@ -68,6 +68,12 @@ struct GltfMaterial
     float attenuationDistance = 0.0f;
     // KHR_materials_dispersion.
     float dispersion = 0.0f;
+    // KHR_materials_diffuse_transmission. The scattering radius is derived from the volume
+    // thickness factor (see the SSS passes).
+    float diffuseTransmissionFactor = 0.0f;
+    int diffuseTransmissionTexture = -1;
+    glm::vec3 diffuseTransmissionColorFactor{1.0f};
+    int diffuseTransmissionColorTexture = -1;
     // KHR_materials_sheen.
     glm::vec3 sheenColorFactor{0.0f};
     float sheenRoughnessFactor = 0.0f;

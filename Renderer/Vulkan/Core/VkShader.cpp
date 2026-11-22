@@ -26,6 +26,8 @@ rhi::ShaderStageMask ToShaderStageMask(rhi::ShaderStage stage)
         return rhi::ShaderStageMask::Fragment;
     case rhi::ShaderStage::Compute:
         return rhi::ShaderStageMask::Compute;
+    case rhi::ShaderStage::Mesh:
+        return rhi::ShaderStageMask::Mesh;
     }
     return rhi::ShaderStageMask::None;
 }

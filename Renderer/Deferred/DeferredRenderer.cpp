@@ -5,6 +5,8 @@
 #include "Renderer/Clouds/CloudNoise.h"
 #include "Core/JobSystem.h"
 #include "Renderer/GlobalIllumination/GiAtrousSchedule.h"
+#include "Renderer/Lighting/Subsurface.h"
+#include "Renderer/Meshlets/MeshletBuilder.h"
 #include "Renderer/RHI/Device.h"
 #include "Scene/SceneDescription.h"
 #include "Utilities/Assert.h"
@@ -18,6 +20,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstddef>
+#include <cstring>
 #include <future>
 #include <iterator>
 #include <string>
@@ -198,18 +201,36 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
         rhi::DescriptorBinding{
             2,
             rhi::DescriptorType::StorageBuffer,
-            rhi::ShaderStageMask::FragmentCompute,
+            rhi::ShaderStageMask::FragmentComputeMesh,
             rhi::kMaxBindlessBuffers,
             true},
     };
-    const std::array<const rhi::Shader*, 2> sceneStages{
+    std::vector<const rhi::Shader*> sceneStages{
         m_gbufferVertexShader.get(),
         m_gbufferFragmentShader.get()};
+    if (m_gbufferMeshShader != nullptr)
+    {
+        sceneStages.push_back(m_gbufferMeshShader.get());
+    }
+    if (m_meshletCullShader != nullptr)
+    {
+        // The cull dispatch reads the scene uniform, so set 0 must also cover the compute stage.
+        sceneStages.push_back(m_meshletCullShader.get());
+    }
     const std::array<const rhi::Shader*, 1> lightingStages{m_lightingFragmentShader.get()};
     const std::array<const rhi::Shader*, 1> clusterStages{m_clusterCullingShader.get()};
-    const std::array<const rhi::Shader*, 2> shadowStages{
+    std::vector<const rhi::Shader*> shadowStages{
         m_shadowVertexShader.get(),
         m_shadowFragmentShader.get()};
+    if (m_shadowMeshShader != nullptr)
+    {
+        shadowStages.push_back(m_shadowMeshShader.get());
+    }
+    if (m_shadowCullShader != nullptr)
+    {
+        // The shadow cull dispatch reads the shadow uniform, so set 0 must cover compute too.
+        shadowStages.push_back(m_shadowCullShader.get());
+    }
     const std::array<const rhi::Shader*, 1> giTraceStages{m_giTraceShader.get()};
     const std::array<const rhi::Shader*, 1> giTemporalStages{m_giTemporalShader.get()};
     const std::array<const rhi::Shader*, 1> giAtrousStages{m_giAtrousShader.get()};
@@ -224,6 +245,24 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
         device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(clusterStages, 0));
     m_shadowSetLayout =
         device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(shadowStages, 0));
+    if (m_shadowCullShader != nullptr)
+    {
+        const std::array<const rhi::Shader*, 1> shadowCullStages{m_shadowCullShader.get()};
+        m_shadowCullSetLayout =
+            device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(shadowCullStages, 1));
+    }
+    if (m_gbufferMeshShader != nullptr)
+    {
+        const std::array<const rhi::Shader*, 1> meshStages{m_gbufferMeshShader.get()};
+        m_meshSetLayout =
+            device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(meshStages, 2));
+    }
+    if (m_meshletCullShader != nullptr)
+    {
+        const std::array<const rhi::Shader*, 1> cullStages{m_meshletCullShader.get()};
+        m_meshletCullSetLayout =
+            device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(cullStages, 1));
+    }
     m_giTraceSetLayout =
         device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(giTraceStages, 0));
     m_giTemporalSetLayout =
@@ -308,6 +347,8 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
         m_sceneSets.push_back(std::move(sceneSet));
     }
 
+    CreateMeshletResources(device);
+
     if (!CreateClusterResources(device) || !CreateShadowResources(device))
     {
         Shutdown();
@@ -351,6 +392,29 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
         return false;
     }
 
+    m_meshletRenderingSupported = m_gbufferMeshShader != nullptr && m_shadowMeshShader != nullptr &&
+                                  m_gbufferMeshPipeline != nullptr && m_shadowMeshPipeline != nullptr &&
+                                  m_meshSetLayout != nullptr &&
+                                  m_meshSets.size() == device.GetFramesInFlight() &&
+                                  m_shadowMeshSets.size() == device.GetFramesInFlight();
+    m_meshletRenderingEnabled = m_meshletRenderingSupported;
+    if (std::getenv("MRE_MESHLETS_OFF") != nullptr)
+    {
+        m_meshletRenderingEnabled = false;
+    }
+    if (std::getenv("MRE_MESHLET_DEBUG") != nullptr)
+    {
+        SetMeshletDebugView(true);
+    }
+    if (m_meshletRenderingSupported)
+    {
+        MRE_INFO(
+            "Meshlet rendering {} (mesh shader G-buffer and shadow passes, {}, debug view {})",
+            m_meshletRenderingEnabled ? "enabled" : "disabled",
+            m_meshletCullPipeline != nullptr ? "compute culling" : "in-shader culling",
+            m_meshletDebugView ? "on" : "off");
+    }
+
     if (!CreateRtShadowResources(device))
     {
         Shutdown();
@@ -358,6 +422,12 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
     }
 
     if (!CreateGiProbeResources(device))
+    {
+        Shutdown();
+        return false;
+    }
+
+    if (!CreateSssResources(device))
     {
         Shutdown();
         return false;
@@ -379,17 +449,45 @@ void DeferredRenderer::Shutdown()
     m_sceneSets.clear();
     m_shadowSets.clear();
     m_shadowPipeline.reset();
+    m_shadowMeshPipeline.reset();
+    m_gbufferMeshPipeline.reset();
+    m_meshletCullPipeline.reset();
+    m_meshletCullSetLayout.reset();
+    m_shadowCullPipeline.reset();
+    m_shadowCullSetLayout.reset();
+    m_meshSetLayout.reset();
+    m_meshDrawBuffers.clear();
+    m_meshletIndexBuffers.clear();
+    m_meshletCommandBuffers.clear();
+    m_meshSets.clear();
+    m_meshletCullSets.clear();
+    m_shadowMeshletIndexBuffers.clear();
+    m_shadowMeshletCommandBuffers.clear();
+    m_shadowMeshSets.clear();
+    m_shadowCullSets.clear();
+    m_meshletCount = 0;
+    m_meshletTriangleCount = 0;
+    m_meshletRenderingSupported = false;
+    m_meshletRenderingEnabled = true;
+    m_meshletCompactionActive = false;
+    m_meshletDebugView = false;
+    m_shadowMeshletCompactionActive = false;
     m_clusterCullingPipeline.reset();
     m_lightingPipeline.reset();
     m_gbufferPipeline.reset();
     m_shadowFragmentShader.reset();
+    m_shadowMeshShader.reset();
     m_shadowVertexShader.reset();
+    m_meshletCullShader.reset();
+    m_shadowCullShader.reset();
+    m_gbufferMeshShader.reset();
     m_clusterCullingShader.reset();
     m_lightingFragmentShader.reset();
     m_lightingVertexShader.reset();
     m_gbufferFragmentShader.reset();
     m_gbufferVertexShader.reset();
     m_sceneDrawItems.clear();
+    m_groundDrawItemValid = false;
     m_gbufferSecondaries.clear();
     m_shadowSecondaries.clear();
     m_tlas.clear();
@@ -539,6 +637,11 @@ void DeferredRenderer::Resize(std::uint32_t width, std::uint32_t height)
     if (!CreateCloudResources(*m_device))
     {
         MRE_CRITICAL("Failed to recreate the cloud resources");
+    }
+
+    if (!CreateSssResources(*m_device))
+    {
+        MRE_CRITICAL("Failed to recreate the subsurface scattering resources");
     }
 
     if (!CreateRtShadowResources(*m_device))
@@ -695,6 +798,8 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
     const glm::vec3 fittedMax = glm::vec3{fit * glm::vec4{model.maxBounds, 1.0f}};
     resources->fittedBounds.center = (fittedMin + fittedMax) * 0.5f;
     resources->fittedBounds.radius = glm::length(fittedMax - fittedMin) * 0.5f;
+    resources->fittedMin = glm::min(fittedMin, fittedMax);
+    resources->fittedMax = glm::max(fittedMin, fittedMax);
 
     const auto createTextureFromImage = [this, &model](int imageIndex, rhi::Format format) {
         std::unique_ptr<rhi::Texture> texture{};
@@ -750,6 +855,18 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
         // Emissive textures carry light, so they stay linear instead of sRGB.
         material.emissiveTexture =
             createTextureFromImage(textureImageIndex(source.emissiveTexture), rhi::Format::R8G8B8A8Unorm);
+        // Diffuse transmission: the factor lives in the alpha channel, the color is sRGB.
+        material.diffuseTransmissionTexture = createTextureFromImage(
+            textureImageIndex(source.diffuseTransmissionTexture),
+            rhi::Format::R8G8B8A8Unorm);
+        material.diffuseTransmissionColorTexture = createTextureFromImage(
+            textureImageIndex(source.diffuseTransmissionColorTexture),
+            rhi::Format::R8G8B8A8Srgb);
+        if (source.diffuseTransmissionFactor > 0.0f && !m_hasSssMaterials)
+        {
+            m_hasSssMaterials = true;
+            MRE_INFO("Diffuse transmission material detected; screen space SSS enabled");
+        }
 
         if (material.baseColorTexture != nullptr)
         {
@@ -804,6 +921,20 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
                 *material.sheenRoughnessTexture,
                 material.sheenRoughnessTexture->GetBindlessIndex());
         }
+        if (material.diffuseTransmissionTexture != nullptr)
+        {
+            m_bindlessSet->BindTexture(
+                0,
+                *material.diffuseTransmissionTexture,
+                material.diffuseTransmissionTexture->GetBindlessIndex());
+        }
+        if (material.diffuseTransmissionColorTexture != nullptr)
+        {
+            m_bindlessSet->BindTexture(
+                0,
+                *material.diffuseTransmissionColorTexture,
+                material.diffuseTransmissionColorTexture->GetBindlessIndex());
+        }
         if (material.emissiveTexture != nullptr)
         {
             m_bindlessSet->BindTexture(
@@ -816,20 +947,23 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
     }
 
     const bool rayTracingSupported = m_device->IsRayTracingSupported();
+    const bool meshShaderSupported = m_device->IsMeshShaderSupported();
     resources->vertexBuffers.reserve(model.primitives.size());
     resources->indexBuffers.reserve(model.primitives.size());
     resources->accelerationStructures.reserve(model.primitives.size());
+    resources->meshletBuffers.reserve(model.primitives.size());
+    resources->meshletPrimitives.reserve(model.primitives.size());
     for (const GltfPrimitive& primitive : model.primitives)
     {
         const std::uint64_t vertexBytes = sizeof(GltfVertex) * primitive.vertices.size();
         const std::uint64_t indexBytes = sizeof(std::uint32_t) * primitive.indices.size();
 
         resources->vertexBuffers.push_back(m_device->CreateBuffer(
-            rhi::BufferDesc{vertexBytes, rhi::BufferUsage::Vertex, false, rayTracingSupported},
+            rhi::BufferDesc{vertexBytes, rhi::BufferUsage::Vertex, false, rayTracingSupported, 0, true},
             primitive.vertices.data(),
             vertexBytes));
         resources->indexBuffers.push_back(m_device->CreateBuffer(
-            rhi::BufferDesc{indexBytes, rhi::BufferUsage::Index, false, rayTracingSupported},
+            rhi::BufferDesc{indexBytes, rhi::BufferUsage::Index, false, rayTracingSupported, 0, true},
             primitive.indices.data(),
             indexBytes));
 
@@ -850,6 +984,71 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
                 true};
             resources->accelerationStructures.push_back(
                 m_device->CreateBottomLevelAccelerationStructure(blasDesc));
+        }
+
+        // Pack the meshlets, the vertex index list and the packed micro triangles into one
+        // storage buffer that is registered in the bindless buffer array.
+        resources->meshletPrimitives.push_back(ModelResources::MeshletPrimitive{});
+        if (meshShaderSupported)
+        {
+            const MeshletMesh meshlets = BuildMeshlets(primitive.vertices, primitive.indices);
+            if (!meshlets.Empty())
+            {
+                const std::uint32_t meshletBytes =
+                    static_cast<std::uint32_t>(meshlets.meshlets.size() * sizeof(GpuMeshlet));
+                const std::uint32_t vertexIndexBase = meshletBytes;
+                const std::uint32_t triangleBase = vertexIndexBase +
+                    static_cast<std::uint32_t>(meshlets.meshletVertices.size() * sizeof(std::uint32_t));
+                const std::uint64_t bufferSize = triangleBase +
+                    meshlets.meshletTriangles.size() * sizeof(std::uint32_t);
+
+                std::vector<GpuMeshlet> gpuMeshlets(meshlets.meshlets.size());
+                for (std::size_t index = 0; index < meshlets.meshlets.size(); ++index)
+                {
+                    const Meshlet& meshlet = meshlets.meshlets[index];
+                    gpuMeshlets[index].centerRadius = glm::vec4{
+                        meshlet.bounds.center,
+                        meshlet.bounds.radius};
+                    gpuMeshlets[index].coneAxisCutoff = glm::vec4{
+                        meshlet.bounds.coneAxis,
+                        meshlet.bounds.coneCutoff};
+                    gpuMeshlets[index].data = glm::uvec4{
+                        meshlet.vertexCount,
+                        meshlet.triangleCount,
+                        meshlet.vertexOffset,
+                        meshlet.triangleOffset};
+                }
+
+                std::vector<std::byte> bytes(static_cast<std::size_t>(bufferSize));
+                std::memcpy(bytes.data(), gpuMeshlets.data(), meshletBytes);
+                std::memcpy(
+                    bytes.data() + vertexIndexBase,
+                    meshlets.meshletVertices.data(),
+                    meshlets.meshletVertices.size() * sizeof(std::uint32_t));
+                std::memcpy(
+                    bytes.data() + triangleBase,
+                    meshlets.meshletTriangles.data(),
+                    meshlets.meshletTriangles.size() * sizeof(std::uint32_t));
+
+                resources->meshletBuffers.push_back(m_device->CreateBuffer(
+                    rhi::BufferDesc{bufferSize, rhi::BufferUsage::Storage, false},
+                    bytes.data(),
+                    bytes.size()));
+
+                ModelResources::MeshletPrimitive& meshletPrimitive =
+                    resources->meshletPrimitives.back();
+                meshletPrimitive.meshletCount =
+                    static_cast<std::uint32_t>(meshlets.meshlets.size());
+                meshletPrimitive.vertexIndexBase = vertexIndexBase;
+                meshletPrimitive.triangleBase = triangleBase;
+                meshletPrimitive.bufferIndex = m_nextBindlessBuffer++;
+                m_bindlessSet->BindStorageBuffer(
+                    2,
+                    *resources->meshletBuffers.back(),
+                    meshletPrimitive.bufferIndex);
+                m_meshletCount += meshlets.meshlets.size();
+                m_meshletTriangleCount += meshlets.meshletTriangles.size();
+            }
         }
     }
     m_blasDirty = true;
@@ -877,6 +1076,13 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
             }
             item.vertexBufferIndex = resources->vertexBufferIndices[primitiveIndex];
             item.indexBufferIndex = resources->indexBufferIndices[primitiveIndex];
+            const ModelResources::MeshletPrimitive& meshletPrimitive =
+                resources->meshletPrimitives[primitiveIndex];
+            item.meshletCount = meshletPrimitive.meshletCount;
+            item.meshletOffset = 0;
+            item.meshletVertexIndexBase = meshletPrimitive.vertexIndexBase;
+            item.meshletTriangleBase = meshletPrimitive.triangleBase;
+            item.meshletBufferIndex = meshletPrimitive.bufferIndex;
 
             const std::uint32_t whiteIndex = m_whiteTexture->GetBindlessIndex();
             const std::uint32_t defaultSamplerIndex =
@@ -897,6 +1103,10 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
             item.emissive = glm::vec4{0.0f};
             item.emissiveTextureIndices = glm::uvec4{whiteIndex, 0u, 0u, 0u};
             item.emissiveSamplerIndices = glm::uvec4{defaultSamplerIndex, 0u, 0u, 0u};
+            item.subsurface = glm::vec4{0.0f};
+            item.subsurfaceTextureIndices = glm::uvec4{whiteIndex, whiteIndex, 0u, 0u};
+            item.subsurfaceSamplerIndices =
+                glm::uvec4{defaultSamplerIndex, defaultSamplerIndex, 0u, 0u};
 
             if (primitive.materialIndex >= 0 &&
                 primitive.materialIndex < static_cast<int>(resources->materials.size()))
@@ -939,6 +1149,11 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
                     material.emissiveFactor.g,
                     material.emissiveFactor.b,
                     0.0f};
+                item.subsurface = glm::vec4{
+                    material.diffuseTransmissionColorFactor.r,
+                    material.diffuseTransmissionColorFactor.g,
+                    material.diffuseTransmissionColorFactor.b,
+                    material.diffuseTransmissionFactor};
 
                 const Material& gpuMaterial = resources->materials[static_cast<std::size_t>(primitive.materialIndex)];
                 if (gpuMaterial.baseColorTexture != nullptr)
@@ -1053,6 +1268,33 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
                     item.emissiveSamplerIndices.x =
                         GetSamplerIndex(ToRhiAddressMode(texture.wrapS), ToRhiAddressMode(texture.wrapT));
                 }
+
+                if (gpuMaterial.diffuseTransmissionTexture != nullptr)
+                {
+                    item.subsurfaceTextureIndices.x =
+                        gpuMaterial.diffuseTransmissionTexture->GetBindlessIndex();
+                }
+                if (gpuMaterial.diffuseTransmissionColorTexture != nullptr)
+                {
+                    item.subsurfaceTextureIndices.y =
+                        gpuMaterial.diffuseTransmissionColorTexture->GetBindlessIndex();
+                }
+                if (material.diffuseTransmissionTexture >= 0 &&
+                    material.diffuseTransmissionTexture < static_cast<int>(model.textures.size()))
+                {
+                    const GltfTexture& texture =
+                        model.textures[static_cast<std::size_t>(material.diffuseTransmissionTexture)];
+                    item.subsurfaceSamplerIndices.x =
+                        GetSamplerIndex(ToRhiAddressMode(texture.wrapS), ToRhiAddressMode(texture.wrapT));
+                }
+                if (material.diffuseTransmissionColorTexture >= 0 &&
+                    material.diffuseTransmissionColorTexture < static_cast<int>(model.textures.size()))
+                {
+                    const GltfTexture& texture =
+                        model.textures[static_cast<std::size_t>(material.diffuseTransmissionColorTexture)];
+                    item.subsurfaceSamplerIndices.y =
+                        GetSamplerIndex(ToRhiAddressMode(texture.wrapS), ToRhiAddressMode(texture.wrapT));
+                }
             }
             else
             {
@@ -1096,11 +1338,18 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
     m_modelVertexCount = m_models[modelIndex]->vertexCount;
     m_modelTriangleCount = m_models[modelIndex]->triangleCount;
 
+    std::uint64_t meshletCount = 0;
+    for (const ModelResources::MeshletPrimitive& primitive : m_models[modelIndex]->meshletPrimitives)
+    {
+        meshletCount += primitive.meshletCount;
+    }
+
     MRE_INFO(
-        "Model '{}' uploaded ({} draw items, {} textures)",
+        "Model '{}' uploaded ({} draw items, {} textures, {} meshlets)",
         m_modelName,
         m_models[modelIndex]->drawItems.size(),
-        textureCount);
+        textureCount,
+        meshletCount);
     return modelIndex;
 }
 
@@ -1206,6 +1455,46 @@ bool DeferredRenderer::GetSceneBounds(glm::vec3& outMin, glm::vec3& outMax) cons
     return true;
 }
 
+bool DeferredRenderer::GetSceneObjectFittedBounds(
+    std::size_t objectIndex,
+    glm::vec3& outMin,
+    glm::vec3& outMax) const
+{
+    if (objectIndex >= m_objectInstances.size())
+    {
+        return false;
+    }
+
+    const SceneObjectInstance& sceneObject = m_objectInstances[objectIndex];
+    MRE_ASSERT(sceneObject.modelIndex < m_models.size(), "Scene object model index out of range");
+    const ModelResources& model = *m_models[sceneObject.modelIndex];
+    const glm::mat4 world =
+        glm::scale(glm::mat4{1.0f}, glm::vec3{m_modelScale}) * sceneObject.transform;
+
+    glm::vec3 boundsMin{std::numeric_limits<float>::max()};
+    glm::vec3 boundsMax{std::numeric_limits<float>::lowest()};
+    for (int corner = 0; corner < 8; ++corner)
+    {
+        const glm::vec3 local{
+            (corner & 1) != 0 ? model.fittedMax.x : model.fittedMin.x,
+            (corner & 2) != 0 ? model.fittedMax.y : model.fittedMin.y,
+            (corner & 4) != 0 ? model.fittedMax.z : model.fittedMin.z};
+        const glm::vec3 worldCorner = glm::vec3{world * glm::vec4{local, 1.0f}};
+        boundsMin = glm::min(boundsMin, worldCorner);
+        boundsMax = glm::max(boundsMax, worldCorner);
+    }
+
+    outMin = boundsMin;
+    outMax = boundsMax;
+    // A degenerate (for example planar) model still needs a usable collider bound.
+    const glm::vec3 minimumExtent{0.01f};
+    const glm::vec3 center = (outMin + outMax) * 0.5f;
+    const glm::vec3 halfExtents = glm::max((outMax - outMin) * 0.5f, minimumExtent);
+    outMin = center - halfExtents;
+    outMax = center + halfExtents;
+    return true;
+}
+
 void DeferredRenderer::ClearModelInstances()
 {
     m_modelDrawItems.clear();
@@ -1219,6 +1508,9 @@ void DeferredRenderer::ClearModels()
     m_modelCache.clear();
     m_models.clear();
     m_blasDirty = true;
+    m_hasSssMaterials = false;
+    m_meshletCount = 0;
+    m_meshletTriangleCount = 0;
     ++m_geometryRevision;
 }
 
@@ -1236,11 +1528,66 @@ void DeferredRenderer::UnloadModel()
     m_modelTriangleCount = 0;
 }
 
+void DeferredRenderer::SetMeshletRenderingEnabled(bool enabled)
+{
+    m_meshletRenderingEnabled = enabled && m_meshletRenderingSupported;
+    if (!m_meshletRenderingEnabled)
+    {
+        m_meshletDebugView = false;
+    }
+}
+
+void DeferredRenderer::SetMeshletDebugView(bool enabled)
+{
+    m_meshletDebugView = enabled && m_meshletRenderingSupported && m_meshletRenderingEnabled;
+}
+
 void DeferredRenderer::SetModelScale(float scale)
 {
     MRE_ASSERT(scale > 0.0f, "Model scale must be greater than zero");
     m_modelScale = std::clamp(scale, 0.01f, 100.0f);
     ApplyModelScale();
+    ++m_geometryRevision;
+}
+
+void DeferredRenderer::SetGroundPlaneExtent(float halfExtent)
+{
+    MRE_ASSERT(halfExtent > 0.0f, "Ground plane extent must be greater than zero");
+    m_groundPlaneExtent = std::clamp(halfExtent, 1.0f, 100000.0f);
+    if (!m_groundDrawItemValid)
+    {
+        return;
+    }
+
+    m_groundDrawItem.pushConstants.model =
+        glm::scale(glm::mat4{1.0f}, glm::vec3{m_groundPlaneExtent / 10.0f});
+    if (m_groundVisible && !m_sceneDrawItems.empty())
+    {
+        m_sceneDrawItems.front().pushConstants.model = m_groundDrawItem.pushConstants.model;
+    }
+    ++m_geometryRevision;
+}
+
+void DeferredRenderer::SetGroundVisible(bool visible)
+{
+    if (visible == m_groundVisible)
+    {
+        return;
+    }
+    m_groundVisible = visible;
+    if (!m_groundDrawItemValid)
+    {
+        return;
+    }
+
+    if (visible)
+    {
+        m_sceneDrawItems.insert(m_sceneDrawItems.begin(), m_groundDrawItem);
+    }
+    else if (!m_sceneDrawItems.empty())
+    {
+        m_sceneDrawItems.erase(m_sceneDrawItems.begin());
+    }
     ++m_geometryRevision;
 }
 
@@ -1273,9 +1620,11 @@ void DeferredRenderer::UpdateObjectData(std::uint32_t frameIndex)
 
     std::vector<GpuObjectData> objectData{};
     objectData.resize(itemCount);
+    std::vector<GpuMeshDraw> meshDraws{};
+    meshDraws.resize(itemCount);
 
     std::size_t index = 0;
-    const auto updateItem = [this, &objectData, &index](DrawItem& item) {
+    const auto updateItem = [this, &objectData, &meshDraws, &index](DrawItem& item) {
         objectData[index].previousModel = m_previousModels[index];
         objectData[index].specular = item.specular;
         objectData[index].specularTextureIndices = item.specularTextureIndices;
@@ -1291,7 +1640,17 @@ void DeferredRenderer::UpdateObjectData(std::uint32_t frameIndex)
         objectData[index].emissive = item.emissive;
         objectData[index].emissiveTextureIndices = item.emissiveTextureIndices;
         objectData[index].emissiveSamplerIndices = item.emissiveSamplerIndices;
+        objectData[index].subsurface = item.subsurface;
+        objectData[index].subsurfaceTextureIndices = item.subsurfaceTextureIndices;
+        objectData[index].subsurfaceSamplerIndices = item.subsurfaceSamplerIndices;
         item.pushConstants.drawIndex = static_cast<std::uint32_t>(index);
+        meshDraws[index].meshletOffset = item.meshletOffset;
+        meshDraws[index].meshletCount = item.meshletCount;
+        meshDraws[index].vertexIndexBase = item.meshletVertexIndexBase;
+        meshDraws[index].triangleBase = item.meshletTriangleBase;
+        meshDraws[index].vertexBufferIndex = item.vertexBufferIndex;
+        meshDraws[index].meshletBufferIndex = item.meshletBufferIndex;
+        meshDraws[index].compactedOffset = item.compactedOffset;
         m_previousModels[index] = item.pushConstants.model;
         ++index;
     };
@@ -1305,9 +1664,76 @@ void DeferredRenderer::UpdateObjectData(std::uint32_t frameIndex)
         updateItem(item);
     }
 
+    // Assign the per-frame compacted meshlet slices and rearm the indirect mesh-task commands. The
+    // cull shader accumulates groupCountX per draw; draws that do not fit the compaction capacity
+    // fall back to direct dispatch and cull in the mesh shader.
+    m_meshletCompactionActive =
+        m_meshletCullPipeline != nullptr && frameIndex < m_meshletIndexBuffers.size() &&
+        frameIndex < m_meshletCommandBuffers.size() && frameIndex < m_meshletCullSets.size() &&
+        m_meshletIndexBuffers[frameIndex] != nullptr &&
+        m_meshletCommandBuffers[frameIndex] != nullptr &&
+        m_meshletCullSets[frameIndex] != nullptr;
+    std::uint32_t compactedOffset = 0;
+    if (m_meshletCompactionActive)
+    {
+        for (GpuMeshDraw& draw : meshDraws)
+        {
+            if (draw.meshletCount == 0)
+            {
+                draw.compactedOffset = kMeshletCullDisabled;
+                continue;
+            }
+            draw.compactedOffset = compactedOffset;
+            compactedOffset += draw.meshletCount;
+            if (compactedOffset > kMeshletCompactionCapacity)
+            {
+                m_meshletCompactionActive = false;
+                break;
+            }
+        }
+    }
+
+    if (m_meshletCompactionActive && !meshDraws.empty())
+    {
+        // groupCountY/Z stay 1; only groupCountX is accumulated by the cull dispatch.
+        std::vector<std::uint32_t> commands(meshDraws.size() * 3u, 1u);
+        for (std::size_t draw = 0; draw < meshDraws.size(); ++draw)
+        {
+            commands[draw * 3u] = 0u;
+        }
+        m_meshletCommandBuffers[frameIndex]->Write(
+            commands.data(),
+            commands.size() * sizeof(std::uint32_t));
+    }
+    else
+    {
+        for (GpuMeshDraw& draw : meshDraws)
+        {
+            draw.compactedOffset = kMeshletCullDisabled;
+        }
+    }
+
+    index = 0;
+    for (DrawItem& item : m_sceneDrawItems)
+    {
+        item.compactedOffset = meshDraws[index].compactedOffset;
+        ++index;
+    }
+    for (DrawItem& item : m_modelDrawItems)
+    {
+        item.compactedOffset = meshDraws[index].compactedOffset;
+        ++index;
+    }
+
     if (!objectData.empty())
     {
         m_objectDataBuffers[frameIndex]->Write(objectData.data(), objectData.size() * sizeof(GpuObjectData));
+    }
+
+    if (!meshDraws.empty() && frameIndex < m_meshDrawBuffers.size() &&
+        m_meshDrawBuffers[frameIndex] != nullptr)
+    {
+        m_meshDrawBuffers[frameIndex]->Write(meshDraws.data(), meshDraws.size() * sizeof(GpuMeshDraw));
     }
 }
 
@@ -1396,6 +1822,9 @@ void DeferredRenderer::BuildAccelerationStructures(rhi::CommandList& commandList
         geometry.emissive = item.emissive;
         geometry.emissiveTextureIndices = item.emissiveTextureIndices;
         geometry.emissiveSamplerIndices = item.emissiveSamplerIndices;
+        geometry.subsurface = item.subsurface;
+        geometry.subsurfaceTextureIndices = item.subsurfaceTextureIndices;
+        geometry.subsurfaceSamplerIndices = item.subsurfaceSamplerIndices;
         m_geometryData.push_back(geometry);
     };
 
@@ -2508,19 +2937,31 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
     };
     gbufferDesc.depthAttachment = rhi::DepthAttachment{&m_gbuffer.GetDepth(), 1.0f, true};
 
+    const bool meshRenderingActive = m_meshletRenderingEnabled && m_meshletRenderingSupported &&
+                                     m_gbufferMeshPipeline != nullptr &&
+                                     frameIndex < m_meshSets.size() &&
+                                     frameIndex < m_meshDrawBuffers.size();
+    const bool meshCompactionActive =
+        meshRenderingActive && m_meshletCompactionActive && m_meshletCullPipeline != nullptr &&
+        frameIndex < m_meshletCommandBuffers.size() &&
+        m_meshletCommandBuffers[frameIndex] != nullptr;
     // Alpha blended materials skip the opaque G-buffer and are drawn back-to-front after lighting.
-    std::vector<const DrawItem*> gbufferItems{};
+    // Opaque items with meshlets use the mesh shader pipeline when it is available.
+    std::vector<const DrawItem*> opaqueItems{};
     std::vector<const DrawItem*> transparentItems{};
-    gbufferItems.reserve(m_sceneDrawItems.size() + m_modelDrawItems.size());
+    opaqueItems.reserve(m_sceneDrawItems.size() + m_modelDrawItems.size());
     transparentItems.reserve(m_modelDrawItems.size());
-    const auto classifyItem = [&gbufferItems, &transparentItems](const DrawItem& item) {
+    const auto isMeshItem = [meshRenderingActive](const DrawItem& item) {
+        return meshRenderingActive && item.meshletCount > 0;
+    };
+    const auto classifyItem = [&opaqueItems, &transparentItems](const DrawItem& item) {
         if (item.alphaBlend)
         {
             transparentItems.push_back(&item);
         }
         else
         {
-            gbufferItems.push_back(&item);
+            opaqueItems.push_back(&item);
         }
     };
     for (const DrawItem& item : m_sceneDrawItems)
@@ -2552,6 +2993,16 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
 
     BuildShadowCullItems();
     BuildShadowViews();
+    BuildShadowMeshletCull(frameIndex);
+
+    const bool meshShadowActive =
+        meshRenderingActive && m_shadowMeshPipeline != nullptr &&
+        frameIndex < m_shadowMeshSets.size() && !m_shadowViews.empty();
+    const bool shadowCompactionActive = meshShadowActive && m_shadowMeshletCompactionActive;
+    if (shadowCompactionActive)
+    {
+        RecordShadowMeshletCullPass(commandList, frameIndex);
+    }
 
     if (!m_shadowViews.empty())
     {
@@ -2563,7 +3014,7 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
 
         if (useShadowSecondaries)
         {
-            RecordShadowViews(frameIndex);
+            RecordShadowViews(frameIndex, meshShadowActive, shadowCompactionActive);
 
             for (std::size_t index = 0; index < m_shadowViews.size(); ++index)
             {
@@ -2594,6 +3045,51 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
                 shadowDesc.area = shadowView.area;
 
                 commandList.BeginRendering(shadowDesc);
+
+                ShadowPushConstants pushConstants{};
+                pushConstants.viewIndex = shadowView.viewIndex;
+
+                if (meshShadowActive)
+                {
+                    commandList.BindPipeline(*m_shadowMeshPipeline);
+                    commandList.BindDescriptorSet(0, *m_shadowSets[frameIndex]);
+                    commandList.BindDescriptorSet(1, *m_bindlessSet);
+                    commandList.BindDescriptorSet(2, *m_shadowMeshSets[frameIndex]);
+                    commandList.SetDepthBias(
+                        m_shadowSettings.depthBias,
+                        m_shadowSettings.depthBias * 1.5f,
+                        0.0f);
+
+                    const std::uint32_t meshPushConstantSize =
+                        m_shadowMeshPipeline->GetPushConstantSize();
+                    for (const ShadowMeshDraw& meshDraw : shadowView.meshDraws)
+                    {
+                        const DrawItem& item = *meshDraw.item;
+                        pushConstants.object = item.pushConstants;
+                        pushConstants.compactedOffset = shadowCompactionActive
+                                                            ? meshDraw.compactedOffset
+                                                            : kMeshletCullDisabled;
+                        commandList.SetPushConstants(
+                            &pushConstants,
+                            meshPushConstantSize,
+                            rhi::ShaderStageMask::FragmentMesh);
+                        if (shadowCompactionActive &&
+                            meshDraw.compactedOffset != kMeshletCullDisabled)
+                        {
+                            commandList.DrawMeshTasksIndirect(
+                                *m_shadowMeshletCommandBuffers[frameIndex],
+                                static_cast<std::uint64_t>(meshDraw.commandIndex) *
+                                    sizeof(GpuMeshTaskCommand),
+                                1u,
+                                sizeof(GpuMeshTaskCommand));
+                        }
+                        else
+                        {
+                            commandList.DrawMeshTasks(item.meshletCount);
+                        }
+                    }
+                }
+
                 commandList.BindPipeline(*m_shadowPipeline);
                 commandList.BindDescriptorSet(0, *m_shadowSets[frameIndex]);
                 commandList.BindDescriptorSet(1, *m_bindlessSet);
@@ -2602,11 +3098,13 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
                     m_shadowSettings.depthBias * 1.5f,
                     0.0f);
 
-                ShadowPushConstants pushConstants{};
-                pushConstants.viewIndex = shadowView.viewIndex;
                 const std::uint32_t pushConstantSize = m_shadowPipeline->GetPushConstantSize();
                 for (const DrawItem* item : shadowView.items)
                 {
+                    if (meshShadowActive && item->meshletCount > 0)
+                    {
+                        continue;
+                    }
                     pushConstants.object = item->pushConstants;
                     commandList.BindVertexBuffer(*item->vertexBuffer);
                     commandList.BindIndexBuffer(*item->indexBuffer);
@@ -2623,28 +3121,25 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
         commandList.EndGpuZone();
     }
 
-    const auto drawItems = [&commandList, frameIndex](const std::vector<const DrawItem*>& items) {
-        for (const DrawItem* item : items)
-        {
-            commandList.BindVertexBuffer(*item->vertexBuffer);
-            commandList.BindIndexBuffer(*item->indexBuffer);
-            commandList.SetPushConstants(
-                &item->pushConstants,
-                sizeof(ObjectPushConstants),
-                rhi::ShaderStageMask::VertexFragment);
-            commandList.DrawIndexed(item->indexCount, item->firstIndex);
-        }
-    };
-
     const bool useSecondaries =
-        m_jobSystem != nullptr && m_secondaryBatchCount > 1 && gbufferItems.size() > 1 &&
+        m_jobSystem != nullptr && m_secondaryBatchCount > 1 && opaqueItems.size() > 1 &&
         frameIndex < m_gbufferSecondaries.size();
+
+    if (meshCompactionActive)
+    {
+        RecordMeshletCullPass(commandList, frameIndex, opaqueItems);
+    }
 
     commandList.BeginGpuZone("GBuffer");
 
     if (useSecondaries)
     {
-        const std::uint32_t batchCount = RecordGBufferSecondaries(frameIndex, gbufferDesc, gbufferItems);
+        const std::uint32_t batchCount = RecordGBufferSecondaries(
+            frameIndex,
+            gbufferDesc,
+            opaqueItems,
+            meshRenderingActive,
+            meshCompactionActive);
 
         std::vector<const rhi::CommandList*> secondaries{};
         secondaries.reserve(batchCount);
@@ -2661,10 +3156,65 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
     else
     {
         commandList.BeginRendering(gbufferDesc);
-        commandList.BindPipeline(*m_gbufferPipeline);
-        commandList.BindDescriptorSet(0, *m_sceneSets[frameIndex]);
-        commandList.BindDescriptorSet(1, *m_bindlessSet);
-        drawItems(gbufferItems);
+        if (meshRenderingActive)
+        {
+            bool meshPipelineBound = false;
+            for (const DrawItem* item : opaqueItems)
+            {
+                if (!isMeshItem(*item))
+                {
+                    continue;
+                }
+                if (!meshPipelineBound)
+                {
+                    commandList.BindPipeline(*m_gbufferMeshPipeline);
+                    commandList.BindDescriptorSet(0, *m_sceneSets[frameIndex]);
+                    commandList.BindDescriptorSet(1, *m_bindlessSet);
+                    commandList.BindDescriptorSet(2, *m_meshSets[frameIndex]);
+                    meshPipelineBound = true;
+                }
+                commandList.SetPushConstants(
+                    &item->pushConstants,
+                    sizeof(ObjectPushConstants),
+                    rhi::ShaderStageMask::FragmentMesh);
+                if (meshCompactionActive && item->compactedOffset != kMeshletCullDisabled)
+                {
+                    commandList.DrawMeshTasksIndirect(
+                        *m_meshletCommandBuffers[frameIndex],
+                        static_cast<std::uint64_t>(item->pushConstants.drawIndex) *
+                            sizeof(GpuMeshTaskCommand),
+                        1u,
+                        sizeof(GpuMeshTaskCommand));
+                }
+                else
+                {
+                    commandList.DrawMeshTasks(item->meshletCount);
+                }
+            }
+        }
+
+        bool vertexPipelineBound = false;
+        for (const DrawItem* item : opaqueItems)
+        {
+            if (isMeshItem(*item))
+            {
+                continue;
+            }
+            if (!vertexPipelineBound)
+            {
+                commandList.BindPipeline(*m_gbufferPipeline);
+                commandList.BindDescriptorSet(0, *m_sceneSets[frameIndex]);
+                commandList.BindDescriptorSet(1, *m_bindlessSet);
+                vertexPipelineBound = true;
+            }
+            commandList.BindVertexBuffer(*item->vertexBuffer);
+            commandList.BindIndexBuffer(*item->indexBuffer);
+            commandList.SetPushConstants(
+                &item->pushConstants,
+                sizeof(ObjectPushConstants),
+                rhi::ShaderStageMask::VertexFragment);
+            commandList.DrawIndexed(item->indexCount, item->firstIndex);
+        }
         commandList.EndRendering();
     }
 
@@ -2708,16 +3258,21 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
     RecordCloudPasses(commandList, frameIndex);
 
     commandList.BeginGpuZone("Lighting");
-    commandList.BeginSwapchainRendering(
-        rhi::ClearColor{0.0f, 0.0f, 0.0f, 1.0f},
-        rhi::DepthAttachment{&m_gbuffer.GetDepth(), 1.0f, false},
-        true);
+    // Lighting and the transparent pass render offscreen in HDR with two attachments: the lit
+    // image and the subsurface diffuse source. The screen space SSS passes diffuse the source and
+    // the composite tone maps everything into the swapchain.
+    rhi::RenderingDesc lightingDesc{};
+    lightingDesc.colorAttachments = {
+        rhi::ColorAttachment{m_lightingColor.get(), rhi::ClearColor{0.0f, 0.0f, 0.0f, 1.0f}, true},
+        rhi::ColorAttachment{m_sssSource.get(), rhi::ClearColor{0.0f, 0.0f, 0.0f, 0.0f}, true}};
+    lightingDesc.depthAttachment = rhi::DepthAttachment{&m_gbuffer.GetDepth(), 1.0f, false};
+    commandList.BeginRendering(lightingDesc);
     commandList.BindPipeline(*m_lightingPipeline);
     commandList.BindDescriptorSet(0, *m_lightingSets[frameIndex]);
     commandList.BindDescriptorSet(1, *m_bindlessSet);
     commandList.Draw(3);
 
-    if (!transparentItems.empty())
+    if (!transparentItems.empty() && !m_meshletDebugView)
     {
         commandList.BeginGpuZone("Transparent");
         commandList.BindPipeline(*m_transparentPipeline);
@@ -2735,6 +3290,43 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
         }
         commandList.EndGpuZone();
     }
+    commandList.EndRendering();
+    commandList.EndGpuZone();
+
+    // The composite always needs its descriptor set, even when no material uses subsurface
+    // scattering (it then passes the lighting target through).
+    CreateSssDescriptorSets();
+    if (IsSssActive())
+    {
+        RecordSssPasses(commandList, view);
+    }
+
+    commandList.BeginGpuZone("Composite");
+    commandList.BeginSwapchainRendering(
+        rhi::ClearColor{0.0f, 0.0f, 0.0f, 1.0f},
+        rhi::DepthAttachment{&m_gbuffer.GetDepth(), 1.0f, false},
+        true);
+    if (m_compositePipeline != nullptr && m_compositeSet != nullptr)
+    {
+        CompositePushConstants composite{};
+        const bool passthrough = m_clusterDebugView || m_meshletDebugView;
+        const bool useSharpSource = !IsSssActive();
+        const float strength = passthrough ? 0.0f
+                                           : (useSharpSource ? 1.0f
+                                                             : std::max(m_sssSettings.strength, 0.0f));
+        composite.params = glm::vec4{
+            strength,
+            static_cast<float>(m_sssSettings.debugView),
+            useSharpSource ? 1.0f : 0.0f,
+            passthrough ? 1.0f : 0.0f};
+        commandList.BindPipeline(*m_compositePipeline);
+        commandList.BindDescriptorSet(0, *m_compositeSet);
+        commandList.SetPushConstants(
+            &composite,
+            sizeof(composite),
+            rhi::ShaderStageMask::Fragment);
+        commandList.Draw(3);
+    }
 
     RecordDebugLines(commandList, view);
     commandList.EndSwapchainRendering();
@@ -2743,7 +3335,8 @@ void DeferredRenderer::Render(rhi::CommandList& commandList, const FrameView& vi
 
 void DeferredRenderer::RecordDebugLines(rhi::CommandList& commandList, const FrameView& view)
 {
-    if (m_debugLinePipeline == nullptr || (!m_showLightGizmos && !m_showProbeGizmos))
+    if (m_debugLinePipeline == nullptr ||
+        (!m_showLightGizmos && !m_showProbeGizmos && !m_showPhysicsGizmos))
     {
         return;
     }
@@ -2796,22 +3389,26 @@ void DeferredRenderer::RecordDebugLines(rhi::CommandList& commandList, const Fra
 
             const GpuGiProbe& probe = m_giProbeData[index];
             const glm::vec3 position{probe.position};
-            lines.AddSphere(position, marker.radius, marker.color);
+            // Probes that failed the depth check (embedded in geometry) are flagged red.
+            const bool depthValid = probe.depth.z >= 0.5f;
+            const glm::vec4 sphereColor =
+                depthValid ? marker.color : glm::vec4{1.0f, 0.15f, 0.15f, 1.0f};
+            lines.AddSphere(position, marker.radius, sphereColor);
             lines.AddCross(
                 position,
                 marker.radius * 0.6f,
                 glm::vec4{
-                    marker.color.r * 0.7f,
-                    marker.color.g * 0.7f,
-                    marker.color.b * 0.7f,
-                    marker.color.a});
+                    sphereColor.r * 0.7f,
+                    sphereColor.g * 0.7f,
+                    sphereColor.b * 0.7f,
+                    sphereColor.a});
 
             const glm::vec3 direction{
                 probe.shX.r + probe.shX.g + probe.shX.b,
                 probe.shY.r + probe.shY.g + probe.shY.b,
                 probe.shZ.r + probe.shZ.g + probe.shZ.b};
             const float directionLength = glm::length(direction);
-            if (directionLength > 1e-4f)
+            if (depthValid && directionLength > 1e-4f)
             {
                 const glm::vec3 irradiance =
                     glm::clamp(glm::vec3{probe.sh0}, glm::vec3{0.0f}, glm::vec3{1.0f});
@@ -2822,6 +3419,11 @@ void DeferredRenderer::RecordDebugLines(rhi::CommandList& commandList, const Fra
                     glm::vec4{irradiance, 1.0f});
             }
         }
+    }
+
+    if (m_showPhysicsGizmos)
+    {
+        lines.Append(m_physicsDebugLines);
     }
 
     if (lines.Empty())
@@ -2860,12 +3462,23 @@ void DeferredRenderer::RecordDebugLines(rhi::CommandList& commandList, const Fra
 std::uint32_t DeferredRenderer::RecordGBufferSecondaries(
     std::uint32_t frameIndex,
     const rhi::RenderingDesc& desc,
-    const std::vector<const DrawItem*>& items)
+    const std::vector<const DrawItem*>& items,
+    bool meshRenderingActive,
+    bool meshCompactionActive)
 {
     MRE_PROFILE_ZONE_N("RecordGBufferSecondaries");
     MRE_ASSERT(m_jobSystem != nullptr, "RecordGBufferSecondaries requires a job system");
     MRE_ASSERT(frameIndex < m_gbufferSecondaries.size(), "Frame index out of range");
     MRE_ASSERT(!items.empty(), "RecordGBufferSecondaries requires draw items");
+    MRE_ASSERT(
+        !meshRenderingActive ||
+            (m_gbufferMeshPipeline != nullptr && frameIndex < m_meshSets.size()),
+        "Meshlet secondaries require the mesh pipeline and descriptor set");
+    MRE_ASSERT(
+        !meshCompactionActive ||
+            (m_meshletCullPipeline != nullptr && frameIndex < m_meshletCommandBuffers.size() &&
+             m_meshletCommandBuffers[frameIndex] != nullptr),
+        "Meshlet secondaries require the cull command buffer");
 
     const std::uint32_t batchCount = std::min(
         m_secondaryBatchCount,
@@ -2887,9 +3500,18 @@ std::uint32_t DeferredRenderer::RecordGBufferSecondaries(
         MRE_ASSERT(begin < end, "RecordGBufferSecondaries produced an empty batch");
 
         rhi::CommandList* secondary = m_gbufferSecondaries[frameIndex][batch].get();
-        futures.push_back(m_jobSystem->Submit([this, frameIndex, secondary, &desc, &items, begin, end]() {
-            RecordGBufferBatch(frameIndex, items, begin, end, *secondary, desc);
-        }));
+        futures.push_back(m_jobSystem->Submit(
+            [this, frameIndex, secondary, &desc, &items, begin, end, meshRenderingActive, meshCompactionActive]() {
+                RecordGBufferBatch(
+                    frameIndex,
+                    items,
+                    begin,
+                    end,
+                    meshRenderingActive,
+                    meshCompactionActive,
+                    *secondary,
+                    desc);
+            }));
     }
 
     for (std::future<void>& future : futures)
@@ -2905,22 +3527,80 @@ void DeferredRenderer::RecordGBufferBatch(
     const std::vector<const DrawItem*>& items,
     std::size_t begin,
     std::size_t end,
+    bool meshRenderingActive,
+    bool meshCompactionActive,
     rhi::CommandList& secondary,
     const rhi::RenderingDesc& desc)
 {
     MRE_ASSERT(m_gbufferPipeline != nullptr, "RecordGBufferBatch requires the G-buffer pipeline");
     MRE_ASSERT(frameIndex < m_sceneSets.size(), "Frame index out of range");
+    MRE_ASSERT(
+        !meshRenderingActive ||
+            (m_gbufferMeshPipeline != nullptr && frameIndex < m_meshSets.size()),
+        "Meshlet batches require the mesh pipeline and descriptor set");
+    MRE_ASSERT(
+        !meshCompactionActive ||
+            (frameIndex < m_meshletCommandBuffers.size() &&
+             m_meshletCommandBuffers[frameIndex] != nullptr),
+        "Meshlet batches require the cull command buffer");
 
     secondary.BeginSecondary(desc);
-    secondary.BindPipeline(*m_gbufferPipeline);
-    secondary.BindDescriptorSet(0, *m_sceneSets[frameIndex]);
-    secondary.BindDescriptorSet(1, *m_bindlessSet);
-
     secondary.BeginGpuZone("GBufferBatch");
 
+    // Mesh items first so the batch binds each pipeline at most once.
+    if (meshRenderingActive)
+    {
+        bool meshPipelineBound = false;
+        for (std::size_t index = begin; index < end; ++index)
+        {
+            const DrawItem& item = *items[index];
+            if (item.meshletCount == 0)
+            {
+                continue;
+            }
+            if (!meshPipelineBound)
+            {
+                secondary.BindPipeline(*m_gbufferMeshPipeline);
+                secondary.BindDescriptorSet(0, *m_sceneSets[frameIndex]);
+                secondary.BindDescriptorSet(1, *m_bindlessSet);
+                secondary.BindDescriptorSet(2, *m_meshSets[frameIndex]);
+                meshPipelineBound = true;
+            }
+            secondary.SetPushConstants(
+                &item.pushConstants,
+                sizeof(ObjectPushConstants),
+                rhi::ShaderStageMask::FragmentMesh);
+            if (meshCompactionActive && item.compactedOffset != kMeshletCullDisabled)
+            {
+                secondary.DrawMeshTasksIndirect(
+                    *m_meshletCommandBuffers[frameIndex],
+                    static_cast<std::uint64_t>(item.pushConstants.drawIndex) *
+                        sizeof(GpuMeshTaskCommand),
+                    1u,
+                    sizeof(GpuMeshTaskCommand));
+            }
+            else
+            {
+                secondary.DrawMeshTasks(item.meshletCount);
+            }
+        }
+    }
+
+    bool vertexPipelineBound = false;
     for (std::size_t index = begin; index < end; ++index)
     {
         const DrawItem& item = *items[index];
+        if (meshRenderingActive && item.meshletCount > 0)
+        {
+            continue;
+        }
+        if (!vertexPipelineBound)
+        {
+            secondary.BindPipeline(*m_gbufferPipeline);
+            secondary.BindDescriptorSet(0, *m_sceneSets[frameIndex]);
+            secondary.BindDescriptorSet(1, *m_bindlessSet);
+            vertexPipelineBound = true;
+        }
         secondary.BindVertexBuffer(*item.vertexBuffer);
         secondary.BindIndexBuffer(*item.indexBuffer);
         secondary.SetPushConstants(
@@ -2934,15 +3614,54 @@ void DeferredRenderer::RecordGBufferBatch(
     secondary.End();
 }
 
+void DeferredRenderer::RecordMeshletCullPass(
+    rhi::CommandList& commandList,
+    std::uint32_t frameIndex,
+    const std::vector<const DrawItem*>& items)
+{
+    MRE_PROFILE_ZONE_N("RecordMeshletCullPass");
+    MRE_ASSERT(m_meshletCullPipeline != nullptr, "RecordMeshletCullPass requires the cull pipeline");
+    MRE_ASSERT(m_meshletCompactionActive, "RecordMeshletCullPass requires active compaction");
+    MRE_ASSERT(frameIndex < m_sceneSets.size(), "Frame index out of range");
+    MRE_ASSERT(frameIndex < m_meshletCullSets.size(), "Frame index out of range");
+
+    commandList.BeginGpuZone("MeshletCull");
+    commandList.BindPipeline(*m_meshletCullPipeline);
+    commandList.BindDescriptorSet(0, *m_sceneSets[frameIndex]);
+    commandList.BindDescriptorSet(1, *m_meshletCullSets[frameIndex]);
+    commandList.BindDescriptorSet(2, *m_bindlessSet);
+
+    MeshletCullPushConstants cull{};
+    for (const DrawItem* item : items)
+    {
+        if (item->meshletCount == 0 || item->compactedOffset == kMeshletCullDisabled)
+        {
+            continue;
+        }
+
+        cull.model = item->pushConstants.model;
+        cull.drawIndex = item->pushConstants.drawIndex;
+        cull.meshletCount = item->meshletCount;
+        commandList.SetPushConstants(&cull, sizeof(cull), rhi::ShaderStageMask::Compute);
+        commandList.Dispatch(
+            (item->meshletCount + kMeshletCullGroupSize - 1u) / kMeshletCullGroupSize,
+            1u,
+            1u);
+    }
+
+    commandList.EndGpuZone();
+    commandList.MeshTaskIndirectBarrier();
+}
+
 void DeferredRenderer::BuildShadowCullItems()
 {
     m_shadowCullItems.clear();
 
-    // The ground plane spans 20x20 world units around the origin.
-    constexpr float kGroundRadius = 14.15f;
+    // The ground plane spans 20x20 world units at its default extent, scaled by SetGroundPlaneExtent.
+    const float groundRadius = 14.15f * (m_groundPlaneExtent / 10.0f);
     for (const DrawItem& item : m_sceneDrawItems)
     {
-        m_shadowCullItems.push_back(ShadowCullItem{&item, glm::vec3{0.0f}, kGroundRadius});
+        m_shadowCullItems.push_back(ShadowCullItem{&item, glm::vec3{0.0f}, groundRadius});
     }
 
     for (const SceneObjectInstance& instance : m_objectInstances)
@@ -3056,7 +3775,123 @@ void DeferredRenderer::BuildShadowViews()
     }
 }
 
-void DeferredRenderer::RecordShadowViews(std::uint32_t frameIndex)
+void DeferredRenderer::BuildShadowMeshletCull(std::uint32_t frameIndex)
+{
+    MRE_PROFILE_ZONE_N("BuildShadowMeshletCull");
+    m_shadowMeshletCompactionActive = false;
+    for (ShadowView& view : m_shadowViews)
+    {
+        view.meshDraws.clear();
+    }
+    if (m_shadowViews.empty() || !m_meshletRenderingEnabled || !m_meshletRenderingSupported ||
+        m_shadowMeshPipeline == nullptr)
+    {
+        return;
+    }
+
+    // Gather the mesh items of every view. Command indices and compacted offsets are assigned in
+    // view/item order so the cull pass and the per-view draw recording agree.
+    std::uint32_t commandCount = 0;
+    std::uint32_t meshletCount = 0;
+    for (ShadowView& view : m_shadowViews)
+    {
+        view.meshDraws.reserve(view.items.size());
+        for (const DrawItem* item : view.items)
+        {
+            if (item->meshletCount == 0)
+            {
+                continue;
+            }
+            view.meshDraws.push_back(ShadowMeshDraw{item, commandCount, meshletCount});
+            ++commandCount;
+            meshletCount += item->meshletCount;
+        }
+    }
+
+    const bool resourcesAvailable =
+        m_shadowCullPipeline != nullptr && frameIndex < m_shadowCullSets.size() &&
+        frameIndex < m_shadowMeshletIndexBuffers.size() &&
+        frameIndex < m_shadowMeshletCommandBuffers.size() &&
+        m_shadowCullSets[frameIndex] != nullptr &&
+        m_shadowMeshletIndexBuffers[frameIndex] != nullptr &&
+        m_shadowMeshletCommandBuffers[frameIndex] != nullptr;
+    const bool fits = commandCount <= kMaxShadowViews * kMaxObjectData &&
+                      meshletCount <= kShadowMeshletCompactionCapacity;
+    m_shadowMeshletCompactionActive = resourcesAvailable && fits;
+    if (!m_shadowMeshletCompactionActive)
+    {
+        for (ShadowView& view : m_shadowViews)
+        {
+            for (ShadowMeshDraw& draw : view.meshDraws)
+            {
+                draw.commandIndex = kMeshletCullDisabled;
+                draw.compactedOffset = kMeshletCullDisabled;
+            }
+        }
+        return;
+    }
+
+    // Rearm the per-view indirect commands: groupCountY/Z stay 1 and groupCountX is accumulated
+    // by the cull dispatches.
+    std::vector<std::uint32_t> commands(commandCount * 3u, 1u);
+    for (std::uint32_t command = 0; command < commandCount; ++command)
+    {
+        commands[command * 3u] = 0u;
+    }
+    if (!commands.empty())
+    {
+        m_shadowMeshletCommandBuffers[frameIndex]->Write(
+            commands.data(),
+            commands.size() * sizeof(std::uint32_t));
+    }
+}
+
+void DeferredRenderer::RecordShadowMeshletCullPass(
+    rhi::CommandList& commandList,
+    std::uint32_t frameIndex)
+{
+    MRE_PROFILE_ZONE_N("RecordShadowMeshletCullPass");
+    MRE_ASSERT(m_shadowCullPipeline != nullptr, "RecordShadowMeshletCullPass requires the cull pipeline");
+    MRE_ASSERT(
+        m_shadowMeshletCompactionActive,
+        "RecordShadowMeshletCullPass requires active compaction");
+    MRE_ASSERT(frameIndex < m_shadowSets.size(), "Frame index out of range");
+    MRE_ASSERT(frameIndex < m_shadowCullSets.size(), "Frame index out of range");
+
+    commandList.BeginGpuZone("ShadowMeshletCull");
+    commandList.BindPipeline(*m_shadowCullPipeline);
+    commandList.BindDescriptorSet(0, *m_shadowSets[frameIndex]);
+    commandList.BindDescriptorSet(1, *m_shadowCullSets[frameIndex]);
+    commandList.BindDescriptorSet(2, *m_bindlessSet);
+
+    ShadowCullPushConstants cull{};
+    for (const ShadowView& view : m_shadowViews)
+    {
+        for (const ShadowMeshDraw& meshDraw : view.meshDraws)
+        {
+            const DrawItem& item = *meshDraw.item;
+            cull.model = item.pushConstants.model;
+            cull.viewIndex = view.viewIndex;
+            cull.drawIndex = item.pushConstants.drawIndex;
+            cull.compactedOffset = meshDraw.compactedOffset;
+            cull.commandIndex = meshDraw.commandIndex;
+            cull.meshletCount = item.meshletCount;
+            commandList.SetPushConstants(&cull, sizeof(cull), rhi::ShaderStageMask::Compute);
+            commandList.Dispatch(
+                (item.meshletCount + kMeshletCullGroupSize - 1u) / kMeshletCullGroupSize,
+                1u,
+                1u);
+        }
+    }
+
+    commandList.EndGpuZone();
+    commandList.MeshTaskIndirectBarrier();
+}
+
+void DeferredRenderer::RecordShadowViews(
+    std::uint32_t frameIndex,
+    bool meshShadowActive,
+    bool meshCompactionActive)
 {
     MRE_PROFILE_ZONE_N("RecordShadowViews");
     MRE_ASSERT(m_jobSystem != nullptr, "RecordShadowViews requires a job system");
@@ -3064,6 +3899,15 @@ void DeferredRenderer::RecordShadowViews(std::uint32_t frameIndex)
     MRE_ASSERT(
         m_shadowViews.size() <= m_shadowSecondaries[frameIndex].size(),
         "Not enough shadow secondary command lists were allocated");
+    MRE_ASSERT(
+        !meshShadowActive ||
+            (m_shadowMeshPipeline != nullptr && frameIndex < m_shadowMeshSets.size()),
+        "Meshlet shadow views require the mesh pipeline and descriptor set");
+    MRE_ASSERT(
+        !meshCompactionActive ||
+            (frameIndex < m_shadowMeshletCommandBuffers.size() &&
+             m_shadowMeshletCommandBuffers[frameIndex] != nullptr),
+        "Meshlet shadow views require the cull command buffer");
 
     std::vector<std::future<void>> futures{};
     futures.reserve(m_shadowViews.size());
@@ -3080,9 +3924,16 @@ void DeferredRenderer::RecordShadowViews(std::uint32_t frameIndex)
         desc.depthAttachment.layer = view.layer;
         desc.area = view.area;
 
-        futures.push_back(m_jobSystem->Submit([this, frameIndex, secondary, &view, desc]() {
-            RecordShadowView(frameIndex, view.viewIndex, view.items, *secondary, desc);
-        }));
+        futures.push_back(m_jobSystem->Submit(
+            [this, frameIndex, secondary, &view, desc, meshShadowActive, meshCompactionActive]() {
+                RecordShadowView(
+                    frameIndex,
+                    view,
+                    meshShadowActive,
+                    meshCompactionActive,
+                    *secondary,
+                    desc);
+            }));
     }
 
     for (std::future<void>& future : futures)
@@ -3093,28 +3944,81 @@ void DeferredRenderer::RecordShadowViews(std::uint32_t frameIndex)
 
 void DeferredRenderer::RecordShadowView(
     std::uint32_t frameIndex,
-    std::uint32_t shadowViewIndex,
-    const std::vector<const DrawItem*>& items,
+    const ShadowView& view,
+    bool meshShadowActive,
+    bool meshCompactionActive,
     rhi::CommandList& secondary,
     const rhi::RenderingDesc& desc)
 {
     MRE_ASSERT(m_shadowPipeline != nullptr, "RecordShadowView requires the shadow pipeline");
     MRE_ASSERT(frameIndex < m_shadowSets.size(), "Frame index out of range");
+    MRE_ASSERT(
+        !meshShadowActive ||
+            (m_shadowMeshPipeline != nullptr && frameIndex < m_shadowMeshSets.size()),
+        "Meshlet shadow views require the mesh pipeline and descriptor set");
+    MRE_ASSERT(
+        !meshCompactionActive ||
+            (frameIndex < m_shadowMeshletCommandBuffers.size() &&
+             m_shadowMeshletCommandBuffers[frameIndex] != nullptr),
+        "Meshlet shadow views require the cull command buffer");
 
     secondary.BeginSecondary(desc);
+    secondary.BeginGpuZone("ShadowView");
+
+    ShadowPushConstants pushConstants{};
+    pushConstants.viewIndex = view.viewIndex;
+
+    // Mesh items first so the view binds each pipeline at most once.
+    if (meshShadowActive)
+    {
+        secondary.BindPipeline(*m_shadowMeshPipeline);
+        secondary.BindDescriptorSet(0, *m_shadowSets[frameIndex]);
+        secondary.BindDescriptorSet(1, *m_bindlessSet);
+        secondary.BindDescriptorSet(2, *m_shadowMeshSets[frameIndex]);
+        secondary.SetDepthBias(m_shadowSettings.depthBias, m_shadowSettings.depthBias * 1.5f, 0.0f);
+
+        const std::uint32_t meshPushConstantSize =
+            m_shadowMeshPipeline->GetPushConstantSize();
+        for (const ShadowMeshDraw& meshDraw : view.meshDraws)
+        {
+            const DrawItem& item = *meshDraw.item;
+            pushConstants.object = item.pushConstants;
+            pushConstants.compactedOffset = meshCompactionActive ? meshDraw.compactedOffset
+                                                                : kMeshletCullDisabled;
+            secondary.SetPushConstants(
+                &pushConstants,
+                meshPushConstantSize,
+                rhi::ShaderStageMask::FragmentMesh);
+            if (meshCompactionActive && meshDraw.compactedOffset != kMeshletCullDisabled)
+            {
+                secondary.DrawMeshTasksIndirect(
+                    *m_shadowMeshletCommandBuffers[frameIndex],
+                    static_cast<std::uint64_t>(meshDraw.commandIndex) *
+                        sizeof(GpuMeshTaskCommand),
+                    1u,
+                    sizeof(GpuMeshTaskCommand));
+            }
+            else
+            {
+                secondary.DrawMeshTasks(item.meshletCount);
+            }
+        }
+    }
+
     secondary.BindPipeline(*m_shadowPipeline);
     secondary.BindDescriptorSet(0, *m_shadowSets[frameIndex]);
     secondary.BindDescriptorSet(1, *m_bindlessSet);
     secondary.SetDepthBias(m_shadowSettings.depthBias, m_shadowSettings.depthBias * 1.5f, 0.0f);
-    secondary.BeginGpuZone("ShadowView");
-
-    ShadowPushConstants pushConstants{};
-    pushConstants.viewIndex = shadowViewIndex;
 
     const std::uint32_t pushConstantSize = m_shadowPipeline->GetPushConstantSize();
-    for (const DrawItem* item : items)
+    for (const DrawItem* item : view.items)
     {
+        if (meshShadowActive && item->meshletCount > 0)
+        {
+            continue;
+        }
         pushConstants.object = item->pushConstants;
+        pushConstants.compactedOffset = kMeshletCullDisabled;
         secondary.BindVertexBuffer(*item->vertexBuffer);
         secondary.BindIndexBuffer(*item->indexBuffer);
         secondary.SetPushConstants(
@@ -3199,6 +4103,41 @@ bool DeferredRenderer::LoadShaders(rhi::Device& device, const std::filesystem::p
     m_cloudGodRayShader = device.CreateShader(
         rhi::ShaderStage::Compute,
         shaderDirectory / "cloud_godrays.comp.spv");
+    m_sssBlurShader = device.CreateShader(
+        rhi::ShaderStage::Compute,
+        shaderDirectory / "sss_blur.comp.spv");
+    m_compositeShader = device.CreateShader(
+        rhi::ShaderStage::Fragment,
+        shaderDirectory / "composite.frag.spv");
+
+    // Meshlet rendering is optional: devices without mesh shaders keep the vertex pipeline.
+    if (device.IsMeshShaderSupported())
+    {
+        m_gbufferMeshShader = device.CreateShader(
+            rhi::ShaderStage::Mesh,
+            shaderDirectory / "gbuffer.mesh.spv");
+        m_shadowMeshShader = device.CreateShader(
+            rhi::ShaderStage::Mesh,
+            shaderDirectory / "shadow.mesh.spv");
+        m_shadowCullShader = device.CreateShader(
+            rhi::ShaderStage::Compute,
+            shaderDirectory / "shadow_cull.comp.spv");
+        m_meshletCullShader = device.CreateShader(
+            rhi::ShaderStage::Compute,
+            shaderDirectory / "meshlet_cull.comp.spv");
+        if (m_gbufferMeshShader == nullptr || m_shadowMeshShader == nullptr)
+        {
+            MRE_WARN("Failed to load the mesh shaders; meshlet rendering stays disabled");
+        }
+        if (m_meshletCullShader == nullptr)
+        {
+            MRE_WARN("Failed to load the meshlet cull shader; meshlets cull in the mesh shader");
+        }
+        if (m_shadowCullShader == nullptr)
+        {
+            MRE_WARN("Failed to load the shadow cull shader; shadow meshlets cull in the shader");
+        }
+    }
 
     if (m_gbufferVertexShader == nullptr || m_gbufferFragmentShader == nullptr ||
         m_transparentFragmentShader == nullptr ||
@@ -3211,7 +4150,8 @@ bool DeferredRenderer::LoadShaders(rhi::Device& device, const std::filesystem::p
         m_reflectionTemporalShader == nullptr || m_reflectionUpsampleShader == nullptr ||
         m_debugLineVertexShader == nullptr || m_debugLineFragmentShader == nullptr ||
         m_cloudShader == nullptr || m_cloudUpsampleShader == nullptr ||
-        m_cloudReprojectShader == nullptr || m_cloudGodRayShader == nullptr)
+        m_cloudReprojectShader == nullptr || m_cloudGodRayShader == nullptr ||
+        m_sssBlurShader == nullptr || m_compositeShader == nullptr)
     {
         MRE_CRITICAL("Failed to load the deferred shaders from '{}'", PathToUtf8(shaderDirectory));
         return false;
@@ -3246,6 +4186,48 @@ bool DeferredRenderer::CreatePipelines(rhi::Device& device)
     gbufferPipelineDesc.depthFormat = rhi::Format::D32Sfloat;
     m_gbufferPipeline = device.CreatePipeline(gbufferPipelineDesc);
 
+    // Meshlet variant of the opaque G-buffer pass; the fragment stage and attachments match.
+    if (m_gbufferMeshShader != nullptr && m_meshSetLayout != nullptr)
+    {
+        const std::array<const rhi::Shader*, 2> gbufferMeshStages{
+            m_gbufferMeshShader.get(),
+            m_gbufferFragmentShader.get()};
+        rhi::PipelineDesc gbufferMeshPipelineDesc{};
+        gbufferMeshPipelineDesc.meshShader = m_gbufferMeshShader.get();
+        gbufferMeshPipelineDesc.fragmentShader = m_gbufferFragmentShader.get();
+        rhi::ApplyShaderReflection(gbufferMeshPipelineDesc, gbufferMeshStages);
+        gbufferMeshPipelineDesc.depthTest = true;
+        gbufferMeshPipelineDesc.depthWrite = true;
+        gbufferMeshPipelineDesc.blend = false;
+        gbufferMeshPipelineDesc.cullMode = rhi::CullMode::None;
+        gbufferMeshPipelineDesc.descriptorSetLayouts = {
+            m_sceneSetLayout.get(),
+            m_bindlessSetLayout.get(),
+            m_meshSetLayout.get()};
+        gbufferMeshPipelineDesc.colorFormats = gbufferPipelineDesc.colorFormats;
+        gbufferMeshPipelineDesc.depthFormat = rhi::Format::D32Sfloat;
+        m_gbufferMeshPipeline = device.CreatePipeline(gbufferMeshPipelineDesc);
+    }
+
+    // Compute cull feeding the G-buffer meshlet draws: set 0 is the scene uniform set, set 1 the
+    // mesh draw/compaction/indirect buffers and set 2 the bindless meshlet data.
+    if (m_meshletCullShader != nullptr && m_meshletCullSetLayout != nullptr)
+    {
+        const std::array<const rhi::Shader*, 1> cullStages{m_meshletCullShader.get()};
+        rhi::PipelineDesc meshletCullPipelineDesc{};
+        meshletCullPipelineDesc.computeShader = m_meshletCullShader.get();
+        rhi::ApplyShaderReflection(meshletCullPipelineDesc, cullStages);
+        meshletCullPipelineDesc.descriptorSetLayouts = {
+            m_sceneSetLayout.get(),
+            m_meshletCullSetLayout.get(),
+            m_bindlessSetLayout.get()};
+        m_meshletCullPipeline = device.CreatePipeline(meshletCullPipelineDesc);
+        if (m_meshletCullPipeline == nullptr)
+        {
+            MRE_WARN("Failed to create the meshlet cull pipeline; meshlets cull in the mesh shader");
+        }
+    }
+
     // Forward pass for alpha blended materials: shares the G-buffer vertex shader, blends over the
     // lit image and tests against the opaque depth without writing it.
     const std::array<const rhi::Shader*, 2> transparentStages{
@@ -3260,7 +4242,12 @@ bool DeferredRenderer::CreatePipelines(rhi::Device& device)
     transparentPipelineDesc.blend = true;
     transparentPipelineDesc.cullMode = rhi::CullMode::None;
     transparentPipelineDesc.descriptorSetLayouts = {m_sceneSetLayout.get(), m_bindlessSetLayout.get()};
-    transparentPipelineDesc.colorFormats = {device.GetSwapchainInfo().format};
+    // The transparent pass renders into the offscreen HDR lighting scope, which has two
+    // attachments; the pipeline must declare the matching attachment count (the subsurface target
+    // keeps its cleared value).
+    transparentPipelineDesc.colorFormats = {
+        rhi::Format::R16G16B16A16Sfloat,
+        rhi::Format::R16G16B16A16Sfloat};
     transparentPipelineDesc.depthFormat = rhi::Format::D32Sfloat;
     m_transparentPipeline = device.CreatePipeline(transparentPipelineDesc);
 
@@ -3271,13 +4258,48 @@ bool DeferredRenderer::CreatePipelines(rhi::Device& device)
     lightingPipelineDesc.depthWrite = false;
     lightingPipelineDesc.blend = false;
     lightingPipelineDesc.cullMode = rhi::CullMode::None;
-    // Set 1 is the bindless material set used for the emissive texture lookup.
+    // Set 1 is the bindless material set used for the emissive/subsurface texture lookups.
     lightingPipelineDesc.descriptorSetLayouts = {m_lightingSetLayout.get(), m_bindlessSetLayout.get()};
-    lightingPipelineDesc.colorFormats = {device.GetSwapchainInfo().format};
-    // The swapchain scope attaches the G-buffer depth for the transparent pass; pipelines drawn in
-    // that scope must declare the matching depth format even when depth testing is disabled.
+    // Attachment 0: HDR lit image, attachment 1: subsurface diffuse source (blurred before the
+    // composite adds it and applies tone mapping).
+    lightingPipelineDesc.colorFormats = {
+        rhi::Format::R16G16B16A16Sfloat,
+        rhi::Format::R16G16B16A16Sfloat};
     lightingPipelineDesc.depthFormat = rhi::Format::D32Sfloat;
     m_lightingPipeline = device.CreatePipeline(lightingPipelineDesc);
+
+    if (m_sssBlurShader != nullptr)
+    {
+        const std::array<const rhi::Shader*, 1> sssBlurStages{m_sssBlurShader.get()};
+        m_sssBlurSetLayout =
+            device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(sssBlurStages, 0));
+
+        rhi::PipelineDesc sssBlurPipelineDesc{};
+        sssBlurPipelineDesc.computeShader = m_sssBlurShader.get();
+        sssBlurPipelineDesc.descriptorSetLayouts = {m_sssBlurSetLayout.get()};
+        sssBlurPipelineDesc.pushConstantSize = sizeof(SssBlurPushConstants);
+        sssBlurPipelineDesc.pushConstantStages = rhi::ShaderStageMask::Compute;
+        m_sssBlurPipeline = device.CreatePipeline(sssBlurPipelineDesc);
+    }
+
+    if (m_compositeShader != nullptr)
+    {
+        const std::array<const rhi::Shader*, 1> compositeStages{m_compositeShader.get()};
+        m_compositeSetLayout =
+            device.CreateDescriptorSetLayout(rhi::MergeShaderReflectionBindings(compositeStages, 0));
+
+        rhi::PipelineDesc compositePipelineDesc{};
+        compositePipelineDesc.vertexShader = m_lightingVertexShader.get();
+        compositePipelineDesc.fragmentShader = m_compositeShader.get();
+        compositePipelineDesc.descriptorSetLayouts = {m_compositeSetLayout.get()};
+        compositePipelineDesc.pushConstantSize = sizeof(CompositePushConstants);
+        compositePipelineDesc.pushConstantStages = rhi::ShaderStageMask::Fragment;
+        compositePipelineDesc.cullMode = rhi::CullMode::None;
+        compositePipelineDesc.colorFormats = {device.GetSwapchainInfo().format};
+        // Drawn in the swapchain scope that also hosts the debug line pass (depth test disabled).
+        compositePipelineDesc.depthFormat = rhi::Format::D32Sfloat;
+        m_compositePipeline = device.CreatePipeline(compositePipelineDesc);
+    }
 
     rhi::PipelineDesc clusterPipelineDesc{};
     clusterPipelineDesc.computeShader = m_clusterCullingShader.get();
@@ -3306,6 +4328,46 @@ bool DeferredRenderer::CreatePipelines(rhi::Device& device)
     shadowPipelineDesc.descriptorSetLayouts = {m_shadowSetLayout.get(), m_bindlessSetLayout.get()};
     shadowPipelineDesc.depthFormat = rhi::Format::D32Sfloat;
     m_shadowPipeline = device.CreatePipeline(shadowPipelineDesc);
+
+    if (m_shadowMeshShader != nullptr && m_meshSetLayout != nullptr)
+    {
+        const std::array<const rhi::Shader*, 2> shadowMeshStages{
+            m_shadowMeshShader.get(),
+            m_shadowFragmentShader.get()};
+        rhi::PipelineDesc shadowMeshPipelineDesc{};
+        shadowMeshPipelineDesc.meshShader = m_shadowMeshShader.get();
+        shadowMeshPipelineDesc.fragmentShader = m_shadowFragmentShader.get();
+        rhi::ApplyShaderReflection(shadowMeshPipelineDesc, shadowMeshStages);
+        shadowMeshPipelineDesc.depthTest = true;
+        shadowMeshPipelineDesc.depthWrite = true;
+        shadowMeshPipelineDesc.depthBiasEnable = true;
+        shadowMeshPipelineDesc.cullMode = rhi::CullMode::None;
+        shadowMeshPipelineDesc.descriptorSetLayouts = {
+            m_shadowSetLayout.get(),
+            m_bindlessSetLayout.get(),
+            m_meshSetLayout.get()};
+        shadowMeshPipelineDesc.depthFormat = rhi::Format::D32Sfloat;
+        m_shadowMeshPipeline = device.CreatePipeline(shadowMeshPipelineDesc);
+    }
+
+    // Compute cull for the shadow views: set 0 is the shadow uniform set, set 1 the mesh
+    // draw/compaction/indirect buffers and set 2 the bindless meshlet data.
+    if (m_shadowCullShader != nullptr && m_shadowCullSetLayout != nullptr)
+    {
+        const std::array<const rhi::Shader*, 1> shadowCullStages{m_shadowCullShader.get()};
+        rhi::PipelineDesc shadowCullPipelineDesc{};
+        shadowCullPipelineDesc.computeShader = m_shadowCullShader.get();
+        rhi::ApplyShaderReflection(shadowCullPipelineDesc, shadowCullStages);
+        shadowCullPipelineDesc.descriptorSetLayouts = {
+            m_shadowSetLayout.get(),
+            m_shadowCullSetLayout.get(),
+            m_bindlessSetLayout.get()};
+        m_shadowCullPipeline = device.CreatePipeline(shadowCullPipelineDesc);
+        if (m_shadowCullPipeline == nullptr)
+        {
+            MRE_WARN("Failed to create the shadow cull pipeline; shadow meshlets cull in the shader");
+        }
+    }
 
     const auto createGiPipeline = [&device](
                                       const rhi::Shader& shader,
@@ -3424,7 +4486,7 @@ bool DeferredRenderer::CreateScene()
     ground.indexBuffer = m_planeIndexBuffer;
     ground.indexCount = static_cast<std::uint32_t>(std::size(kPlaneIndices));
     ground.firstIndex = 0;
-    ground.pushConstants.model = glm::mat4{1.0f};
+    ground.pushConstants.model = glm::scale(glm::mat4{1.0f}, glm::vec3{m_groundPlaneExtent / 10.0f});
     ground.pushConstants.baseColorFactor = glm::vec4{0.35f, 0.35f, 0.38f, 1.0f};
     ground.pushConstants.params = glm::vec4{0.9f, 0.0f, 0.0f, 0.0f};
     const std::uint32_t whiteIndex = m_whiteTexture->GetBindlessIndex();
@@ -3465,7 +4527,12 @@ bool DeferredRenderer::CreateScene()
         m_blasDirty = true;
     }
 
-    m_sceneDrawItems.push_back(ground);
+    m_groundDrawItem = ground;
+    m_groundDrawItemValid = true;
+    if (m_groundVisible)
+    {
+        m_sceneDrawItems.push_back(ground);
+    }
 
     MRE_ASSERT(m_planeVertexBuffer != nullptr, "Failed to create the ground plane vertex buffer");
     return true;
@@ -3707,6 +4774,131 @@ bool DeferredRenderer::CreateClusterResources(rhi::Device& device)
     return true;
 }
 
+void DeferredRenderer::CreateMeshletResources(rhi::Device& device)
+{
+    if (m_meshSetLayout == nullptr)
+    {
+        return;
+    }
+
+    const std::uint32_t framesInFlight = device.GetFramesInFlight();
+    m_meshDrawBuffers.clear();
+    m_meshletIndexBuffers.clear();
+    m_meshletCommandBuffers.clear();
+    m_meshSets.clear();
+    m_meshletCullSets.clear();
+    m_shadowMeshletIndexBuffers.clear();
+    m_shadowMeshletCommandBuffers.clear();
+    m_shadowMeshSets.clear();
+    m_shadowCullSets.clear();
+    m_meshDrawBuffers.reserve(framesInFlight);
+    m_meshletIndexBuffers.reserve(framesInFlight);
+    m_meshletCommandBuffers.reserve(framesInFlight);
+    m_meshSets.reserve(framesInFlight);
+    m_meshletCullSets.reserve(framesInFlight);
+    m_shadowMeshletIndexBuffers.reserve(framesInFlight);
+    m_shadowMeshletCommandBuffers.reserve(framesInFlight);
+    m_shadowMeshSets.reserve(framesInFlight);
+    m_shadowCullSets.reserve(framesInFlight);
+    for (std::uint32_t frame = 0; frame < framesInFlight; ++frame)
+    {
+        m_meshDrawBuffers.push_back(device.CreateBuffer(
+            rhi::BufferDesc{kMaxObjectData * sizeof(GpuMeshDraw), rhi::BufferUsage::Storage, true}));
+        if (m_meshDrawBuffers.back() == nullptr)
+        {
+            MRE_CRITICAL("Failed to create the mesh draw data buffer");
+            return;
+        }
+
+        // The compute cull writes the visible meshlet indices of every draw into this frame buffer.
+        m_meshletIndexBuffers.push_back(device.CreateBuffer(rhi::BufferDesc{
+            kMeshletCompactionCapacity * sizeof(std::uint32_t),
+            rhi::BufferUsage::Storage}));
+        if (m_meshletIndexBuffers.back() == nullptr)
+        {
+            MRE_CRITICAL("Failed to create the meshlet compaction buffer");
+            return;
+        }
+
+        std::unique_ptr<rhi::DescriptorSet> meshSet = device.CreateDescriptorSet(*m_meshSetLayout);
+        meshSet->BindBuffer(0, *m_meshDrawBuffers.back());
+        meshSet->BindBuffer(1, *m_meshletIndexBuffers.back());
+        m_meshSets.push_back(std::move(meshSet));
+
+        if (m_meshletCullSetLayout != nullptr)
+        {
+            // Host visible so the per-frame command reset can rearm the indirect group counts.
+            m_meshletCommandBuffers.push_back(device.CreateBuffer(rhi::BufferDesc{
+                kMaxObjectData * sizeof(GpuMeshTaskCommand),
+                rhi::BufferUsage::Storage,
+                true,
+                false,
+                0,
+                false,
+                true}));
+            if (m_meshletCommandBuffers.back() == nullptr)
+            {
+                MRE_CRITICAL("Failed to create the meshlet cull command buffer");
+                return;
+            }
+
+            std::unique_ptr<rhi::DescriptorSet> cullSet =
+                device.CreateDescriptorSet(*m_meshletCullSetLayout);
+            cullSet->BindBuffer(0, *m_meshDrawBuffers.back());
+            cullSet->BindBuffer(1, *m_meshletIndexBuffers.back());
+            cullSet->BindBuffer(2, *m_meshletCommandBuffers.back());
+            m_meshletCullSets.push_back(std::move(cullSet));
+        }
+
+        if (m_shadowCullSetLayout != nullptr)
+        {
+            // Shadow views compact into their own per-frame list and indirect commands.
+            m_shadowMeshletIndexBuffers.push_back(device.CreateBuffer(rhi::BufferDesc{
+                kShadowMeshletCompactionCapacity * sizeof(std::uint32_t),
+                rhi::BufferUsage::Storage}));
+            if (m_shadowMeshletIndexBuffers.back() == nullptr)
+            {
+                MRE_CRITICAL("Failed to create the shadow meshlet compaction buffer");
+                return;
+            }
+
+            m_shadowMeshletCommandBuffers.push_back(device.CreateBuffer(rhi::BufferDesc{
+                kMaxShadowViews * kMaxObjectData * sizeof(GpuMeshTaskCommand),
+                rhi::BufferUsage::Storage,
+                true,
+                false,
+                0,
+                false,
+                true}));
+            if (m_shadowMeshletCommandBuffers.back() == nullptr)
+            {
+                MRE_CRITICAL("Failed to create the shadow meshlet cull command buffer");
+                return;
+            }
+
+            std::unique_ptr<rhi::DescriptorSet> shadowCullSet =
+                device.CreateDescriptorSet(*m_shadowCullSetLayout);
+            shadowCullSet->BindBuffer(0, *m_meshDrawBuffers.back());
+            shadowCullSet->BindBuffer(1, *m_shadowMeshletIndexBuffers.back());
+            shadowCullSet->BindBuffer(2, *m_shadowMeshletCommandBuffers.back());
+            m_shadowCullSets.push_back(std::move(shadowCullSet));
+        }
+
+        // The shadow mesh shader remaps through the shadow compaction list; bind the G-buffer list
+        // as a valid placeholder when shadow culling is unavailable (the sentinel path never reads
+        // it).
+        const rhi::Buffer* shadowIndexBuffer =
+            m_shadowMeshletIndexBuffers.size() == static_cast<std::size_t>(frame) + 1u
+                ? m_shadowMeshletIndexBuffers.back().get()
+                : m_meshletIndexBuffers.back().get();
+        std::unique_ptr<rhi::DescriptorSet> shadowMeshSet =
+            device.CreateDescriptorSet(*m_meshSetLayout);
+        shadowMeshSet->BindBuffer(0, *m_meshDrawBuffers.back());
+        shadowMeshSet->BindBuffer(1, *shadowIndexBuffer);
+        m_shadowMeshSets.push_back(std::move(shadowMeshSet));
+    }
+}
+
 void DeferredRenderer::SetLights(std::span<const Light> lights)
 {
     m_lights.assign(lights.begin(), lights.end());
@@ -3837,7 +5029,10 @@ void DeferredRenderer::UpdateUniforms(std::uint32_t frameIndex, const FrameView&
     m_sceneUniform.screenSize = glm::vec4{
         static_cast<float>(m_gbuffer.GetWidth()),
         static_cast<float>(m_gbuffer.GetHeight()),
-        m_clusterDebugView ? 1.0f : 0.0f,
+        // z: debug view selection (0 = lit, 1 = cluster light count heatmap, 2 = GI only,
+        // 3 = per-meshlet colors).
+        m_meshletDebugView ? 3.0f
+                           : (m_giDebugView ? 2.0f : (m_clusterDebugView ? 1.0f : 0.0f)),
         IsPerPixelGiActive() ? 1.0f : 0.0f};
     // ambientColor.w carries the active GI probe count to the lighting pass (0 disables them).
     m_sceneUniform.ambientColor.w =
@@ -4081,6 +5276,231 @@ bool DeferredRenderer::IsProbeGiActive() const
     return m_giSettings.enabled && m_giSettings.useProbes &&
            m_device != nullptr && m_device->IsRayTracingSupported() &&
            m_giProbePipeline != nullptr && !m_giProbeData.empty();
+}
+
+bool DeferredRenderer::ReadGiProbes(std::vector<GpuGiProbe>& out)
+{
+    out.clear();
+    if (m_giProbeBuffer == nullptr || m_giProbeData.empty() || m_device == nullptr)
+    {
+        return false;
+    }
+
+    m_device->WaitIdle();
+    out.resize(m_giProbeData.size());
+    if (!m_giProbeBuffer->Read(out.data(), out.size() * sizeof(GpuGiProbe)))
+    {
+        return false;
+    }
+
+    // Keep the CPU copy's SH and depth current for the debug gizmos; the positions stay untouched
+    // and the data is not re-uploaded (the GPU owns the accumulated coefficients).
+    for (std::size_t index = 0; index < m_giProbeData.size(); ++index)
+    {
+        m_giProbeData[index].sh0 = out[index].sh0;
+        m_giProbeData[index].shX = out[index].shX;
+        m_giProbeData[index].shY = out[index].shY;
+        m_giProbeData[index].shZ = out[index].shZ;
+        m_giProbeData[index].depth = out[index].depth;
+    }
+    return true;
+}
+
+bool DeferredRenderer::CreateSssResources(rhi::Device& device)
+{
+    m_lightingColor.reset();
+    m_sssSource.reset();
+    m_sssBlurTargets[0].reset();
+    m_sssBlurTargets[1].reset();
+    m_sssLut.reset();
+    m_sssSampler.reset();
+    m_sssBlurSets.clear();
+    m_compositeSet.reset();
+
+    const std::uint32_t width = m_gbuffer.GetWidth();
+    const std::uint32_t height = m_gbuffer.GetHeight();
+    if (width == 0 || height == 0)
+    {
+        return false;
+    }
+
+    m_sssHalfWidth = std::max(1u, width / 2u);
+    m_sssHalfHeight = std::max(1u, height / 2u);
+
+    m_lightingColor = device.CreateTexture(rhi::TextureDesc{
+        width,
+        height,
+        rhi::Format::R16G16B16A16Sfloat,
+        rhi::TextureUsage::ColorAttachment});
+    m_sssSource = device.CreateTexture(rhi::TextureDesc{
+        width,
+        height,
+        rhi::Format::R16G16B16A16Sfloat,
+        rhi::TextureUsage::ColorAttachment});
+    m_sssBlurTargets[0] = device.CreateTexture(rhi::TextureDesc{
+        m_sssHalfWidth,
+        m_sssHalfHeight,
+        rhi::Format::R16G16B16A16Sfloat,
+        rhi::TextureUsage::Storage});
+    m_sssBlurTargets[1] = device.CreateTexture(rhi::TextureDesc{
+        m_sssHalfWidth,
+        m_sssHalfHeight,
+        rhi::Format::R16G16B16A16Sfloat,
+        rhi::TextureUsage::Storage});
+
+    std::vector<float> lutPixels{};
+    BuildSubsurfaceLut(lutPixels);
+    m_sssLut = device.CreateTexture(rhi::TextureDesc{
+        kSubsurfaceLutWidth,
+        kSubsurfaceLutHeight,
+        rhi::Format::R32G32B32A32Sfloat,
+        rhi::TextureUsage::Sampled,
+        lutPixels.data(),
+        lutPixels.size() * sizeof(float)});
+    m_sssSampler = device.CreateSampler(rhi::SamplerDesc{});
+
+    if (m_lightingColor == nullptr || m_sssSource == nullptr ||
+        m_sssBlurTargets[0] == nullptr || m_sssBlurTargets[1] == nullptr ||
+        m_sssLut == nullptr || m_sssSampler == nullptr)
+    {
+        MRE_CRITICAL("Failed to create the subsurface scattering resources");
+        return false;
+    }
+    return true;
+}
+
+// Descriptor sets are created lazily after the first lighting pass: the color targets are in the
+// undefined layout at creation and only become shader readable when the pass ends.
+void DeferredRenderer::CreateSssDescriptorSets()
+{
+    if (m_device == nullptr || m_sssBlurPipeline == nullptr || m_sssBlurSetLayout == nullptr ||
+        m_compositeSetLayout == nullptr || m_lightingColor == nullptr || m_sssSource == nullptr ||
+        m_sssBlurTargets[0] == nullptr || m_sssBlurTargets[1] == nullptr || m_sssLut == nullptr ||
+        m_sssSampler == nullptr)
+    {
+        return;
+    }
+
+    if (m_sssBlurSets.empty())
+    {
+        constexpr std::uint32_t kMaxPasses = 6; // 3 iterations * (horizontal + vertical)
+        m_sssBlurSets.reserve(kMaxPasses);
+        for (std::uint32_t pass = 0; pass < kMaxPasses; ++pass)
+        {
+            const bool horizontal = (pass % 2u) == 0u;
+            rhi::Texture* source = m_sssSource.get();
+            if (pass > 0)
+            {
+                source = horizontal ? m_sssBlurTargets[1].get() : m_sssBlurTargets[0].get();
+            }
+            rhi::Texture* dest =
+                horizontal ? m_sssBlurTargets[0].get() : m_sssBlurTargets[1].get();
+
+            std::unique_ptr<rhi::DescriptorSet> set =
+                m_device->CreateDescriptorSet(*m_sssBlurSetLayout);
+            set->BindTexture(0, *source, 0u);
+            set->BindSampler(1, *m_sssSampler);
+            set->BindTexture(2, m_gbuffer.GetPosition(), 0u);
+            set->BindTexture(3, *m_sssLut, 0u);
+            set->BindSampler(4, *m_sssSampler);
+            set->BindStorageImage(5, *dest);
+            m_sssBlurSets.push_back(std::move(set));
+        }
+    }
+
+    if (m_compositeSet == nullptr)
+    {
+        m_compositeSet = m_device->CreateDescriptorSet(*m_compositeSetLayout);
+        m_compositeSet->BindTexture(0, *m_lightingColor, 0u);
+        m_compositeSet->BindTexture(1, *m_sssSource, 0u);
+        m_compositeSet->BindTexture(2, *m_sssBlurTargets[1], 0u);
+        m_compositeSet->BindSampler(3, *m_sssSampler);
+    }
+}
+
+void DeferredRenderer::RecordSssPasses(rhi::CommandList& commandList, const FrameView& view)
+{
+    if (m_sssBlurPipeline == nullptr || !m_hasSssMaterials)
+    {
+        return;
+    }
+
+    if (m_sssBlurSets.empty())
+    {
+        return;
+    }
+
+    const std::uint32_t iterations =
+        std::clamp(m_sssSettings.iterations, 1u, 3u);
+    const float radius =
+        std::clamp(m_sssSettings.radiusPixels, 1.0f, kSubsurfaceLutRadiusMaxPx);
+    const float logMin = std::log(kSubsurfaceLutRadiusMinPx);
+    const float logMax = std::log(kSubsurfaceLutRadiusMaxPx);
+    const float logRange = std::max(logMax - logMin, 1.0e-4f);
+
+    commandList.BeginGpuZone("SssBlur");
+    commandList.BindPipeline(*m_sssBlurPipeline);
+    for (std::uint32_t pass = 0; pass < 2u * iterations; ++pass)
+    {
+        if (pass > 0)
+        {
+            commandList.ShaderMemoryBarrier(
+                rhi::ShaderStageMask::Compute,
+                rhi::ShaderStageMask::Compute);
+        }
+
+        const bool horizontal = (pass % 2u) == 0u;
+        const std::uint32_t sourceWidth =
+            pass == 0 ? m_gbuffer.GetWidth() : m_sssHalfWidth;
+        const std::uint32_t sourceHeight =
+            pass == 0 ? m_gbuffer.GetHeight() : m_sssHalfHeight;
+        const float spacing =
+            std::max(radius / 4.0f, 0.5f) * static_cast<float>(1u + pass / 2u);
+
+        SssBlurPushConstants push{};
+        push.params = glm::vec4{
+            radius,
+            std::max(m_sssSettings.depthTolerance, 0.01f),
+            spacing,
+            0.0f};
+        push.fullSize = glm::vec4{
+            static_cast<float>(m_gbuffer.GetWidth()),
+            static_cast<float>(m_gbuffer.GetHeight()),
+            0.0f,
+            0.0f};
+        push.sourceSize = glm::vec4{
+            static_cast<float>(sourceWidth),
+            static_cast<float>(sourceHeight),
+            0.0f,
+            0.0f};
+        push.destSize = glm::vec4{
+            static_cast<float>(m_sssHalfWidth),
+            static_cast<float>(m_sssHalfHeight),
+            0.0f,
+            0.0f};
+        push.direction = horizontal ? glm::vec4{1.0f, 0.0f, 0.0f, 0.0f}
+                                    : glm::vec4{0.0f, 1.0f, 0.0f, 0.0f};
+        push.cameraPosition = glm::vec4{view.position, 1.0f};
+        push.projection = glm::vec4{
+            std::tan(std::max(view.fovYRadians, 1.0e-3f) * 0.5f),
+            static_cast<float>(m_gbuffer.GetHeight()),
+            0.0f,
+            0.0f};
+        push.lutParams = glm::vec4{1.0f / logRange, -logMin / logRange, 0.0f, 0.0f};
+
+        commandList.BindDescriptorSet(0, *m_sssBlurSets[pass]);
+        commandList.SetPushConstants(&push, sizeof(push), rhi::ShaderStageMask::Compute);
+        commandList.Dispatch(
+            (m_sssHalfWidth + 7u) / 8u,
+            (m_sssHalfHeight + 7u) / 8u,
+            1);
+    }
+    commandList.EndGpuZone();
+}
+
+bool DeferredRenderer::IsSssActive() const
+{
+    return m_sssSettings.enabled && m_hasSssMaterials && m_sssBlurPipeline != nullptr;
 }
 
 bool DeferredRenderer::IsPerPixelGiActive() const

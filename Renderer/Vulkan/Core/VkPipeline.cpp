@@ -60,32 +60,54 @@ VkPipeline::VkPipeline(const vk::raii::Device& device, const rhi::PipelineDesc& 
         return;
     }
 
-    MRE_ASSERT(desc.vertexShader != nullptr, "PipelineDesc requires a vertex shader");
+    const bool isMeshPipeline = desc.meshShader != nullptr;
+    MRE_ASSERT(
+        isMeshPipeline || desc.vertexShader != nullptr,
+        "PipelineDesc requires a vertex or a mesh shader");
     MRE_ASSERT(desc.fragmentShader != nullptr, "PipelineDesc requires a fragment shader");
+    MRE_ASSERT(
+        !isMeshPipeline || desc.vertexShader == nullptr,
+        "A mesh pipeline must not declare a vertex shader");
     MRE_ASSERT(
         !desc.colorFormats.empty() || desc.depthFormat != rhi::Format::Undefined,
         "PipelineDesc requires at least one color format or a depth format");
 
-    const auto* vertexShader = static_cast<const VkShader*>(desc.vertexShader);
     const auto* fragmentShader = static_cast<const VkShader*>(desc.fragmentShader);
-    MRE_ASSERT(vertexShader->GetStage() == rhi::ShaderStage::Vertex, "The vertex shader has the wrong stage");
     MRE_ASSERT(fragmentShader->GetStage() == rhi::ShaderStage::Fragment, "The fragment shader has the wrong stage");
 
-    const std::string vertexEntryPoint{desc.vertexEntryPoint};
     const std::string fragmentEntryPoint{desc.fragmentEntryPoint};
+    const std::string vertexEntryPoint{desc.vertexEntryPoint};
+    const std::string meshEntryPoint{desc.meshEntryPoint};
 
-    const std::array<vk::PipelineShaderStageCreateInfo, 2> shaderStages{
-        vk::PipelineShaderStageCreateInfo{}
-            .setStage(vk::ShaderStageFlagBits::eVertex)
-            .setModule(vertexShader->GetHandle())
-            .setPName(vertexEntryPoint.c_str()),
+    std::vector<vk::PipelineShaderStageCreateInfo> shaderStages{};
+    shaderStages.reserve(2);
+    if (isMeshPipeline)
+    {
+        const auto* meshShader = static_cast<const VkShader*>(desc.meshShader);
+        MRE_ASSERT(meshShader->GetStage() == rhi::ShaderStage::Mesh, "The mesh shader has the wrong stage");
+        shaderStages.push_back(
+            vk::PipelineShaderStageCreateInfo{}
+                .setStage(vk::ShaderStageFlagBits::eMeshEXT)
+                .setModule(meshShader->GetHandle())
+                .setPName(meshEntryPoint.c_str()));
+    }
+    else
+    {
+        const auto* vertexShader = static_cast<const VkShader*>(desc.vertexShader);
+        MRE_ASSERT(vertexShader->GetStage() == rhi::ShaderStage::Vertex, "The vertex shader has the wrong stage");
+        shaderStages.push_back(
+            vk::PipelineShaderStageCreateInfo{}
+                .setStage(vk::ShaderStageFlagBits::eVertex)
+                .setModule(vertexShader->GetHandle())
+                .setPName(vertexEntryPoint.c_str()));
+    }
+    shaderStages.push_back(
         vk::PipelineShaderStageCreateInfo{}
             .setStage(vk::ShaderStageFlagBits::eFragment)
             .setModule(fragmentShader->GetHandle())
-            .setPName(fragmentEntryPoint.c_str()),
-    };
+            .setPName(fragmentEntryPoint.c_str()));
 
-    const bool hasVertexInput = desc.vertexLayout.GetStride() > 0;
+    const bool hasVertexInput = !isMeshPipeline && desc.vertexLayout.GetStride() > 0;
 
     const std::vector<vk::VertexInputBindingDescription> bindingDescriptions = hasVertexInput
         ? std::vector<vk::VertexInputBindingDescription>{vk::VertexInputBindingDescription{}
@@ -95,14 +117,17 @@ VkPipeline::VkPipeline(const vk::raii::Device& device, const rhi::PipelineDesc& 
         : std::vector<vk::VertexInputBindingDescription>{};
 
     std::vector<vk::VertexInputAttributeDescription> attributeDescriptions{};
-    attributeDescriptions.reserve(desc.vertexLayout.GetAttributes().size());
-    for (const rhi::VertexAttribute& attribute : desc.vertexLayout.GetAttributes())
+    attributeDescriptions.reserve(hasVertexInput ? desc.vertexLayout.GetAttributes().size() : 0);
+    if (hasVertexInput)
     {
-        attributeDescriptions.push_back(vk::VertexInputAttributeDescription{}
-                                            .setLocation(attribute.location)
-                                            .setBinding(0)
-                                            .setFormat(ToVkFormat(attribute.format))
-                                            .setOffset(attribute.offset));
+        for (const rhi::VertexAttribute& attribute : desc.vertexLayout.GetAttributes())
+        {
+            attributeDescriptions.push_back(vk::VertexInputAttributeDescription{}
+                                                .setLocation(attribute.location)
+                                                .setBinding(0)
+                                                .setFormat(ToVkFormat(attribute.format))
+                                                .setOffset(attribute.offset));
+        }
     }
 
     const vk::PipelineVertexInputStateCreateInfo vertexInputState =
@@ -192,8 +217,10 @@ VkPipeline::VkPipeline(const vk::raii::Device& device, const rhi::PipelineDesc& 
     const vk::GraphicsPipelineCreateInfo pipelineInfo = vk::GraphicsPipelineCreateInfo{}
                                                             .setPNext(&renderingInfo)
                                                             .setStages(shaderStages)
-                                                            .setPVertexInputState(&vertexInputState)
-                                                            .setPInputAssemblyState(&inputAssemblyState)
+                                                            .setPVertexInputState(
+                                                                isMeshPipeline ? nullptr : &vertexInputState)
+                                                            .setPInputAssemblyState(
+                                                                isMeshPipeline ? nullptr : &inputAssemblyState)
                                                             .setPViewportState(&viewportState)
                                                             .setPRasterizationState(&rasterizationState)
                                                             .setPMultisampleState(&multisampleState)

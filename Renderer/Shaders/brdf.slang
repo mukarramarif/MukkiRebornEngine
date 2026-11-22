@@ -39,7 +39,12 @@ float3 EvaluateCookTorrance(
         return 0.0;
     }
 
-    const float3 halfVector = normalize(viewDirection + lightDirection);
+    // viewDirection and lightDirection cancel in the retroreflection configuration; normalizing
+    // the zero vector would inject NaNs into the traced signal (probes accumulate every ray).
+    const float3 halfSum = viewDirection + lightDirection;
+    const float halfSumLengthSquared = dot(halfSum, halfSum);
+    const float3 halfVector =
+        halfSumLengthSquared > 1e-8 ? halfSum * rsqrt(halfSumLengthSquared) : normal;
     const float nDotV = max(dot(normal, viewDirection), 1e-4);
     const float nDotH = max(dot(normal, halfVector), 0.0);
     const float vDotH = max(dot(viewDirection, halfVector), 0.0);
@@ -52,4 +57,19 @@ float3 EvaluateCookTorrance(
 
     const float3 diffuseWeight = (1.0 - fresnel) * (1.0 - metalness);
     return (diffuseWeight * albedo / kBrdfPi + specular) * radiance * nDotL;
+}
+
+// KHR_materials_diffuse_transmission: the transmitted part of the diffuse lobe is a BTDF that
+// carries light from the hemisphere behind the (infinitely thin) surface. Returns the outgoing
+// diffuse-transmission radiance for a light with the given raw cosine; the caller scales the
+// diffuse BRDF albedo by (1 - factor) so the energy is only moved, not duplicated.
+float3 SubsurfaceTransmissionRadiance(
+    float3 subsurfaceColor,
+    float factor,
+    float metalness,
+    float rawNdotL,
+    float3 radiance)
+{
+    return subsurfaceColor * (factor / kBrdfPi) * (1.0 - metalness) * saturate(-rawNdotL) *
+           radiance;
 }

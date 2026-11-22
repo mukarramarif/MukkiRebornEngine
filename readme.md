@@ -38,7 +38,7 @@ configure into `build/<preset>/vcpkg_installed`. That first configure can take s
 vcpkg builds the dependencies. `tinygltf` is pinned to 2.9.3 because the 3.0.0 port hash no longer
 matches GitHub's regenerated tarball.
 
-Sample assets live in a submodule (about 1.7 GB, cloned shallow):
+Sample assets live in two submodules (about 1.7 GB and 12 MB, cloned shallow):
 
 ```sh
 git clone --recurse-submodules <repository-url>
@@ -46,8 +46,15 @@ git clone --recurse-submodules <repository-url>
 git submodule update --init --depth 1
 ```
 
-Without the submodule the engine still builds and tests pass, but the default demo scene cannot
-load its models.
+`ThirdParty/glTF-Sample-Assets` uses a sparse checkout (only
+`Models/DiffuseTransmissionPlant`) to keep the download small; after initializing it run:
+
+```sh
+git -C ThirdParty/glTF-Sample-Assets sparse-checkout set Models/DiffuseTransmissionPlant
+```
+
+Without the submodules the engine still builds and tests pass, but the demo scenes cannot load their
+models.
 
 Shader compilation uses `slangc` from the Vulkan SDK, found through the `VULKAN_SDK` environment
 variable (or on `PATH`). If `slangc` is missing, CMake prints a warning, shader targets are skipped
@@ -115,9 +122,11 @@ lighting (a sample lives in `AssetLibrary/lakeside_sunrise_2k.hdr`).
 Controls: `WASD`/`QE` to move, mouse to look, `Shift` to move faster, `Tab` to toggle the cursor for
 UI interaction (or hold `Left Alt`), `Esc` to quit.
 
-The sandbox has a scene browser window listing the JSON scenes in `Sandbox/Scenes`, a scene window
-with the light editor, a G-buffer debug window, and an ImGui demo window. glTF objects loaded from a
-scene are auto-fitted to the ground plane.
+The sandbox uses a docked ImGui layout persisted next to the executable (`imgui.ini`): `Stats`,
+`Scenes` and `G-buffer` tab together in the left group, while `GI & Lights`, `Objects & Physics`,
+`Volumetrics` (environment + clouds) and `Flight` tab together in the main group. `View -> Reset
+layout` in the `Stats` menu restores the default layout; stale layouts from older window sets are
+rebuilt automatically. glTF objects loaded from a scene are auto-fitted to the ground plane.
 
 ## Rendering pipeline
 
@@ -131,7 +140,7 @@ flowchart TB
     UPLOAD --> AS["Acceleration structures<br/>BLAS per primitive (rebuild when dirty)<br/>+ per-frame TLAS + geometry SSBO"]
 
     AS --> SHADOW["Shadow pass<br/>CSM · spot · point<br/>(secondary command buffers)"]
-    SHADOW --> GBUFFER["G-buffer pass<br/>albedo · normal+roughness · position · motion<br/>specularF0 · transmission · attenuation · sheen · depth"]
+    GBUFFER["G-buffer pass<br/>mesh shader meshlets or vertex path<br/>albedo · normal+roughness · position · motion<br/>specularF0 · transmission · attenuation · sheen · depth"]
     GBUFFER --> RTSHADOW["RT sun shadow mask<br/>jittered rays, full-res R16F (optional)"]
     AS --> RTSHADOW
 
@@ -204,6 +213,20 @@ flowchart TB
   a-trous kernel with GI and fades into the GI specular signal at the roughness cutoff.
 - **Lighting** composites direct clustered lights, indirect GI (or probes) and reflections in one
   pass, applies ACES tonemapping, and transparent `BLEND` geometry is drawn over the result.
+- **Meshlets**: opaque glTF geometry is clustered with [meshoptimizer](https://github.com/zeux/meshoptimizer)
+  (`Renderer/Meshlets/MeshletBuilder`) into meshlets of up to 64 vertices and 124 triangles. The
+  G-buffer and shadow passes render them with `gbuffer.mesh.slang` / `shadow.mesh.slang`: one mesh
+  shader workgroup per meshlet, culled against the view frustum and the normal cone, emitting its
+  deduplicated vertices and packed triangles. The vertex pipeline remains for transparent
+  materials, the ground plane and devices without `VK_EXT_mesh_shader`. Meshlet rendering is on by
+  default when supported; the `Scenes` window toggles it and `MRE_MESHLETS_OFF` disables it. The
+  G-buffer and shadow paths first run compute culls (`meshlet_cull.comp.slang` /
+  `shadow_cull.comp.slang`): each (view, draw) compacts its surviving meshlets into a per-frame
+  index buffer and accumulates an indirect mesh-task group count, so `gbuffer.mesh.slang` /
+  `shadow.mesh.slang` only launch workgroups for visible meshlets. Draws beyond the compaction
+  capacities fall back to direct dispatch with in-shader culling. The `Scenes` window's `Meshlet
+  debug view` colors each G-buffer meshlet. Both the G-buffer and shadow passes record meshlet and
+  vertex draws into secondary command buffers on the job system.
 
 ## Scenes
 
@@ -266,7 +289,18 @@ A minimal scene:
   use `range`, directional lights ignore `position`/`range`, and point lights ignore `direction`.
 - Up to 256 lights (`kMaxLights`) and any number of glTF objects are supported. Models referenced
   more than once are loaded once and instanced.
-- `Sandbox/Scenes/demo.scene.json` is a complete example with 7 glTF objects and 25 lights.
+- Optional per-object `physics` blocks make an object a static or dynamic rigid body; see
+  [Physics](#physics).
+- The optional scene root `environment` block (`{"map": "...", "intensity": 1.0}`) loads an HDR
+  environment map (resolved like model paths), and `clouds` overrides the volumetric cloud settings
+  (same fields as the `Volumetrics` UI). Scenes without these blocks keep the current renderer
+  settings, so `--env` still works for older scenes.
+- `playerPlane` names the scene object that enters flight mode on load; see the
+  [Airplane demo](#airplane-demo).
+- `Sandbox/Scenes/demo.scene.json` is a complete example with 11 glTF objects (including two dynamic
+  bodies and one static body) and 10 lights; `Sandbox/Scenes/flight.scene.json` is the playable
+  airplane demo and `Sandbox/Scenes/sss.scene.json` demonstrates subsurface scattering on the
+  Khronos diffuse transmission plant.
 
 ### Compiling
 
@@ -299,6 +333,91 @@ then loads only that bytecode:
 .\build\windows-debug\Debug\mukki_sandbox.exe --scene Sandbox\Scenes\demo.scene.json --frames 240
 ```
 
+### Physics
+
+Physics is optional per scene object and runs on [Box3D](https://github.com/erincatto/box3d)
+(vendored through `overlay-ports/box3d`, stepped single threaded on the game thread). An object
+without a `physics` block is render-only, and a ground box collider is created by default at the
+bottom of the scene bounds.
+
+```json
+{
+  "physics": { "gravity": [0.0, -9.81, 0.0], "stepHz": 60.0, "subSteps": 4 },
+  "objects": [
+    {
+      "name": "Crate",
+      "model": "Box/glTF/Box.gltf",
+      "position": [0.0, 4.0, 0.0],
+      "physics": { "body": "dynamic", "shape": "box", "density": 400.0, "friction": 0.6 }
+    },
+    {
+      "name": "Pillar",
+      "model": "BoomBox/glTF/BoomBox.gltf",
+      "position": [-2.0, 1.5, 0.0],
+      "physics": { "body": "static", "shape": "box" }
+    }
+  ]
+}
+```
+
+- `body` is `none` (default), `static` or `dynamic`; `shape` is `box`, `sphere` or `capsule`.
+- With zero `halfExtents`/`radius`/`height` the collider is fitted to the loaded model bounds (a
+  single box for boxes, the max extent as radius for spheres/capsules); set them to override.
+  `offset` moves the collider in body local space and `density`/`friction`/`restitution` set the
+  material.
+- The optional scene root `physics` block authors gravity, the fixed step rate (`stepHz`, 15-240)
+  and Box3D `subSteps` (1-8). All three are also editable in the `Objects & Physics` tab and are
+  written back by `Save JSON`.
+- Dynamic bodies are stepped once per frame and their transforms are written back into the scene
+  objects (post-step sync, no render interpolation); editing a dynamic object in the UI teleports it
+  and clears its velocity. Scale edits are disabled for dynamic bodies because the scale is baked
+  into the collider.
+- `Rebuild bodies` recreates every collider from the current scene description and `Show collision
+  gizmos` draws collider wireframes (green static, cyan dynamic) through the debug line pass.
+- The `Static floor` controls adjust the default ground collider at runtime: enable/disable, top
+  surface height (Y), XZ center, half extents and thickness. `Reset floor` fits it to the loaded
+  scene bounds again; only the floor collider is recreated while editing so moving bodies keep
+  simulating. The floor is runtime only (not serialized into the scene JSON).
+- Scene files with physics require scene binary version 5+ (`MRES`); older files still load with
+  physics defaults.
+
+### Airplane demo
+
+`Sandbox/Scenes/flight.scene.json` is a playable demo: a low-poly glass skyscraper city under the
+`lakeside_sunrise_2k.hdr` environment, a volumetric cloud layer you can climb into (0.9-2.8 km) and
+a controllable airplane. The scene sets its own environment, clouds and `playerPlane`, so flight
+mode enables automatically when it loads:
+
+```powershell
+.\build\windows-debug\Debug\mukki_sandbox.exe --scene Sandbox\Scenes\flight.scene.json
+```
+
+Controls while flying:
+
+| Input | Action |
+| --- | --- |
+| Mouse | pitch / roll (the cursor is captured; `Tab` frees it for the UI) |
+| `W` / `S` | throttle up / down |
+| `A` / `D` | rudder left / right |
+| `R` | reset the plane to its spawn pose |
+| `F` | toggle flight mode / free camera |
+
+The `Flight` tab shows speed, altitude, throttle, bank and the crash counter, and exposes the
+handling sliders (max speed, pitch/roll/yaw rates, auto-level, mouse stick gain, stick return).
+
+Crashing into a building, the ground or the 12 km boundary freezes the plane and respawns it after
+a short delay; the crash counter tracks the attempts. Collision uses the fitted building bounds, so
+the estimate is slightly conservative. The demo ground is the renderer's built-in plane scaled to
+9 km (`DeferredRenderer::SetGroundPlaneExtent`), and dynamic bodies keep simulating under Box3D.
+
+Both demo assets come from Sketchfab under CC-BY-4.0 and live under `AssetLibrary/`:
+
+- "Aviation, Aircraft, Airplane model" by Pixel (https://sketchfab.com/stefan.lengyel1)
+- "Skyscraper with interior with animation video" (see `AssetLibrary/skyscraper_with_interior_with_animation_video/license.txt`)
+
+The volumetric clouds are composited on sky pixels only, so a cloud in front of a building does not
+veil it; flying through clouds against the sky works as expected. There is no audio.
+
 ### Shadows
 
 The renderer implements shadow mapping for all light types:
@@ -308,9 +427,11 @@ The renderer implements shadow mapping for all light types:
   light with `"castShadows": true` (JSON, default `true`) is used.
 - **Spot**: up to 4 perspective shadow maps (1024x1024) in a `Texture2DArray`; the projection
   covers the light cone plus a small margin.
-- **Point**: up to 2 lights, each with six 512x512 perspective faces packed into a 2D atlas
-  (1536x2048). The lighting pass picks the face from the major axis of the light-to-fragment
-  vector and filters inside the atlas tile.
+- **Point**: up to 4 lights, each with its own 512x512x6 depth map (six cube faces as array
+  layers). The lighting pass picks the face from the major axis of the light-to-fragment vector
+  and filters inside it. With `Dynamic point shadows` (default on) a light's map is only
+  re-rendered when the light moves/changes or the scene geometry changes, so static lights keep
+  their cached map and moving lights update every frame.
 - All shadow views are rendered in one shadow pass, recorded into secondary command buffers on
   worker threads like the G-buffer pass. Spot and point views cull objects by light range using
   per-instance bounding spheres.
@@ -323,9 +444,9 @@ The renderer implements shadow mapping for all light types:
   G-buffer and the lighting pass reads the resulting full-resolution visibility mask instead of the
   cascades. Spot and point lights keep using shadow maps.
 
-The `Scene` window exposes `Enabled`, `Distance`, `Depth bias` and `Normal bias` sliders for
-tuning, and every light editor has a `Casts shadows` checkbox (subject to the spot/point slot
-budgets above).
+The `Scene` window exposes `Enabled`, `Distance`, `Depth bias`, `Normal bias` and
+`Dynamic point shadows` controls, and every light editor has a `Casts shadows` checkbox (subject
+to the spot/point slot budgets above).
 
 ### Global illumination
 
@@ -388,10 +509,36 @@ clustered lights:
   feed the irradiance probe pass. `gi_probes.comp.slang`
   traces `Probe rays` uniform-sphere rays per probe with the same hit shading as the path tracer,
   projects the result onto SH L1 and blends it with the previous frame (`Probe hysteresis`). The
+  trace also records **depth statistics** per probe: the mean/variance of the hit distances and the
+  fraction of committed hits that are backfaces. Probes whose backface fraction stays above 0.6 are
+  flagged as embedded in geometry (`depth.z = 0`): the lighting pass skips them, the debug gizmos
+  draw them red, and fills automatically remove them (the `Probe irradiance (live)` section shows
+  the count and has a manual `Remove stuck probes` action). For valid probes the lighting pass
+  applies a **Chebyshev visibility weight** from the depth mean/variance, so a probe on the far side
+  of a wall contributes almost nothing to the surface (no light bleeding through geometry). The
   lighting pass blends the surrounding probes by inverse distance, and the per-pixel trace/denoiser
   is skipped while probes are active (`Use probes for GI`) so the indirect lighting is not counted
   twice. Place several probes around the scene for smooth indirect; they update every frame and
-  reset their accumulation when moved.
+  reset their accumulation when moved. The `Probe irradiance (live)` section reads the GPU
+  coefficients back on a timer (or on `Refresh probes`) and shows each probe's SH as a 32x16
+  equirectangular irradiance thumbnail, plus the numeric `sh0..shZ` of the selected probe.
+- **Subsurface scattering**: `KHR_materials_diffuse_transmission` materials (thin back-lit surfaces
+  such as leaves) mix part of their diffuse lobe into a diffuse transmission BTDF. The lighting
+  pass writes that back-lit term into a second offscreen attachment (the HDR lit image and the
+  subsurface source are produced together), the `sss_blur.comp.slang` passes run a separable,
+  depth-aware diffusion at half resolution with a **radius-parameterized LUT**
+  (`BuildSubsurfaceLut`, 128x16: normalized tap distance x logarithmic scattering radius bucket,
+  per-channel radii so red scatters furthest) and `composite.frag.slang` adds the blurred result to
+  the lighting image before applying ACES tone mapping. The `Subsurface scattering` UI section
+  controls the effect: enabled, scatter radius in pixels, strength, depth tolerance and blur
+  iterations, plus `Off`/`Blurred SSS`/`Sharp source` debug views. The same terms are evaluated in
+  the ray traced hit shading (`gi_shading.slang`), so GI, reflections and probes stay consistent.
+  `Sandbox/Scenes/sss.scene.json` is a demo built around the Khronos `DiffuseTransmissionPlant`
+  with a firefly light behind the leaves.
+- **Debug views**: `Visualize cluster light counts` replaces the image with the cluster heatmap and
+  `GI only view` (in the GI section) shows just the indirect signal: ambient SH/IBL diffuse, the
+  traced diffuse signal (or probes) and the traced reflections, without direct lights or emissive.
+  Both are driven by `SceneUniform::screenSize.z` (0 lit, 1 cluster heatmap, 2 GI only).
 - A hand-rolled SVGF denoiser accumulates edge-aware temporally (depth, normal, luminance and
   hit-distance rejection, variance from the first two moments), then runs 4 iterations of a
   depth/normal/roughness-aware a-trous filter and a joint bilateral upsample back to full
@@ -400,23 +547,32 @@ clustered lights:
   at creation; each a-trous iteration owns its descriptor set because updating a set that is bound
   to a recording command buffer invalidates that command buffer.
 
-The `Scene` window exposes the GI controls: `Ray traced GI`, `Trace scale`, `GI intensity`,
+The `GI & Lights` window exposes the GI controls: `Ray traced GI`, `GI only view`, `Trace scale`,
+`GI intensity`,
 `Max ray distance`, `Bounce feedback`, `Specular min roughness`, the temporal/edge-stop
 parameters, `A-trous iterations`, `Sun shadow ray` and the punctual-light controls
 (`Point/spot lights in GI`, `GI light count`, `GI light shadows`, `GI light shadow bias`). Devices
 without ray tracing report `(ray tracing unavailable)` and render the clustered lights only. The
-`Volumetric clouds (Nubis)` section hosts the coverage/type/density, layer, wind/curl, step count,
-trace scale, temporal blend and god-ray controls.
+`Volumetrics` window hosts the environment controls and the `Volumetric clouds (Nubis)`
+coverage/type/density, layer, wind/curl, step count, trace scale, temporal blend and god-ray
+controls.
 
 In the sandbox, the `Scenes` window browses and loads the JSON scenes found in `Sandbox/Scenes`
-(with a global transform scale). The `Scene` window lists the loaded objects and lights:
+(with a global transform scale). The `Objects & Physics` window lists the loaded objects and
+lights:
 
 - Selecting an object lets you edit its position, rotation (degrees, YXZ) and scale; the change is
   applied to the renderer immediately. The `Probes` section below the objects manages the
-world-space GI probes (`Add probe` places one in front of the camera, `Add grid` drops a 3x2x3
-grid, `Fill scene`/`Maximize probes` distribute probes across the loaded scene bounds up to the
-GPU limit of `kMaxGiProbes`, and the selected probe has position/radius/enabled controls); they
-are persisted in the scene JSON and bytecode.
+  world-space GI probes (`Add probe` places one in front of the camera, `Add grid` drops a 3x2x3
+  grid, and the selected probe has position/radius/enabled controls); they are persisted in the
+  scene JSON and bytecode. The fill controls place the GPU-budget of `kMaxGiProbes` probes without
+  hand placement: `Fill scene` covers the whole loaded scene bounds while `Fill target` fills only
+  the object selected in the `Fill target` combo (for example a Sponza interior), both using a
+  Halton sequence with `Inset`, `Bottom` and `Top` sliders to shape the volume; `Maximize probes`
+  fills the target with the GPU limit. Fills run the depth check afterwards and remove the probes
+  that landed inside walls or props (the status line reports how many). The object editor also has
+  a `Fill probes inside` shortcut. The `Probe irradiance (live)` section below the probe editor
+  visualizes the GPU probe data.
 - Selecting a light opens a `Type` dropdown (directional/point/spot) plus position, direction,
   color, `Strength`, range and cone controls.
 - `Show light gizmos` draws wireframe markers for the lights in the viewport: range spheres for
@@ -432,6 +588,7 @@ in-memory edits to `<exe>\scenes\<name>.mres`, and `Save JSON` dumps them back t
 - `Application/` - windowing, input, keybinds, camera, ImGui styles
 - `Assets/` - asset loading (glTF via tinygltf, KTX2 planned)
 - `Core/` - engine core (version, time)
+- `Physics/` - Box3D rigid body world (single threaded, fixed-step accumulator)
 - `Renderer/RHI/` - vendor-agnostic render hardware interface (device, command lists, resources)
 - `Renderer/Vulkan/` - Vulkan backend implementation
 - `Renderer/Debug/` - world-space debug line builder (light/probe gizmos)
@@ -442,7 +599,8 @@ in-memory edits to `<exe>\scenes\<name>.mres`, and `Save JSON` dumps them back t
 - `Renderer/BufferManager` - vertex/index/uniform buffer management
 - `Scene/` - scene description, JSON authoring (nlohmann/json) and `MRES` bytecode
 - `Tools/` - command line tools (`mukki_scene_compiler`)
-- `ThirdParty/` - submodules (glTF sample models)
+- `ThirdParty/` - submodules (glTF sample models, glTF sample assets)
+- `overlay-ports/` - local vcpkg ports (tinygltf, box3d)
 - `Utilities/` - logging, asserts, future containers and allocators
 - `Tests/` - GoogleTest unit tests
 - `Sandbox/` - sandbox executable and `Scenes/demo.scene.json`
