@@ -314,4 +314,74 @@ TEST(GltfLoader, LoadsNonAsciiPath)
     EXPECT_GT(model.vertexCount, 0u);
 }
 
+TEST(GltfLoader, ParsesSkinsAndAnimations)
+{
+    const std::filesystem::path modelPath =
+        SampleModelsRoot() / "RiggedSimple/glTF/RiggedSimple.gltf";
+    if (!std::filesystem::exists(modelPath))
+    {
+        GTEST_SKIP() << "glTF sample models submodule is not initialized";
+    }
+
+    mukki::GltfModel model{};
+    ASSERT_TRUE(mukki::LoadGltfModel(modelPath, model));
+
+    ASSERT_FALSE(model.skins.empty());
+    ASSERT_FALSE(model.animations.empty());
+
+    // RiggedSimple's clip is anonymous; the loader assigns an indexed fallback name so the
+    // empty string stays reserved as the "no clip" sentinel in the animation API.
+    EXPECT_EQ(model.animations.front().name, "Clip 0");
+
+    const mukki::GltfSkin& skin = model.skins.front();
+    EXPECT_EQ(skin.joints.size(), skin.inverseBindMatrices.size());
+    EXPECT_GT(skin.joints.size(), 0u);
+    for (const int joint : skin.joints)
+    {
+        EXPECT_GE(joint, 0);
+        EXPECT_LT(joint, static_cast<int>(model.nodes.size()));
+    }
+
+    const mukki::GltfAnimation& animation = model.animations.front();
+    EXPECT_FALSE(animation.channels.empty());
+    EXPECT_FALSE(animation.samplers.empty());
+    EXPECT_GT(animation.duration, 0.0f);
+    for (const mukki::GltfAnimationChannel& channel : animation.channels)
+    {
+        EXPECT_GE(channel.node, 0);
+        EXPECT_LT(channel.node, static_cast<int>(model.nodes.size()));
+        EXPECT_GE(channel.sampler, 0);
+        EXPECT_LT(channel.sampler, static_cast<int>(animation.samplers.size()));
+    }
+
+    bool foundSkinned = false;
+    for (const mukki::GltfPrimitive& primitive : model.primitives)
+    {
+        if (primitive.skinIndex < 0)
+        {
+            continue;
+        }
+        foundSkinned = true;
+        for (const mukki::GltfVertex& vertex : primitive.vertices)
+        {
+            const unsigned weightSum = vertex.weights[0] + vertex.weights[1] +
+                                       vertex.weights[2] + vertex.weights[3];
+            EXPECT_GT(weightSum, 0u);
+        }
+    }
+    EXPECT_TRUE(foundSkinned);
+
+    // The hierarchy is retained: roots reference the scene and parents/children link.
+    EXPECT_FALSE(model.rootNodes.empty());
+    bool linked = false;
+    for (const mukki::GltfNode& node : model.nodes)
+    {
+        if (node.parent >= 0 || !node.children.empty())
+        {
+            linked = true;
+        }
+    }
+    EXPECT_TRUE(linked);
+}
+
 } // namespace

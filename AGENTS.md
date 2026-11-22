@@ -84,6 +84,30 @@ must not expose backend types, and Vulkan types may only appear under `Renderer/
   the main group. The layout persists in `imgui.ini` next to the executable (`io.IniFilename`); the
   `Stats` `View` menu toggles windows and has `Reset layout`; layouts that predate the marker
   windows are rebuilt automatically.
+- Animation & skinning: the loader parses skins, animations and the interleaved `JOINTS_0`/
+  `WEIGHTS_0` attributes into `GltfVertex` (position/normal/uv + joints u32x4 + weights f32x4 =
+  64-byte stride; the `meshlet.slang` `kMeshletVertexStride` and the BLAS/`GpuGeometryData`
+  `bufferIndices.z` stride must stay in sync). `GltfNode` keeps the full hierarchy,
+  `ComposeNodeTransform` builds local TRS/matrix transforms and unnamed clips get indexed names
+  ("Clip N") so the empty string stays reserved as the "no clip" sentinel. `Animation/`
+  (`AnimationData` moved out of the model by `ExtractAnimationData`, `PoseEvaluator`)
+  evaluates poses on the CPU: `DeferredRenderer::UpdateAnimations(dt)` advances per-instance
+  clip time, evaluates rest + current pose (`RestPose`, `EvaluatePose`; linear/step/hermite
+  cubic-spline with slerp for rotations) and keeps the previous pose for motion vectors. Joint
+  palettes live in one host-visible storage buffer per frame in flight (`2 * kMaxJointMatrices`,
+  previous region at `kMaxJointMatrices`; `RebuildJointPaletteLayout` prefix-sums per-instance
+  offsets and warns on overflow). The scene set binds set 0 binding 2 (`gJoints`) and the shadow
+  set binds the same buffer at its binding 2; `GpuObjectData.skinning` (x = joint offset, y =
+  previous offset, z = count, w = skinned flag) is kept in sync across all shader copies. The
+  G-buffer vertex shader skins position + normal (current and previous palette, so motion
+  vectors stay correct), `shadow.vert` skins with the current pose only, and skinned primitives
+  always take the vertex pipeline (no meshlets) — the shadow pipeline vertex layout declares the
+  interleaved locations 0/2/3/4 with the `GltfVertex` offsets. Ray traced hits still shade the
+  bind pose (per-instance BLAS refit is deferred). Scene binary v7 + `SceneJson` carry a
+  per-object `animation` block (clip/autoplay/loop/speed/startTime); the sandbox applies it after
+  `LoadScene` and the object editor exposes an `Animation` section. `Sandbox/Scenes/
+  animation.scene.json` demos the Fox; `Tests/test_animation.cpp` covers wrapping/rest pose/
+  interpolation/joint matrices and Fox skinning, the loader test covers skin/animation parsing.
 - Materials: glTF `alphaMode = MASK` is supported. The flag and `alphaCutoff` are packed into
   `ObjectPushConstants.params.z/.w` (set by `DeferredRenderer` from `GltfMaterial`), the G-buffer
   discards `baseColor.a * baseColorFactor.a < cutoff`, and the shadow fragment stage alpha-tests

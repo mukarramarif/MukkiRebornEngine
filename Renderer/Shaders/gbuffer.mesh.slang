@@ -55,6 +55,7 @@ struct GpuObjectData
     float4 subsurface;
     uint4 subsurfaceTextureIndices;
     uint4 subsurfaceSamplerIndices;
+    uint4 skinning;
 };
 
 [[vk::binding(0, 0)]] ConstantBuffer<SceneUniform> gScene;

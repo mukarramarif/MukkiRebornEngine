@@ -1,8 +1,9 @@
 // Shared meshlet decoding and culling for the mesh shader pipelines. The includer must declare
 // the uniform and push constant bindings before including this file.
 
-// GltfVertex: position (12 bytes), normal (12 bytes), uv (8 bytes).
-static const uint kMeshletVertexStride = 32;
+// GltfVertex: position (12 bytes), normal (12 bytes), uv (8 bytes), joints u32x4 (16 bytes),
+// weights f32x4 (16 bytes).
+static const uint kMeshletVertexStride = 64;
 static const uint kMeshletStride = 48;
 // Matches mukki::kMeshletCullDisabled: draws without compute compaction use direct mesh-task
 // dispatch and keep the in-shader cull.

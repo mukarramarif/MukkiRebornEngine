@@ -300,6 +300,7 @@ protected:
 
         m_physics.Step(deltaTime);
         SyncDynamicBodies();
+        m_renderer->UpdateAnimations(deltaTime);
         UpdateProbeReadback(deltaTime);
         if (m_renderer->ArePhysicsGizmosEnabled())
         {
@@ -761,6 +762,21 @@ private:
         {
             m_sceneStatus = "the renderer failed to load the scene";
             return false;
+        }
+
+        // Apply the authored animation settings (clip, autoplay, loop, speed, start time).
+        for (std::size_t index = 0; index < m_scene.objects.size(); ++index)
+        {
+            const mukki::SceneAnimation& animation = m_scene.objects[index].animation;
+            if (animation.clip.empty())
+            {
+                continue;
+            }
+            m_renderer->SetAnimationClip(index, animation.clip);
+            m_renderer->SetAnimationSpeed(index, animation.speed);
+            m_renderer->SetAnimationLoop(index, animation.loop);
+            m_renderer->SetAnimationTime(index, animation.startTime);
+            m_renderer->SetAnimationPlaying(index, animation.autoplay);
         }
 
         mukki::PhysicsSettings physicsSettings = m_physics.GetSettings();
@@ -2625,6 +2641,65 @@ private:
             m_physicsDirty = false;
             RebuildPhysics();
             m_sceneStatus = "physics bodies rebuilt";
+        }
+
+        if (m_renderer->HasAnimation(index))
+        {
+            ImGui::SeparatorText("Animation");
+            const std::vector<std::string> clips = m_renderer->GetAnimationClips(index);
+            if (clips.empty())
+            {
+                ImGui::TextDisabled("No animation clips");
+            }
+            else
+            {
+                const std::string currentClip = m_renderer->GetAnimationClipName(index);
+                if (ImGui::BeginCombo("Clip", currentClip.empty() ? "(none)" : currentClip.c_str()))
+                {
+                    if (ImGui::Selectable("(none)", currentClip.empty()))
+                    {
+                        object.animation.clip.clear();
+                        m_renderer->SetAnimationClip(index, "");
+                    }
+                    for (const std::string& clip : clips)
+                    {
+                        if (ImGui::Selectable(clip.c_str(), clip == currentClip))
+                        {
+                            object.animation.clip = clip;
+                            m_renderer->SetAnimationClip(index, clip);
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+
+                bool playing = m_renderer->IsAnimationPlaying(index);
+                if (ImGui::Checkbox("Play", &playing))
+                {
+                    object.animation.autoplay = playing;
+                    m_renderer->SetAnimationPlaying(index, playing);
+                }
+                ImGui::SameLine();
+                if (ImGui::Checkbox("Loop", &object.animation.loop))
+                {
+                    m_renderer->SetAnimationLoop(index, object.animation.loop);
+                }
+
+                float speed = m_renderer->GetAnimationSpeed(index);
+                if (ImGui::DragFloat("Speed", &speed, 0.05f, 0.0f, 10.0f, "%.2f"))
+                {
+                    object.animation.speed = speed;
+                    m_renderer->SetAnimationSpeed(index, speed);
+                }
+
+                const float duration = m_renderer->GetAnimationDuration(index);
+                float time = m_renderer->GetAnimationTime(index);
+                if (duration > 0.0f &&
+                    ImGui::SliderFloat("Time", &time, 0.0f, duration, "%.2f"))
+                {
+                    object.animation.startTime = time;
+                    m_renderer->SetAnimationTime(index, time);
+                }
+            }
         }
 
         // Quick probe fill for this object's interior (for example a Sponza hall) so the GI is

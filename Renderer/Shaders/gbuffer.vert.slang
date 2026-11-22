@@ -44,10 +44,12 @@ struct GpuObjectData
     float4 subsurface;            // rgb: diffuseTransmissionColor, a: factor
     uint4 subsurfaceTextureIndices; // x: diffuseTransmissionTexture, y: color texture
     uint4 subsurfaceSamplerIndices;
+    uint4 skinning; // x: joint offset, y: previous joint offset, z: joint count, w: 1 = skinned
 };
 
 [[vk::binding(0, 0)]] ConstantBuffer<SceneUniform> gScene;
 [[vk::binding(1, 0)]] StructuredBuffer<GpuObjectData> gObjects;
+[[vk::binding(2, 0)]] StructuredBuffer<float4x4> gJoints;
 [[vk::push_constant]] ConstantBuffer<ObjectPushConstants> gObject;
 
 struct VertexInput
@@ -55,6 +57,8 @@ struct VertexInput
     [[vk::location(0)]] float3 position : POSITION;
     [[vk::location(1)]] float3 normal : NORMAL;
     [[vk::location(2)]] float2 uv : TEXCOORD0;
+    [[vk::location(3)]] uint4 joints : JOINTS0;
+    [[vk::location(4)]] float4 weights : WEIGHTS0;
 };
 
 struct VertexOutput
@@ -70,14 +74,35 @@ struct VertexOutput
 [shader("vertex")]
 VertexOutput vertexMain(VertexInput input)
 {
-    const float4 localPosition = float4(input.position, 1.0);
+    float4 localPosition = float4(input.position, 1.0);
+    float4 previousLocalPosition = localPosition;
+    float3 localNormal = input.normal;
+    const uint4 skinning = gObjects[gObject.drawIndex].skinning;
+    if (skinning.w != 0u)
+    {
+        const float4x4 skinMatrix =
+            gJoints[skinning.x + input.joints.x] * input.weights.x +
+            gJoints[skinning.x + input.joints.y] * input.weights.y +
+            gJoints[skinning.x + input.joints.z] * input.weights.z +
+            gJoints[skinning.x + input.joints.w] * input.weights.w;
+        const float4x4 previousSkinMatrix =
+            gJoints[skinning.y + input.joints.x] * input.weights.x +
+            gJoints[skinning.y + input.joints.y] * input.weights.y +
+            gJoints[skinning.y + input.joints.z] * input.weights.z +
+            gJoints[skinning.y + input.joints.w] * input.weights.w;
+        localPosition = mul(skinMatrix, localPosition);
+        previousLocalPosition = mul(previousSkinMatrix, previousLocalPosition);
+        localNormal = mul((float3x3)skinMatrix, localNormal);
+    }
+
     const float4 worldPosition = mul(gObject.model, localPosition);
-    const float4 previousWorldPosition = mul(gObjects[gObject.drawIndex].previousModel, localPosition);
+    const float4 previousWorldPosition =
+        mul(gObjects[gObject.drawIndex].previousModel, previousLocalPosition);
 
     VertexOutput output;
     output.position = mul(gScene.viewProjection, worldPosition);
     output.worldPosition = worldPosition.xyz;
-    output.normal = mul((float3x3)gObject.model, input.normal);
+    output.normal = mul((float3x3)gObject.model, localNormal);
     output.uv = input.uv;
     output.previousClip = mul(gScene.previousViewProjection, previousWorldPosition);
     // Vertex-pipeline geometry is not split into meshlets; keep it dark in the debug view.

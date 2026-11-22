@@ -24,6 +24,7 @@ enum class Format : std::uint8_t
     R32G32Sfloat,
     R32G32B32Sfloat,
     R32G32B32A32Sfloat,
+    R32G32B32A32Uint,
     D32Sfloat,
 };
 

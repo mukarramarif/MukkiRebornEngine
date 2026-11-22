@@ -37,6 +37,11 @@ mukki::SceneDescription MakeScene()
     duck.name = "Duck";
     duck.modelPath = "Duck.gltf";
     duck.physics.body = mukki::ScenePhysicsBody::Static;
+    duck.animation.clip = "Walk";
+    duck.animation.autoplay = true;
+    duck.animation.loop = false;
+    duck.animation.speed = 1.5f;
+    duck.animation.startTime = 2.25f;
     scene.objects.push_back(duck);
 
     scene.physics.gravity = glm::vec3{0.0f, -3.7f, 0.0f};
@@ -113,6 +118,12 @@ TEST(SceneBinary, RoundTrips)
     EXPECT_FLOAT_EQ(decoded.objects[0].physics.friction, scene.objects[0].physics.friction);
     EXPECT_FLOAT_EQ(decoded.objects[0].physics.restitution, scene.objects[0].physics.restitution);
     EXPECT_EQ(decoded.objects[1].physics.body, mukki::ScenePhysicsBody::Static);
+    EXPECT_TRUE(decoded.objects[0].animation.clip.empty());
+    EXPECT_EQ(decoded.objects[1].animation.clip, "Walk");
+    EXPECT_TRUE(decoded.objects[1].animation.autoplay);
+    EXPECT_FALSE(decoded.objects[1].animation.loop);
+    EXPECT_FLOAT_EQ(decoded.objects[1].animation.speed, 1.5f);
+    EXPECT_FLOAT_EQ(decoded.objects[1].animation.startTime, 2.25f);
     EXPECT_FLOAT_EQ(decoded.physics.gravity.y, scene.physics.gravity.y);
     EXPECT_FLOAT_EQ(decoded.physics.stepHz, scene.physics.stepHz);
     EXPECT_EQ(decoded.physics.subSteps, scene.physics.subSteps);

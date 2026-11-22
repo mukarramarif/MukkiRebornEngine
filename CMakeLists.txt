@@ -98,6 +98,7 @@ function(mre_add_slang_shaders target)
 endfunction()
 
 add_library(mukki_engine STATIC
+    Animation/PoseEvaluator.cpp
     Application/Application.cpp
     Application/Camera.cpp
     Application/Input.cpp

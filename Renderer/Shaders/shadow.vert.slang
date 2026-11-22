@@ -20,13 +20,41 @@ struct ShadowUniform
     float4 rtParams; // x: ray traced sun shadows enabled, y/z/w: unused
 };
 
+// Must match mukki::DeferredRenderer::GpuObjectData (skinning drives the skin below).
+struct GpuObjectData
+{
+    float4x4 previousModel;
+    float4 specular;
+    uint4 specularTextureIndices;
+    uint4 specularSamplerIndices;
+    float4 volume;
+    float4 attenuation;
+    uint4 volumeTextureIndices;
+    uint4 volumeSamplerIndices;
+    float4 alpha;
+    float4 sheen;
+    uint4 sheenTextureIndices;
+    uint4 sheenSamplerIndices;
+    float4 emissive;
+    uint4 emissiveTextureIndices;
+    uint4 emissiveSamplerIndices;
+    float4 subsurface;
+    uint4 subsurfaceTextureIndices;
+    uint4 subsurfaceSamplerIndices;
+    uint4 skinning; // x: joint offset, y: previous joint offset, z: joint count, w: 1 = skinned
+};
+
 [[vk::binding(0, 0)]] ConstantBuffer<ShadowUniform> gShadow;
+[[vk::binding(1, 0)]] StructuredBuffer<GpuObjectData> gObjects;
+[[vk::binding(2, 0)]] StructuredBuffer<float4x4> gJoints;
 [[vk::push_constant]] ConstantBuffer<ShadowPushConstants> gPush;
 
 struct VertexInput
 {
     [[vk::location(0)]] float3 position : POSITION;
     [[vk::location(2)]] float2 uv : TEXCOORD0;
+    [[vk::location(3)]] uint4 joints : JOINTS0;
+    [[vk::location(4)]] float4 weights : WEIGHTS0;
 };
 
 struct VertexOutput
@@ -38,7 +66,19 @@ struct VertexOutput
 [shader("vertex")]
 VertexOutput vertexMain(VertexInput input)
 {
-    const float4 worldPosition = mul(gPush.model, float4(input.position, 1.0));
+    float4 localPosition = float4(input.position, 1.0);
+    const uint4 skinning = gObjects[gPush.drawIndex].skinning;
+    if (skinning.w != 0u)
+    {
+        const float4x4 skinMatrix =
+            gJoints[skinning.x + input.joints.x] * input.weights.x +
+            gJoints[skinning.x + input.joints.y] * input.weights.y +
+            gJoints[skinning.x + input.joints.z] * input.weights.z +
+            gJoints[skinning.x + input.joints.w] * input.weights.w;
+        localPosition = mul(skinMatrix, localPosition);
+    }
+
+    const float4 worldPosition = mul(gPush.model, localPosition);
 
     VertexOutput output;
     output.position = mul(gShadow.viewProjections[gPush.viewIndex], worldPosition);

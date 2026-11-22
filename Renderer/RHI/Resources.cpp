@@ -156,6 +156,7 @@ std::uint32_t GetFormatSize(Format format)
     case Format::R32G32B32Sfloat:
         return 12;
     case Format::R32G32B32A32Sfloat:
+    case Format::R32G32B32A32Uint:
         return 16;
     case Format::Undefined:
         return 0;

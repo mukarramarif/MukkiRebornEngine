@@ -45,6 +45,7 @@ struct GpuObjectData
     float4 subsurface;            // rgb: diffuseTransmissionColor, a: factor
     uint4 subsurfaceTextureIndices; // x: diffuseTransmissionTexture, y: color texture
     uint4 subsurfaceSamplerIndices;
+    uint4 skinning;
 };
 
 struct VertexOutput

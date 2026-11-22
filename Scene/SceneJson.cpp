@@ -268,6 +268,35 @@ bool ReadScenePhysics(const Json& node, ScenePhysics& physics, std::string& erro
     return true;
 }
 
+// Parses the optional per-object "animation" block.
+bool ReadSceneAnimation(const Json& node, SceneAnimation& animation, std::string& error)
+{
+    const auto it = node.find("animation");
+    if (it == node.end())
+    {
+        return true;
+    }
+    if (!it->is_object())
+    {
+        error = "'animation' must be an object";
+        return false;
+    }
+    if (!ReadString(*it, "clip", animation.clip, false, error) ||
+        !ReadBool(*it, "autoplay", animation.autoplay, error) ||
+        !ReadBool(*it, "loop", animation.loop, error) ||
+        !ReadFloat(*it, "speed", animation.speed, error) ||
+        !ReadFloat(*it, "startTime", animation.startTime, error))
+    {
+        return false;
+    }
+    if (animation.speed < 0.0f)
+    {
+        error = "animation 'speed' must not be negative";
+        return false;
+    }
+    return true;
+}
+
 std::string Indexed(std::string_view collection, std::size_t index, std::string message)
 {
     return std::string{collection} + "[" + std::to_string(index) + "]: " + std::move(message);
@@ -470,7 +499,8 @@ bool SceneJson::Parse(
                 !ReadVec3(node, "position", object.position, entryError) ||
                 !ReadVec3(node, "rotation", object.rotation, entryError) ||
                 !ReadVec3(node, "scale", object.scale, entryError) ||
-                !ReadScenePhysics(node, object.physics, entryError))
+                !ReadScenePhysics(node, object.physics, entryError) ||
+                !ReadSceneAnimation(node, object.animation, entryError))
             {
                 error = Indexed("objects", index, std::move(entryError));
                 return false;
@@ -661,6 +691,17 @@ std::string SceneJson::Serialize(const SceneDescription& scene)
             physics["friction"] = object.physics.friction;
             physics["restitution"] = object.physics.restitution;
             node["physics"] = std::move(physics);
+        }
+
+        if (!object.animation.clip.empty())
+        {
+            Json animation;
+            animation["clip"] = object.animation.clip;
+            animation["autoplay"] = object.animation.autoplay;
+            animation["loop"] = object.animation.loop;
+            animation["speed"] = object.animation.speed;
+            animation["startTime"] = object.animation.startTime;
+            node["animation"] = std::move(animation);
         }
 
         objects.push_back(std::move(node));

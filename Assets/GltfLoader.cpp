@@ -6,6 +6,7 @@
 #include "Utilities/Profiling.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -72,6 +73,10 @@ bool GetAccessorView(const tinygltf::Model& gltf, int accessorIndex, AccessorVie
     else if (accessor.type == TINYGLTF_TYPE_VEC4)
     {
         componentCount = 4;
+    }
+    else if (accessor.type == TINYGLTF_TYPE_MAT4)
+    {
+        componentCount = 16;
     }
     else
     {
@@ -162,6 +167,67 @@ bool ReadFloats(
         }
     }
 
+    return true;
+}
+
+bool ReadMatrix4s(const tinygltf::Model& gltf, int accessorIndex, std::vector<glm::mat4>& out)
+{
+    AccessorView view{};
+    if (!GetAccessorView(gltf, accessorIndex, view) || view.componentCount != 16)
+    {
+        return false;
+    }
+
+    out.resize(view.count);
+    for (std::size_t element = 0; element < view.count; ++element)
+    {
+        const std::uint8_t* source = view.data + element * view.stride;
+        for (int component = 0; component < 16; ++component)
+        {
+            // Column-major: component = column * 4 + row.
+            out[element][component / 4][component % 4] =
+                ReadComponent(source, component, view.componentType, view.normalized);
+        }
+    }
+    return true;
+}
+
+// Reads JOINTS_0 (u8/u16/u32) and WEIGHTS_0 (f32 or normalized u8/u16) into the interleaved
+// vertex attributes.
+bool ReadSkinningAttributes(
+    const tinygltf::Model& gltf,
+    int jointsAccessor,
+    int weightsAccessor,
+    std::size_t vertexCount,
+    GltfPrimitive& out)
+{
+    AccessorView joints{};
+    AccessorView weights{};
+    if (!GetAccessorView(gltf, jointsAccessor, joints) || joints.componentCount != 4 ||
+        !GetAccessorView(gltf, weightsAccessor, weights) || weights.componentCount != 4)
+    {
+        return false;
+    }
+    if (joints.count != vertexCount || weights.count != vertexCount)
+    {
+        return false;
+    }
+
+    for (std::size_t vertex = 0; vertex < vertexCount; ++vertex)
+    {
+        const std::uint8_t* jointSource = joints.data + vertex * joints.stride;
+        const std::uint8_t* weightSource = weights.data + vertex * weights.stride;
+        for (int component = 0; component < 4; ++component)
+        {
+            const float joint =
+                ReadComponent(jointSource, component, joints.componentType, false);
+            const float weight =
+                ReadComponent(weightSource, component, weights.componentType, weights.normalized);
+            out.vertices[vertex].joints[component] =
+                static_cast<std::uint32_t>(std::max(joint, 0.0f));
+            out.vertices[vertex].weights[component] = weight;
+        }
+    }
     return true;
 }
 
@@ -286,14 +352,21 @@ GltfWrapMode ConvertWrapMode(int wrap)
     }
 }
 
-glm::mat4 GetNodeLocalTransform(const tinygltf::Node& node)
+// Reads a node's local TRS and the composed matrix. Matrix-authored nodes keep the identity TRS;
+// animation channels replace the individual properties either way.
+void ReadNodeLocalTrs(
+    const tinygltf::Node& node,
+    glm::vec3& translation,
+    glm::quat& rotation,
+    glm::vec3& scale,
+    glm::mat4& matrix)
 {
     if (node.matrix.size() == 16)
     {
-        return glm::make_mat4(node.matrix.data());
+        matrix = glm::make_mat4(node.matrix.data());
+        return;
     }
 
-    glm::vec3 translation{0.0f};
     if (node.translation.size() == 3)
     {
         translation = glm::vec3{
@@ -301,8 +374,6 @@ glm::mat4 GetNodeLocalTransform(const tinygltf::Node& node)
             static_cast<float>(node.translation[1]),
             static_cast<float>(node.translation[2])};
     }
-
-    glm::quat rotation{1.0f, 0.0f, 0.0f, 0.0f};
     if (node.rotation.size() == 4)
     {
         rotation = glm::quat{
@@ -311,8 +382,6 @@ glm::mat4 GetNodeLocalTransform(const tinygltf::Node& node)
             static_cast<float>(node.rotation[1]),
             static_cast<float>(node.rotation[2])};
     }
-
-    glm::vec3 scale{1.0f};
     if (node.scale.size() == 3)
     {
         scale = glm::vec3{
@@ -320,11 +389,7 @@ glm::mat4 GetNodeLocalTransform(const tinygltf::Node& node)
             static_cast<float>(node.scale[1]),
             static_cast<float>(node.scale[2])};
     }
-
-    glm::mat4 transform = glm::translate(glm::mat4{1.0f}, translation);
-    transform *= glm::mat4_cast(rotation);
-    transform = glm::scale(transform, scale);
-    return transform;
+    matrix = ComposeNodeTransform(translation, rotation, scale);
 }
 
 void ExpandBounds(const GltfPrimitive& primitive, const glm::mat4& transform, glm::vec3& minBounds, glm::vec3& maxBounds)
@@ -337,38 +402,65 @@ void ExpandBounds(const GltfPrimitive& primitive, const glm::mat4& transform, gl
     }
 }
 
-void TraverseNode(
-    const tinygltf::Model& gltf,
-    int nodeIndex,
-    const glm::mat4& parentTransform,
-    const std::vector<std::vector<std::uint32_t>>& meshPrimitives,
-    GltfModel& out)
+// Fills the full node array (index aligned with the glTF nodes), links parents/children and
+// computes the rest-pose world transforms parent-first from the scene roots.
+void BuildNodes(const tinygltf::Model& gltf, GltfModel& out)
 {
-    if (nodeIndex < 0 || nodeIndex >= static_cast<int>(gltf.nodes.size()))
+    out.nodes.resize(gltf.nodes.size());
+    for (std::size_t index = 0; index < gltf.nodes.size(); ++index)
     {
-        return;
-    }
-
-    const tinygltf::Node& node = gltf.nodes[nodeIndex];
-    const glm::mat4 worldTransform = parentTransform * GetNodeLocalTransform(node);
-
-    if (node.mesh >= 0 && node.mesh < static_cast<int>(meshPrimitives.size()))
-    {
-        out.nodes.push_back(GltfNode{worldTransform, node.mesh});
-
-        for (const std::uint32_t primitiveIndex : meshPrimitives[static_cast<std::size_t>(node.mesh)])
+        const tinygltf::Node& node = gltf.nodes[index];
+        GltfNode& converted = out.nodes[index];
+        converted.name = node.name;
+        converted.meshIndex = node.mesh;
+        converted.skinIndex = node.skin;
+        ReadNodeLocalTrs(
+            node,
+            converted.translation,
+            converted.rotation,
+            converted.scale,
+            converted.localTransform);
+        for (const int child : node.children)
         {
-            ExpandBounds(out.primitives[primitiveIndex], worldTransform, out.minBounds, out.maxBounds);
+            if (child >= 0 && child < static_cast<int>(out.nodes.size()))
+            {
+                converted.children.push_back(child);
+                out.nodes[static_cast<std::size_t>(child)].parent = static_cast<int>(index);
+            }
         }
     }
 
-    for (const int child : node.children)
+    const auto computeWorld = [&out](
+                                  auto&& self,
+                                  int nodeIndex,
+                                  const glm::mat4& parentTransform) -> void {
+        GltfNode& node = out.nodes[static_cast<std::size_t>(nodeIndex)];
+        node.worldTransform = parentTransform * node.localTransform;
+        for (const int child : node.children)
+        {
+            self(self, child, node.worldTransform);
+        }
+    };
+    for (const int root : out.rootNodes)
     {
-        TraverseNode(gltf, child, worldTransform, meshPrimitives, out);
+        if (root >= 0 && root < static_cast<int>(out.nodes.size()))
+        {
+            computeWorld(computeWorld, root, glm::mat4{1.0f});
+        }
     }
 }
 
 } // namespace
+
+glm::mat4 ComposeNodeTransform(
+    const glm::vec3& translation,
+    const glm::quat& rotation,
+    const glm::vec3& scale)
+{
+    glm::mat4 transform = glm::translate(glm::mat4{1.0f}, translation);
+    transform *= glm::mat4_cast(rotation);
+    return glm::scale(transform, scale);
+}
 
 bool LoadGltfModel(const std::filesystem::path& path, GltfModel& model)
 {
@@ -689,6 +781,19 @@ bool LoadGltfModel(const std::filesystem::path& path, GltfModel& model)
                 }
             }
 
+            const auto jointsAttribute = primitive.attributes.find("JOINTS_0");
+            const auto weightsAttribute = primitive.attributes.find("WEIGHTS_0");
+            if (jointsAttribute != primitive.attributes.end() &&
+                weightsAttribute != primitive.attributes.end())
+            {
+                ReadSkinningAttributes(
+                    gltf,
+                    jointsAttribute->second,
+                    weightsAttribute->second,
+                    vertexCount,
+                    converted);
+            }
+
             converted.materialIndex = primitive.material;
 
             model.vertexCount += converted.vertices.size();
@@ -703,7 +808,208 @@ bool LoadGltfModel(const std::filesystem::path& path, GltfModel& model)
     {
         for (const int nodeIndex : gltf.scenes[static_cast<std::size_t>(gltf.defaultScene)].nodes)
         {
-            TraverseNode(gltf, nodeIndex, glm::mat4{1.0f}, meshPrimitives, model);
+            model.rootNodes.push_back(nodeIndex);
+        }
+    }
+
+    BuildNodes(gltf, model);
+
+    for (const GltfNode& node : model.nodes)
+    {
+        if (node.meshIndex < 0 || node.meshIndex >= static_cast<int>(meshPrimitives.size()))
+        {
+            continue;
+        }
+        for (const std::uint32_t primitiveIndex : meshPrimitives[static_cast<std::size_t>(node.meshIndex)])
+        {
+            ExpandBounds(
+                model.primitives[primitiveIndex],
+                node.worldTransform,
+                model.minBounds,
+                model.maxBounds);
+            // Skins attach to nodes while primitives are shared across nodes; mark the mesh's
+            // primitives skinned when any node using the mesh has a skin.
+            if (node.skinIndex >= 0 && model.primitives[primitiveIndex].skinIndex < 0)
+            {
+                model.primitives[primitiveIndex].skinIndex = node.skinIndex;
+            }
+        }
+    }
+
+    for (const tinygltf::Skin& skin : gltf.skins)
+    {
+        GltfSkin converted{};
+        converted.name = skin.name;
+        converted.skeletonRoot = skin.skeleton;
+        for (const int joint : skin.joints)
+        {
+            if (joint < 0 || joint >= static_cast<int>(model.nodes.size()))
+            {
+                MRE_WARN(
+                    "glTF skin '{}' references node {} outside the node array",
+                    converted.name,
+                    joint);
+                continue;
+            }
+            converted.joints.push_back(joint);
+        }
+
+        if (skin.inverseBindMatrices >= 0)
+        {
+            if (!ReadMatrix4s(gltf, skin.inverseBindMatrices, converted.inverseBindMatrices) ||
+                converted.inverseBindMatrices.size() != converted.joints.size())
+            {
+                MRE_WARN(
+                    "glTF skin '{}' inverse bind matrices do not match its joints",
+                    converted.name);
+                converted.inverseBindMatrices.assign(converted.joints.size(), glm::mat4{1.0f});
+            }
+        }
+        else
+        {
+            converted.inverseBindMatrices.assign(converted.joints.size(), glm::mat4{1.0f});
+        }
+        model.skins.push_back(std::move(converted));
+    }
+
+    for (const tinygltf::Animation& animation : gltf.animations)
+    {
+        GltfAnimation converted{};
+        // Anonymous clips get an indexed name so the empty string stays reserved as the
+        // "no clip" sentinel in the animation API.
+        converted.name = animation.name.empty()
+                             ? "Clip " + std::to_string(model.animations.size())
+                             : animation.name;
+
+        // Samplers are kept positionally aligned with the source array so channel sampler
+        // indices stay valid even when a sampler is rejected.
+        for (const tinygltf::AnimationSampler& sampler : animation.samplers)
+        {
+            GltfAnimationSampler convertedSampler{};
+            if (sampler.interpolation == "STEP")
+            {
+                convertedSampler.interpolation = GltfInterpolation::Step;
+            }
+            else if (sampler.interpolation == "CUBICSPLINE")
+            {
+                convertedSampler.interpolation = GltfInterpolation::CubicSpline;
+            }
+
+            if (!ReadFloats(gltf, sampler.input, 1, convertedSampler.times))
+            {
+                MRE_WARN(
+                    "glTF animation '{}' has an invalid sampler input",
+                    converted.name);
+                converted.samplers.push_back(std::move(convertedSampler));
+                continue;
+            }
+
+            AccessorView output{};
+            if (!GetAccessorView(gltf, sampler.output, output) ||
+                (output.componentCount != 1 && output.componentCount != 3 &&
+                 output.componentCount != 4))
+            {
+                MRE_WARN(
+                    "glTF animation '{}' has an invalid sampler output",
+                    converted.name);
+                converted.samplers.push_back(std::move(convertedSampler));
+                continue;
+            }
+
+            const std::size_t valuesPerKey =
+                convertedSampler.interpolation == GltfInterpolation::CubicSpline ? 3u : 1u;
+            if (output.count != convertedSampler.times.size() * valuesPerKey)
+            {
+                MRE_WARN(
+                    "glTF animation '{}' sampler key and value counts mismatch",
+                    converted.name);
+                convertedSampler.times.clear();
+                converted.samplers.push_back(std::move(convertedSampler));
+                continue;
+            }
+
+            convertedSampler.values.resize(output.count);
+            for (std::size_t element = 0; element < output.count; ++element)
+            {
+                const std::uint8_t* source = output.data + element * output.stride;
+                glm::vec4 value{0.0f};
+                for (int component = 0; component < output.componentCount; ++component)
+                {
+                    value[component] = ReadComponent(
+                        source,
+                        component,
+                        output.componentType,
+                        output.normalized);
+                }
+                convertedSampler.values[element] = value;
+            }
+            converted.duration = std::max(converted.duration, convertedSampler.times.back());
+            converted.samplers.push_back(std::move(convertedSampler));
+        }
+
+        bool warnedCubicRotation = false;
+        for (const tinygltf::AnimationChannel& channel : animation.channels)
+        {
+            GltfAnimationChannel convertedChannel{};
+            convertedChannel.node = channel.target_node;
+            convertedChannel.sampler = channel.sampler;
+            if (channel.target_path == "translation")
+            {
+                convertedChannel.path = GltfAnimationPath::Translation;
+            }
+            else if (channel.target_path == "rotation")
+            {
+                convertedChannel.path = GltfAnimationPath::Rotation;
+            }
+            else if (channel.target_path == "scale")
+            {
+                convertedChannel.path = GltfAnimationPath::Scale;
+            }
+            else if (channel.target_path == "weights")
+            {
+                convertedChannel.path = GltfAnimationPath::Weights;
+                MRE_WARN(
+                    "glTF animation '{}' morph target weights are not supported yet",
+                    converted.name);
+                continue;
+            }
+            else
+            {
+                MRE_WARN(
+                    "glTF animation '{}' has an unknown channel path '{}'",
+                    converted.name,
+                    channel.target_path);
+                continue;
+            }
+
+            if (convertedChannel.node < 0 ||
+                convertedChannel.node >= static_cast<int>(model.nodes.size()) ||
+                convertedChannel.sampler < 0 ||
+                convertedChannel.sampler >= static_cast<int>(converted.samplers.size()) ||
+                converted.samplers[static_cast<std::size_t>(convertedChannel.sampler)].times.empty())
+            {
+                MRE_WARN(
+                    "glTF animation '{}' has an invalid channel target",
+                    converted.name);
+                continue;
+            }
+
+            if (convertedChannel.path == GltfAnimationPath::Rotation && !warnedCubicRotation &&
+                converted.samplers[static_cast<std::size_t>(convertedChannel.sampler)].interpolation ==
+                    GltfInterpolation::CubicSpline)
+            {
+                MRE_WARN(
+                    "glTF animation '{}' cubic spline rotations are approximated with slerp",
+                    converted.name);
+                warnedCubicRotation = true;
+            }
+
+            converted.channels.push_back(convertedChannel);
+        }
+
+        if (!converted.channels.empty())
+        {
+            model.animations.push_back(std::move(converted));
         }
     }
 
@@ -714,10 +1020,12 @@ bool LoadGltfModel(const std::filesystem::path& path, GltfModel& model)
     }
 
     MRE_INFO(
-        "Loaded '{}': {} primitives, {} nodes, {} materials, {} images, {} vertices, {} triangles",
+        "Loaded '{}': {} primitives, {} nodes, {} skins, {} animations, {} materials, {} images, {} vertices, {} triangles",
         PathToUtf8(path.filename()),
         model.primitives.size(),
         model.nodes.size(),
+        model.skins.size(),
+        model.animations.size(),
         model.materials.size(),
         model.images.size(),
         model.vertexCount,
