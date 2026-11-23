@@ -16,11 +16,14 @@
 #include "Scene/SceneBinary.h"
 #include "Scene/SceneDescription.h"
 #include "Scene/SceneJson.h"
+#include "Terrain/TerrainGenerator.h"
+#include "Terrain/TerrainMesh.h"
 #include "Utilities/Log.h"
 #include "Utilities/PathUtils.h"
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -29,6 +32,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -85,12 +89,14 @@ public:
         std::filesystem::path shaderDirectory,
         std::filesystem::path requestedModel,
         std::filesystem::path requestedScene,
-        std::filesystem::path requestedEnvironment)
+        std::filesystem::path requestedEnvironment,
+        bool terrainDemo)
         : m_maxFrames(maxFrames)
         , m_shaderDirectory(std::move(shaderDirectory))
         , m_requestedModel(std::move(requestedModel))
         , m_requestedScene(std::move(requestedScene))
         , m_requestedEnvironment(std::move(requestedEnvironment))
+        , m_terrainDemo(terrainDemo)
     {
     }
 
@@ -171,7 +177,8 @@ protected:
             iniContents = buffer.str();
         }
         m_hasSavedLayout = iniContents.find("[Window][GI & Lights]") != std::string::npos &&
-                           iniContents.find("[Window][Flight]") != std::string::npos;
+                           iniContents.find("[Window][Flight]") != std::string::npos &&
+                           iniContents.find("[Window][Terrain]") != std::string::npos;
         m_iniPath = mukki::PathToUtf8(iniPath);
         ImGui::GetIO().IniFilename = m_iniPath.c_str();
 
@@ -191,47 +198,15 @@ protected:
         ScanSceneFiles();
         ScanEnvironmentMaps();
 
-        if (!m_requestedModel.empty())
+        if (m_terrainDemo)
+        {
+            SetupStandaloneLightRig();
+            BeginTerrainGeneration();
+        }
+        else if (!m_requestedModel.empty())
         {
             m_pendingModelPath = m_requestedModel;
-
-            // Standalone models get a small default light rig and one probe so they are visible.
-            m_scene.lights.clear();
-            m_scene.probes.clear();
-
-            mukki::SceneLight key{};
-            key.name = "Key";
-            key.light.type = mukki::LightType::Directional;
-            key.light.direction = glm::vec3{-0.4f, -1.0f, -0.3f};
-            key.light.color = glm::vec3{1.0f, 0.98f, 0.95f};
-            key.light.intensity = 3.0f;
-            m_scene.lights.push_back(key);
-
-            mukki::SceneLight fill{};
-            fill.name = "Fill";
-            fill.light.type = mukki::LightType::Point;
-            fill.light.position = glm::vec3{1.5f, 1.5f, 1.5f};
-            fill.light.color = glm::vec3{0.6f, 0.8f, 1.0f};
-            fill.light.intensity = 3.0f;
-            fill.light.range = 8.0f;
-            m_scene.lights.push_back(fill);
-
-            mukki::SceneLight rim{};
-            rim.name = "Rim";
-            rim.light.type = mukki::LightType::Point;
-            rim.light.position = glm::vec3{-1.5f, 1.0f, -1.5f};
-            rim.light.color = glm::vec3{1.0f, 0.7f, 0.4f};
-            rim.light.intensity = 2.0f;
-            rim.light.range = 8.0f;
-            m_scene.lights.push_back(rim);
-
-            mukki::SceneProbe probe{};
-            probe.name = "Probe";
-            probe.position = glm::vec3{0.0f, 1.0f, 0.0f};
-            probe.radius = 0.4f;
-            m_scene.probes.push_back(probe);
-
-            ApplySceneLights();
+            SetupStandaloneLightRig();
         }
         else
         {
@@ -301,6 +276,7 @@ protected:
         m_physics.Step(deltaTime);
         SyncDynamicBodies();
         m_renderer->UpdateAnimations(deltaTime);
+        PollTerrainGeneration();
         UpdateProbeReadback(deltaTime);
         if (m_renderer->ArePhysicsGizmosEnabled())
         {
@@ -388,6 +364,10 @@ protected:
         {
             DrawVolumetricsWindow();
         }
+        if (m_showTerrainWindow)
+        {
+            DrawTerrainWindow();
+        }
         if (m_showFlightWindow)
         {
             DrawFlightWindow();
@@ -440,12 +420,17 @@ protected:
     {
         // The GPU may still be executing the last submitted frame; wait before releasing any
         // resources (descriptor sets, textures) that frame references.
+        if (m_terrainFuture.valid())
+        {
+            m_terrainFuture.wait();
+        }
         if (m_device != nullptr)
         {
             m_device->WaitIdle();
         }
         ReleaseDebugTextures();
         ReleaseProbeTextures();
+        ReleaseTerrainTextures();
         m_ui.Shutdown();
         m_physics.Shutdown();
         m_renderer.reset();
@@ -453,6 +438,47 @@ protected:
     }
 
 private:
+    // Small default light rig for standalone models and the procedural terrain demo.
+    void SetupStandaloneLightRig()
+    {
+        m_scene.lights.clear();
+        m_scene.probes.clear();
+
+        mukki::SceneLight key{};
+        key.name = "Key";
+        key.light.type = mukki::LightType::Directional;
+        key.light.direction = glm::vec3{-0.4f, -1.0f, -0.3f};
+        key.light.color = glm::vec3{1.0f, 0.98f, 0.95f};
+        key.light.intensity = 3.0f;
+        m_scene.lights.push_back(key);
+
+        mukki::SceneLight fill{};
+        fill.name = "Fill";
+        fill.light.type = mukki::LightType::Point;
+        fill.light.position = glm::vec3{1.5f, 1.5f, 1.5f};
+        fill.light.color = glm::vec3{0.6f, 0.8f, 1.0f};
+        fill.light.intensity = 3.0f;
+        fill.light.range = 8.0f;
+        m_scene.lights.push_back(fill);
+
+        mukki::SceneLight rim{};
+        rim.name = "Rim";
+        rim.light.type = mukki::LightType::Point;
+        rim.light.position = glm::vec3{-1.5f, 1.0f, -1.5f};
+        rim.light.color = glm::vec3{1.0f, 0.7f, 0.4f};
+        rim.light.intensity = 2.0f;
+        rim.light.range = 8.0f;
+        m_scene.lights.push_back(rim);
+
+        mukki::SceneProbe probe{};
+        probe.name = "Probe";
+        probe.position = glm::vec3{0.0f, 1.0f, 0.0f};
+        probe.radius = 0.4f;
+        m_scene.probes.push_back(probe);
+
+        ApplySceneLights();
+    }
+
     void ScanSceneFiles()
     {
 #ifdef MRE_SCENES_DIR
@@ -546,6 +572,7 @@ private:
                 ImGui::MenuItem("GI & Lights", nullptr, &m_showGiLightsWindow);
                 ImGui::MenuItem("Objects & Physics", nullptr, &m_showObjectsPhysicsWindow);
                 ImGui::MenuItem("Volumetrics", nullptr, &m_showVolumetricsWindow);
+                ImGui::MenuItem("Terrain", nullptr, &m_showTerrainWindow);
                 ImGui::MenuItem("Flight", nullptr, &m_showFlightWindow);
                 ImGui::MenuItem("G-buffer", nullptr, &m_showGBuffer);
                 ImGui::MenuItem("ImGui demo", nullptr, &m_showDemoWindow);
@@ -630,6 +657,11 @@ private:
             {
                 ClearFlight();
                 m_renderer->ClearScene();
+                m_renderer->SetGroundVisible(true);
+                m_terrainActive = false;
+                m_terrain = mukki::TerrainHeightfield{};
+                ClearTerrainPreview();
+                ApplyCameraPerspective();
                 m_scene = mukki::SceneDescription{};
                 m_sceneSourcePath.clear();
                 m_physics.ClearBodies();
@@ -758,11 +790,13 @@ private:
         m_selectedLight = 0;
         m_selectedObject = 0;
         m_probeFillTarget = -1;
+        m_terrainActive = false;
         if (!m_renderer->LoadScene(m_scene))
         {
             m_sceneStatus = "the renderer failed to load the scene";
             return false;
         }
+        m_renderer->SetGroundVisible(true);
 
         // Apply the authored animation settings (clip, autoplay, loop, speed, start time).
         for (std::size_t index = 0; index < m_scene.objects.size(); ++index)
@@ -788,6 +822,7 @@ private:
         ResetFloorFromSceneBounds();
         RebuildPhysics();
         PrepareFlight();
+        ApplyCameraPerspective();
 
         m_sceneLightsDirty = false;
         m_sceneStatus = "loaded '" + m_scene.name + "' (" + std::to_string(m_scene.objects.size()) +
@@ -1105,6 +1140,11 @@ private:
         {
             m_camera.SetPerspective(glm::radians(70.0f), aspect, 1.0f, 25000.0f);
         }
+        else if (m_terrainActive && !m_terrain.Empty())
+        {
+            const float farPlane = std::max(2000.0f, m_terrain.settings.sizeMeters * 3.0f);
+            m_camera.SetPerspective(glm::radians(60.0f), aspect, 0.5f, farPlane);
+        }
         else
         {
             m_camera.SetPerspective(1.0471975512f, aspect, 0.1f, 1000.0f);
@@ -1389,6 +1429,7 @@ private:
         ImGui::DockBuilderDockWindow("GI & Lights", mainNode);
         ImGui::DockBuilderDockWindow("Objects & Physics", mainNode);
         ImGui::DockBuilderDockWindow("Volumetrics", mainNode);
+        ImGui::DockBuilderDockWindow("Terrain", mainNode);
         ImGui::DockBuilderDockWindow("Flight", mainNode);
         ImGui::DockBuilderFinish(dockspaceId);
     }
@@ -1554,6 +1595,390 @@ private:
         ImGui::Begin("Volumetrics", &m_showVolumetricsWindow);
         DrawEnvironmentSettings();
         DrawCloudSettings();
+        ImGui::End();
+    }
+
+    void BeginTerrainGeneration()
+    {
+        if (m_terrainFuture.valid())
+        {
+            return;
+        }
+
+        const mukki::TerrainSettings settings = m_terrainSettings;
+        m_terrainStatus = "generating terrain...";
+        m_terrainFuture = m_jobSystem.Submit([settings]() { return mukki::GenerateTerrain(settings); });
+    }
+
+    void PollTerrainGeneration()
+    {
+        ReleaseRetiredTerrainTextures();
+        if (!m_terrainFuture.valid())
+        {
+            return;
+        }
+        if (m_terrainFuture.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+        {
+            return;
+        }
+
+        mukki::TerrainHeightfield heightfield{};
+        try
+        {
+            heightfield = m_terrainFuture.get();
+        }
+        catch (const std::exception& exception)
+        {
+            m_terrainStatus = std::string{"terrain generation failed: "} + exception.what();
+            MRE_ERROR("{}", m_terrainStatus);
+            return;
+        }
+        m_terrain = std::move(heightfield);
+        if (m_renderer == nullptr || m_device == nullptr)
+        {
+            return;
+        }
+
+        mukki::GltfModel model = mukki::BuildTerrainModel(m_terrain);
+        if (!m_renderer->LoadGeneratedModel("terrain", std::move(model)))
+        {
+            m_terrainStatus = "failed to upload the generated terrain";
+            MRE_ERROR("{}", m_terrainStatus);
+            return;
+        }
+
+        // The terrain replaces the scene geometry; keep the lights but drop the stale objects so
+        // the editors and physics do not address objects that no longer exist.
+        ClearFlight();
+        m_scene.objects.clear();
+        m_scene.playerPlane.clear();
+        m_scene.probes.clear();
+        m_scene.name = "PCG Terrain";
+        m_sceneStatus = "procedural terrain";
+        m_selectedObject = 0;
+        m_probeFillTarget = -1;
+        m_floor = FloorSettings{};
+        RebuildPhysics();
+
+        m_renderer->SetModelScale(1.0f);
+        m_renderer->SetGroundVisible(false);
+        m_terrainActive = true;
+        UpdateTerrainPreviewTexture();
+        FrameTerrain();
+
+        char status[256];
+        std::snprintf(
+            status,
+            sizeof(status),
+            "generated %ux%u grid (%u vertices) in %.2f s",
+            m_terrain.resolution,
+            m_terrain.resolution,
+            m_terrain.VertexCount(),
+            m_terrain.stats.generationSeconds);
+        m_terrainStatus = status;
+        MRE_INFO("{}", m_terrainStatus);
+    }
+
+    void RemoveTerrain()
+    {
+        if (m_renderer == nullptr)
+        {
+            return;
+        }
+
+        m_renderer->UnloadModel();
+        m_renderer->SetGroundVisible(true);
+        m_terrainActive = false;
+        m_terrain = mukki::TerrainHeightfield{};
+        ClearTerrainPreview();
+        ApplyCameraPerspective();
+        RebuildPhysics();
+        m_scene.name.clear();
+        m_terrainStatus = "terrain removed";
+        m_sceneStatus = "terrain removed";
+    }
+
+    void UpdateTerrainPreviewTexture()
+    {
+        if (m_device == nullptr || m_terrain.Empty())
+        {
+            return;
+        }
+
+        const std::vector<std::uint8_t> pixels = mukki::BuildTerrainPreview(m_terrain);
+        if (pixels.empty())
+        {
+            return;
+        }
+
+        const std::uint32_t side = m_terrain.SideVertices();
+        const mukki::rhi::TextureDesc desc{
+            side,
+            side,
+            mukki::rhi::Format::R8G8B8A8Srgb,
+            mukki::rhi::TextureUsage::Sampled,
+            pixels.data(),
+            pixels.size()};
+        std::unique_ptr<mukki::rhi::Texture> texture = m_device->CreateTexture(desc);
+        if (texture == nullptr)
+        {
+            return;
+        }
+
+        ClearTerrainPreview();
+        m_terrainPreviewTexture = std::move(texture);
+        m_terrainPreviewId = m_ui.AddTexture(*m_terrainPreviewTexture);
+    }
+
+    void ClearTerrainPreview()
+    {
+        if (m_terrainPreviewTexture != nullptr)
+        {
+            m_retiredTerrainTextures.push_back(
+                RetiredTerrainTexture{std::move(m_terrainPreviewTexture), m_terrainPreviewId, m_frameCount});
+            m_terrainPreviewId = 0;
+        }
+    }
+
+    // The preview texture's ImGui descriptor must outlive the frames that referenced it.
+    void ReleaseRetiredTerrainTextures()
+    {
+        const int grace = (m_device != nullptr
+                               ? static_cast<int>(m_device->GetFramesInFlight())
+                               : 2) +
+                          2;
+        for (std::size_t index = 0; index < m_retiredTerrainTextures.size();)
+        {
+            if (m_frameCount - m_retiredTerrainTextures[index].frame >= grace)
+            {
+                m_ui.RemoveTexture(m_retiredTerrainTextures[index].id);
+                m_retiredTerrainTextures.erase(
+                    m_retiredTerrainTextures.begin() + static_cast<std::ptrdiff_t>(index));
+            }
+            else
+            {
+                ++index;
+            }
+        }
+    }
+
+    void ReleaseTerrainTextures()
+    {
+        if (m_terrainPreviewId != 0)
+        {
+            m_ui.RemoveTexture(m_terrainPreviewId);
+            m_terrainPreviewId = 0;
+        }
+        m_terrainPreviewTexture.reset();
+        for (const RetiredTerrainTexture& retired : m_retiredTerrainTextures)
+        {
+            m_ui.RemoveTexture(retired.id);
+        }
+        m_retiredTerrainTextures.clear();
+    }
+
+    void FrameTerrain()
+    {
+        if (m_terrain.Empty())
+        {
+            return;
+        }
+
+        const float size = m_terrain.settings.sizeMeters;
+        const float peak = m_terrain.stats.maxHeightMeters;
+        const float farPlane = std::max(2000.0f, size * 3.0f);
+        m_camera.SetPerspective(glm::radians(60.0f), GetWindow().GetAspectRatio(), 0.5f, farPlane);
+
+        const float distance = std::max(size * 0.75f, 240.0f);
+        const glm::vec3 position{size * 0.15f, peak + size * 0.22f, distance};
+        const glm::vec3 target{0.0f, peak * 0.3f, 0.0f};
+        m_camera.SetView(position, glm::normalize(target - position), glm::vec3{0.0f, 1.0f, 0.0f});
+        m_controller.SyncFromCamera(m_camera);
+    }
+
+    void DrawTerrainWindow()
+    {
+        ImGui::Begin("Terrain", &m_showTerrainWindow);
+
+        const bool generating = m_terrainFuture.valid();
+        ImGui::TextWrapped(
+            "Seeded PCG landscape: domain-warped ridged Perlin mountains, FBM greenland, "
+            "hydraulic droplet and thermal talus erosion, then biome classification.");
+        if (generating)
+        {
+            ImGui::TextColored(ImVec4{1.0f, 0.8f, 0.2f, 1.0f}, "Generating terrain...");
+        }
+
+        ImGui::BeginDisabled(generating);
+
+        ImGui::SeparatorText("World");
+        int seed = static_cast<int>(m_terrainSettings.seed);
+        if (ImGui::DragInt("Seed", &seed, 1.0f, 0, 999999))
+        {
+            m_terrainSettings.seed = static_cast<std::uint32_t>(std::max(seed, 0));
+        }
+        int resolution = static_cast<int>(m_terrainSettings.resolution);
+        if (ImGui::SliderInt("Resolution", &resolution, 32, 512))
+        {
+            m_terrainSettings.resolution = static_cast<std::uint32_t>(std::max(resolution, 8));
+        }
+        ImGui::SliderFloat("Size (m)", &m_terrainSettings.sizeMeters, 256.0f, 8192.0f, "%.0f");
+        ImGui::SliderFloat(
+            "Peak height (m)",
+            &m_terrainSettings.maxHeightMeters,
+            50.0f,
+            2000.0f,
+            "%.0f");
+
+        if (ImGui::CollapsingHeader("Mountains & greenland", ImGuiTreeNodeFlags_DefaultOpen))
+        {
+            ImGui::SliderFloat(
+                "Continent frequency",
+                &m_terrainSettings.continentFrequency,
+                0.2f,
+                6.0f,
+                "%.2f");
+            ImGui::SliderFloat(
+                "Mountain frequency",
+                &m_terrainSettings.mountainFrequency,
+                0.5f,
+                12.0f,
+                "%.2f");
+            int octaves = static_cast<int>(m_terrainSettings.octaves);
+            if (ImGui::SliderInt("Octaves", &octaves, 1, 10))
+            {
+                m_terrainSettings.octaves = static_cast<std::uint32_t>(octaves);
+            }
+            ImGui::SliderFloat("Lacunarity", &m_terrainSettings.lacunarity, 1.5f, 3.0f, "%.2f");
+            ImGui::SliderFloat("Persistence", &m_terrainSettings.persistence, 0.2f, 0.8f, "%.2f");
+            ImGui::SliderFloat("Ridge sharpness", &m_terrainSettings.ridgeSharpness, 0.5f, 4.0f, "%.2f");
+            ImGui::SliderFloat("Mountain coverage", &m_terrainSettings.mountainCoverage, 0.1f, 0.9f, "%.2f");
+            ImGui::SliderFloat("Domain warp", &m_terrainSettings.domainWarp, 0.0f, 1.0f, "%.2f");
+        }
+
+        if (ImGui::CollapsingHeader("Degradation", ImGuiTreeNodeFlags_DefaultOpen))
+        {
+            ImGui::Checkbox("Hydraulic erosion (droplets)", &m_terrainSettings.hydraulicErosion);
+            ImGui::SliderFloat(
+                "Droplet density",
+                &m_terrainSettings.hydraulicDropletDensity,
+                0.0f,
+                1.0f,
+                "%.2f");
+            int lifetime = static_cast<int>(m_terrainSettings.hydraulicLifetime);
+            if (ImGui::SliderInt("Droplet lifetime", &lifetime, 5, 60))
+            {
+                m_terrainSettings.hydraulicLifetime = static_cast<std::uint32_t>(lifetime);
+            }
+            int brushRadius = static_cast<int>(m_terrainSettings.hydraulicBrushRadius);
+            if (ImGui::SliderInt("Erosion brush radius", &brushRadius, 1, 6))
+            {
+                m_terrainSettings.hydraulicBrushRadius = static_cast<std::uint32_t>(brushRadius);
+            }
+            ImGui::SliderFloat("Erosion rate", &m_terrainSettings.hydraulicErodeSpeed, 0.0f, 1.0f, "%.2f");
+            ImGui::SliderFloat("Deposition rate", &m_terrainSettings.hydraulicDepositSpeed, 0.0f, 1.0f, "%.2f");
+            ImGui::SliderFloat("Sediment capacity", &m_terrainSettings.hydraulicCapacity, 1.0f, 10.0f, "%.2f");
+            ImGui::Separator();
+            ImGui::Checkbox("Thermal erosion (talus)", &m_terrainSettings.thermalErosion);
+            int thermalIterations = static_cast<int>(m_terrainSettings.thermalIterations);
+            if (ImGui::SliderInt("Thermal iterations", &thermalIterations, 0, 40))
+            {
+                m_terrainSettings.thermalIterations = static_cast<std::uint32_t>(thermalIterations);
+            }
+            ImGui::SliderFloat(
+                "Talus angle (deg)",
+                &m_terrainSettings.thermalTalusAngleDegrees,
+                15.0f,
+                60.0f,
+                "%.1f");
+        }
+
+        if (ImGui::CollapsingHeader("Biomes", ImGuiTreeNodeFlags_DefaultOpen))
+        {
+            ImGui::SliderFloat("Water level", &m_terrainSettings.waterLevel, 0.0f, 0.3f, "%.3f");
+            ImGui::SliderFloat("Beach band", &m_terrainSettings.beachBand, 0.0f, 0.1f, "%.3f");
+            ImGui::SliderFloat("Tree line", &m_terrainSettings.treeLine, 0.1f, 0.95f, "%.2f");
+            ImGui::SliderFloat("Snow line", &m_terrainSettings.snowLine, 0.1f, 0.98f, "%.2f");
+            ImGui::SliderFloat("Rock slope", &m_terrainSettings.rockSlope, 0.1f, 0.8f, "%.2f");
+            ImGui::SliderFloat("Forest moisture", &m_terrainSettings.forestMoisture, 0.0f, 1.0f, "%.2f");
+            ImGui::TextDisabled("Height thresholds are fractions of the peak height.");
+        }
+
+        ImGui::Separator();
+        if (ImGui::Button("Generate"))
+        {
+            BeginTerrainGeneration();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("New seed & generate"))
+        {
+            ++m_terrainSettings.seed;
+            BeginTerrainGeneration();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Remove terrain"))
+        {
+            RemoveTerrain();
+        }
+
+        ImGui::EndDisabled();
+
+        bool groundVisible = m_renderer->IsGroundVisible();
+        if (ImGui::Checkbox("Show ground plane", &groundVisible))
+        {
+            m_renderer->SetGroundVisible(groundVisible);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Frame terrain"))
+        {
+            FrameTerrain();
+        }
+
+        if (!m_terrainStatus.empty())
+        {
+            ImGui::TextWrapped("%s", m_terrainStatus.c_str());
+        }
+
+        if (!m_terrain.Empty())
+        {
+            ImGui::SeparatorText("Last generation");
+            ImGui::Text(
+                "Vertices: %u   Triangles: %llu",
+                m_terrain.VertexCount(),
+                static_cast<unsigned long long>(m_terrain.resolution) * m_terrain.resolution * 2ull);
+            ImGui::Text(
+                "Time: %.2f s   Droplets: %llu   Thermal passes: %llu",
+                m_terrain.stats.generationSeconds,
+                static_cast<unsigned long long>(m_terrain.stats.hydraulicDroplets),
+                static_cast<unsigned long long>(m_terrain.stats.thermalIterations));
+            ImGui::Text(
+                "Height: %.1f .. %.1f m (mean %.1f m)",
+                static_cast<double>(m_terrain.stats.minHeightMeters),
+                static_cast<double>(m_terrain.stats.maxHeightMeters),
+                static_cast<double>(m_terrain.stats.meanHeightMeters));
+            ImGui::Text("Max slope: %.1f deg", static_cast<double>(m_terrain.stats.maxSlopeDegrees));
+            for (std::uint32_t biomeIndex = 0; biomeIndex < mukki::kTerrainBiomeCount; ++biomeIndex)
+            {
+                ImGui::Text(
+                    "%s: %.1f%%",
+                    mukki::TerrainBiomeName(static_cast<mukki::TerrainBiome>(biomeIndex)),
+                    static_cast<double>(m_terrain.stats.biomeFractions[biomeIndex]) * 100.0);
+                if (biomeIndex + 1u < mukki::kTerrainBiomeCount && (biomeIndex % 3u) != 2u)
+                {
+                    ImGui::SameLine(0.0f, 16.0f);
+                }
+            }
+
+            if (m_terrainPreviewId != 0)
+            {
+                ImGui::SeparatorText("Biome preview");
+                const float available = ImGui::GetContentRegionAvail().x;
+                const float width = std::max(64.0f, std::min(available, 420.0f));
+                ImGui::Image(ImTextureRef{m_terrainPreviewId}, ImVec2(width, width));
+                ImGui::TextDisabled("Hill-shaded biome albedo (north is up).");
+            }
+        }
+
         ImGui::End();
     }
 
@@ -3049,6 +3474,13 @@ private:
         int frame = 0;
     };
 
+    struct RetiredTerrainTexture
+    {
+        std::unique_ptr<mukki::rhi::Texture> texture{};
+        ImTextureID id = 0;
+        int frame = 0;
+    };
+
     mukki::Camera m_camera{};
     mukki::FlyCameraController m_controller{};
     glm::mat4 m_previousViewProjection{1.0f};
@@ -3082,6 +3514,14 @@ private:
     ImTextureID m_probeTextureId = 0;
     float m_probeReadbackTimer = 0.0f;
     float m_probeLiveInterval = 0.5f;
+    mukki::TerrainSettings m_terrainSettings{};
+    mukki::TerrainHeightfield m_terrain{};
+    std::future<mukki::TerrainHeightfield> m_terrainFuture{};
+    std::unique_ptr<mukki::rhi::Texture> m_terrainPreviewTexture{};
+    std::vector<RetiredTerrainTexture> m_retiredTerrainTextures{};
+    ImTextureID m_terrainPreviewId = 0;
+    std::string m_terrainStatus{};
+    bool m_terrainActive = false;
     std::string m_iniPath{};
     std::vector<std::filesystem::path> m_sceneFiles{};
     std::filesystem::path m_scenesRoot{};
@@ -3111,6 +3551,7 @@ private:
     int m_sceneFileIndex = 0;
     int m_maxFrames = 0;
     int m_frameCount = 0;
+    bool m_terrainDemo = false;
     bool m_sceneLightsDirty = false;
     bool m_physicsDirty = false;
     bool m_debugTexturesRegistered = false;
@@ -3120,6 +3561,7 @@ private:
     bool m_showGiLightsWindow = true;
     bool m_showObjectsPhysicsWindow = true;
     bool m_showVolumetricsWindow = true;
+    bool m_showTerrainWindow = true;
     bool m_showFlightWindow = true;
     bool m_showGBuffer = true;
     bool m_showDemoWindow = false;
@@ -3140,11 +3582,16 @@ int main(int argc, char** argv)
     std::filesystem::path requestedModel{};
     std::filesystem::path requestedScene{};
     std::filesystem::path requestedEnvironment{};
+    bool terrainDemo = false;
     for (int i = 1; i < argc; ++i)
     {
         if (std::strcmp(argv[i], "--frames") == 0 && i + 1 < argc)
         {
             maxFrames = std::atoi(argv[i + 1]);
+        }
+        else if (std::strcmp(argv[i], "--terrain") == 0)
+        {
+            terrainDemo = true;
         }
         else if (std::strcmp(argv[i], "--model") == 0 && i + 1 < argc)
         {
@@ -3175,7 +3622,13 @@ int main(int argc, char** argv)
         const std::filesystem::path shaderDirectory =
             std::filesystem::absolute(argv[0]).parent_path() / "shaders";
 
-        SandboxApp app{maxFrames, shaderDirectory, requestedModel, requestedScene, requestedEnvironment};
+        SandboxApp app{
+            maxFrames,
+            shaderDirectory,
+            requestedModel,
+            requestedScene,
+            requestedEnvironment,
+            terrainDemo};
         if (!app.Init(mukki::WindowDesc{}))
         {
             MRE_CRITICAL("Failed to initialize the application");

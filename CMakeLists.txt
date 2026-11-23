@@ -129,6 +129,11 @@ add_library(mukki_engine STATIC
     Scene/SceneBinary.cpp
     Scene/SceneDescription.cpp
     Scene/SceneJson.cpp
+    Terrain/TerrainErosion.cpp
+    Terrain/TerrainGenerator.cpp
+    Terrain/TerrainMesh.cpp
+    Terrain/TerrainNoise.cpp
+    Terrain/TerrainTypes.cpp
     Renderer/Vulkan/Core/FrameSync.cpp
     Renderer/Vulkan/Core/VkCommandList.cpp
     Renderer/Vulkan/Core/VkConversions.cpp

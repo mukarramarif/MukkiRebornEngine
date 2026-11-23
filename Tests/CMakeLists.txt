@@ -27,6 +27,7 @@ add_executable(mukki_tests
     test_shader_reflection.cpp
     test_shadow_cascades.cpp
     test_subsurface.cpp
+    test_terrain.cpp
     test_vk_conversions.cpp
 )
 target_compile_definitions(mukki_tests PRIVATE MRE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/..")

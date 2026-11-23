@@ -115,18 +115,25 @@ copied next to the executable automatically.
 
 Pass `--frames N` to run a fixed number of frames and exit (used for smoke testing). Pass
 `--model <path>` to load a specific glTF/GLB file instead of the default scene, `--scene <path>`
-to load a JSON scene (compiled to bytecode next to the executable, see [Scenes](#scenes)), or
+to load a JSON scene (compiled to bytecode next to the executable, see [Scenes](#scenes)),
 `--env <path>` to use a Radiance `.hdr` equirectangular environment map for the image based
-lighting (a sample lives in `AssetLibrary/lakeside_sunrise_2k.hdr`).
+lighting (a sample lives in `AssetLibrary/lakeside_sunrise_2k.hdr`), or `--terrain` to generate
+and display the default procedural terrain at startup.
 
 Controls: `WASD`/`QE` to move, mouse to look, `Shift` to move faster, `Tab` to toggle the cursor for
 UI interaction (or hold `Left Alt`), `Esc` to quit.
 
 The sandbox uses a docked ImGui layout persisted next to the executable (`imgui.ini`): `Stats`,
 `Scenes` and `G-buffer` tab together in the left group, while `GI & Lights`, `Objects & Physics`,
-`Volumetrics` (environment + clouds) and `Flight` tab together in the main group. `View -> Reset
-layout` in the `Stats` menu restores the default layout; stale layouts from older window sets are
-rebuilt automatically. glTF objects loaded from a scene are auto-fitted to the ground plane.
+`Volumetrics` (environment + clouds), `Terrain` and `Flight` tab together in the main group. `View
+-> Reset layout` in the `Stats` menu restores the default layout; stale layouts from older window
+sets are rebuilt automatically. glTF objects loaded from a scene are auto-fitted to the ground
+plane.
+
+The `Terrain` window generates seeded PCG landscapes: Perlin-based mountains and greenland, hydraulic
+and thermal erosion, biome classification (water, beach, grassland, forest, rock, snow), and a
+hill-shaded biome preview. Generation runs asynchronously on the job system; `Generate` uploads the
+new mesh and hides the ground plane.
 
 ## Rendering pipeline
 

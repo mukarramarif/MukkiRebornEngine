@@ -115,4 +115,10 @@ void FlyCameraController::Update(Camera& camera, const CameraInput& input, float
     }
 }
 
+void FlyCameraController::SyncFromCamera(const Camera& camera)
+{
+    m_yaw = camera.GetYaw();
+    m_pitch = camera.GetPitch();
+}
+
 } // namespace mukki

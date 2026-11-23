@@ -80,10 +80,10 @@ must not expose backend types, and Vulkan types may only appear under `Renderer/
   extent. Sandbox shutdown calls `Device::WaitIdle` before the UI/renderer release resources.
 - Sandbox UI: ImGui docking is enabled in `Renderer/Vulkan/UiLayer`; `Sandbox/main.cpp` builds a
   default dock layout with the `imgui_internal.h` DockBuilder API — `Stats`/`Scenes`/`G-buffer`
-  tabbed in the left group and `GI & Lights`/`Objects & Physics`/`Volumetrics`/`Flight` tabbed in
-  the main group. The layout persists in `imgui.ini` next to the executable (`io.IniFilename`); the
-  `Stats` `View` menu toggles windows and has `Reset layout`; layouts that predate the marker
-  windows are rebuilt automatically.
+  tabbed in the left group and `GI & Lights`/`Objects & Physics`/`Volumetrics`/`Terrain`/`Flight`
+  tabbed in the main group. The layout persists in `imgui.ini` next to the executable
+  (`io.IniFilename`); the `Stats` `View` menu toggles windows and has `Reset layout`; layouts that
+  predate the marker windows are rebuilt automatically.
 - Animation & skinning: the loader parses skins, animations and the interleaved `JOINTS_0`/
   `WEIGHTS_0` attributes into `GltfVertex` (position/normal/uv + joints u32x4 + weights f32x4 =
   64-byte stride; the `meshlet.slang` `kMeshletVertexStride` and the BLAS/`GpuGeometryData`
@@ -242,6 +242,22 @@ must not expose backend types, and Vulkan types may only appear under `Renderer/
   23-25). `CloudSettings`/`CloudUniform` (`Renderer/Clouds/CloudSettings.h`) mirror the shaders;
   noise generation costs ~4 s Debug (<1 s Release) at startup. `.hdr` environment maps, the
   gradient sky, GI and reflections are unaffected (clouds are sky-only).
+- PCG terrain: `Terrain/` generates deterministic landscapes for landscaping (`TerrainSettings`,
+  `GenerateTerrain`). Seeded 2D Perlin noise (`TerrainNoise`, explicit permutation shuffle) is
+  layered into domain-warped ridged multifractal mountains blended with FBM greenland and coast
+  masks. Degradation runs in two stages: `TerrainErosion` droplet-based hydraulic erosion on the
+  normalised heightfield (sediment transport, bilinear deposition, deterministic SplitMix droplet
+  stream, capped at 250k droplets) and talus-angle thermal relaxation in metres. Low points are
+  flattened at `waterLevel`, normals are recomputed, and every vertex is classified into water /
+  beach / grassland / forest / rock / snow from height, slope and a moisture FBM
+  (`ClassifyTerrainBiome`). `BuildTerrainModel` emits a world-space Y-up `GltfModel` with the biome
+  albedo as an sRGB base colour texture, and `DeferredRenderer::LoadGeneratedModel` uploads such an
+  in-memory model without the glTF fit-and-centre normalization. The sandbox `Terrain` window
+  regenerates asynchronously on the JobSystem, replaces the scene geometry (keeping lights),
+  hides the ground plane, frames the camera and shows a hill-shaded biome preview; the
+  `--terrain` CLI flag generates the default landscape at startup. `Tests/test_terrain.cpp`
+  covers determinism, noise ranges, both erosion stages, biome classification, the mesh builder
+  and the preview.
 - Image based lighting: `Renderer/Lighting/Environment.h/.cpp` defines a parametric gradient sky
   (`EnvironmentSettings`); `ComputeEnvironmentSh` numerically projects it onto SH L2 with the
   Lambert band factors folded in (diffuse = `albedo * EvaluateSkySh`), and `BuildEnvironmentBrdfLut`

@@ -75,6 +75,10 @@ public:
 
     void Update(Camera& camera, const CameraInput& input, float deltaTime);
 
+    // Snaps the controller's internal yaw/pitch to the camera orientation. Call after teleporting
+    // the camera so the next Update keeps the new heading instead of restoring the old one.
+    void SyncFromCamera(const Camera& camera);
+
     [[nodiscard]] const Settings& GetSettings() const { return m_settings; }
     Settings& GetSettings() { return m_settings; }
 

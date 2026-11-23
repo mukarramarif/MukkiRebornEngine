@@ -24,6 +24,7 @@
 #include <future>
 #include <iterator>
 #include <string>
+#include <utility>
 
 #include <glm/ext/matrix_transform.hpp>
 #include <glm/geometric.hpp>
@@ -712,6 +713,36 @@ bool DeferredRenderer::LoadModel(const std::filesystem::path& path)
     return true;
 }
 
+bool DeferredRenderer::LoadGeneratedModel(std::string name, GltfModel model)
+{
+    MRE_ASSERT(
+        m_initialized,
+        "DeferredRenderer::LoadGeneratedModel called before DeferredRenderer::Init");
+    MRE_ASSERT(m_device != nullptr, "DeferredRenderer requires a device");
+
+    if (model.primitives.empty())
+    {
+        MRE_WARN("Generated model '{}' has no primitives", name);
+        return false;
+    }
+
+    // UnloadModel also cancels a pending asynchronous glTF load so it cannot replace the
+    // generated geometry when it finishes.
+    UnloadModel();
+
+    const std::optional<std::size_t> modelIndex = UploadModel(
+        std::filesystem::path{std::move(name)},
+        model,
+        false);
+    if (!modelIndex.has_value())
+    {
+        return false;
+    }
+
+    AddModelInstance(*modelIndex, glm::mat4{1.0f});
+    return true;
+}
+
 bool DeferredRenderer::LoadScene(const SceneDescription& scene)
 {
     MRE_ASSERT(m_initialized, "DeferredRenderer::LoadScene called before DeferredRenderer::Init");
@@ -811,7 +842,10 @@ bool DeferredRenderer::PollModelLoad()
     return true;
 }
 
-std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::path& path, GltfModel& model)
+std::optional<std::size_t> DeferredRenderer::UploadModel(
+    const std::filesystem::path& path,
+    GltfModel& model,
+    bool applyFit)
 {
     MRE_PROFILE_ZONE_N("UploadModel");
     MRE_ASSERT(m_device != nullptr, "DeferredRenderer requires a device");
@@ -821,18 +855,25 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
     resources->vertexCount = model.vertexCount;
     resources->triangleCount = model.triangleCount;
 
-    const glm::vec3 center = (model.minBounds + model.maxBounds) * 0.5f;
-    const glm::vec3 extent = model.maxBounds - model.minBounds;
-    const float maxExtent = std::max({extent.x, extent.y, extent.z});
-    const float scale = maxExtent > 0.0f ? 2.5f / maxExtent : 1.0f;
-    const float lift = (center.y - model.minBounds.y) * scale;
+    glm::mat4 fit{1.0f};
+    glm::vec3 fittedMin = model.minBounds;
+    glm::vec3 fittedMax = model.maxBounds;
+    if (applyFit)
+    {
+        const glm::vec3 center = (model.minBounds + model.maxBounds) * 0.5f;
+        const glm::vec3 extent = model.maxBounds - model.minBounds;
+        const float maxExtent = std::max({extent.x, extent.y, extent.z});
+        const float scale = maxExtent > 0.0f ? 2.5f / maxExtent : 1.0f;
+        const float lift = (center.y - model.minBounds.y) * scale;
 
-    const glm::mat4 fit = glm::translate(glm::mat4{1.0f}, glm::vec3{0.0f, lift, 0.0f}) *
-                          glm::scale(glm::mat4{1.0f}, glm::vec3{scale}) *
-                          glm::translate(glm::mat4{1.0f}, -center);
+        fit = glm::translate(glm::mat4{1.0f}, glm::vec3{0.0f, lift, 0.0f}) *
+              glm::scale(glm::mat4{1.0f}, glm::vec3{scale}) *
+              glm::translate(glm::mat4{1.0f}, -center);
 
-    const glm::vec3 fittedMin = glm::vec3{fit * glm::vec4{model.minBounds, 1.0f}};
-    const glm::vec3 fittedMax = glm::vec3{fit * glm::vec4{model.maxBounds, 1.0f}};
+        fittedMin = glm::vec3{fit * glm::vec4{model.minBounds, 1.0f}};
+        fittedMax = glm::vec3{fit * glm::vec4{model.maxBounds, 1.0f}};
+    }
+
     resources->fitMatrix = fit;
     resources->fittedBounds.center = (fittedMin + fittedMax) * 0.5f;
     resources->fittedBounds.radius = glm::length(fittedMax - fittedMin) * 0.5f;

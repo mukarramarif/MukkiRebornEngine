@@ -328,6 +328,11 @@ public:
     bool PollModelLoad();
     void UnloadModel();
 
+    // Uploads an in-memory model that is already authored in world units (procedurally generated
+    // terrain), without the automatic fit-and-centre normalization applied to glTF files. Replaces
+    // the current models and instances; lights and the ground plane are kept.
+    bool LoadGeneratedModel(std::string name, GltfModel model);
+
     // Loads every glTF object and light from a scene description. Models referenced more than once
     // are loaded and uploaded only once. Replaces the current models and lights; the ground plane
     // is kept.
@@ -714,7 +719,10 @@ private:
     void RecordReflectionPasses(rhi::CommandList& commandList, std::uint32_t frameIndex);
     [[nodiscard]] bool IsReflectionActive() const;
     void RecordDebugLines(rhi::CommandList& commandList, const FrameView& view);
-    [[nodiscard]] std::optional<std::size_t> UploadModel(const std::filesystem::path& path, GltfModel& model);
+    [[nodiscard]] std::optional<std::size_t> UploadModel(
+        const std::filesystem::path& path,
+        GltfModel& model,
+        bool applyFit = true);
     [[nodiscard]] std::optional<std::size_t> LoadModelResources(const std::filesystem::path& path);
     void AddModelInstance(std::size_t modelIndex, const glm::mat4& transform);
     void ClearModelInstances();
