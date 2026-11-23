@@ -66,6 +66,8 @@ rhi::Format FromSpvFormat(SpvReflectFormat format)
         return rhi::Format::R32G32B32Sfloat;
     case SPV_REFLECT_FORMAT_R32G32B32A32_SFLOAT:
         return rhi::Format::R32G32B32A32Sfloat;
+    case SPV_REFLECT_FORMAT_R32G32B32A32_UINT:
+        return rhi::Format::R32G32B32A32Uint;
     default:
         MRE_ASSERT(false, "Unsupported vertex input format {} in shader reflection", static_cast<int>(format));
         return rhi::Format::Undefined;

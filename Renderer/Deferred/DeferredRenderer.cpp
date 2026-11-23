@@ -201,7 +201,9 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
         rhi::DescriptorBinding{
             2,
             rhi::DescriptorType::StorageBuffer,
-            rhi::ShaderStageMask::FragmentComputeMesh,
+            // Morph delta buffers are read by the vertex shaders, so the bindless storage array
+            // must also cover the vertex stage.
+            rhi::ShaderStageMask::VertexFragmentComputeMesh,
             rhi::kMaxBindlessBuffers,
             true},
     };
@@ -327,6 +329,26 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
     m_tlas.resize(framesInFlight);
     m_tlasInstanceCounts.assign(framesInFlight, 0);
     m_geometryDataBuffers.resize(framesInFlight);
+    CreateJointPaletteResources(device);
+    // Per draw item morph state and the per-frame current/previous weight regions.
+    m_morphDataBuffers.clear();
+    m_morphWeightBuffers.clear();
+    m_morphDataBuffers.reserve(framesInFlight);
+    m_morphWeightBuffers.reserve(framesInFlight);
+    for (std::uint32_t frame = 0; frame < framesInFlight; ++frame)
+    {
+        m_morphDataBuffers.push_back(device.CreateBuffer(rhi::BufferDesc{
+            kMaxObjectData * sizeof(GpuMorphData),
+            rhi::BufferUsage::Storage,
+            true}));
+        m_morphWeightBuffers.push_back(device.CreateBuffer(rhi::BufferDesc{
+            2ull * kMaxObjectData * kMaxMorphTargets * sizeof(float),
+            rhi::BufferUsage::Storage,
+            true}));
+        MRE_ASSERT(
+            m_morphDataBuffers.back() != nullptr && m_morphWeightBuffers.back() != nullptr,
+            "Failed to create the morph buffers");
+    }
     m_objectDataBuffers.clear();
     m_uniformBuffers.reserve(framesInFlight);
     m_sceneSets.reserve(framesInFlight);
@@ -344,6 +366,18 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
         std::unique_ptr<rhi::DescriptorSet> sceneSet = device.CreateDescriptorSet(*m_sceneSetLayout);
         sceneSet->BindBuffer(0, *m_uniformBuffers.back());
         sceneSet->BindBuffer(1, *m_objectDataBuffers.back());
+        if (frame < m_jointBuffers.size() && m_jointBuffers[frame] != nullptr)
+        {
+            sceneSet->BindBuffer(2, *m_jointBuffers[frame]);
+        }
+        if (frame < m_morphDataBuffers.size() && m_morphDataBuffers[frame] != nullptr)
+        {
+            sceneSet->BindBuffer(3, *m_morphDataBuffers[frame]);
+        }
+        if (frame < m_morphWeightBuffers.size() && m_morphWeightBuffers[frame] != nullptr)
+        {
+            sceneSet->BindBuffer(4, *m_morphWeightBuffers[frame]);
+        }
         m_sceneSets.push_back(std::move(sceneSet));
     }
 
@@ -465,6 +499,9 @@ void DeferredRenderer::Shutdown()
     m_shadowMeshletCommandBuffers.clear();
     m_shadowMeshSets.clear();
     m_shadowCullSets.clear();
+    m_jointBuffers.clear();
+    m_morphDataBuffers.clear();
+    m_morphWeightBuffers.clear();
     m_meshletCount = 0;
     m_meshletTriangleCount = 0;
     m_meshletRenderingSupported = false;
@@ -796,6 +833,7 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
 
     const glm::vec3 fittedMin = glm::vec3{fit * glm::vec4{model.minBounds, 1.0f}};
     const glm::vec3 fittedMax = glm::vec3{fit * glm::vec4{model.maxBounds, 1.0f}};
+    resources->fitMatrix = fit;
     resources->fittedBounds.center = (fittedMin + fittedMax) * 0.5f;
     resources->fittedBounds.radius = glm::length(fittedMax - fittedMin) * 0.5f;
     resources->fittedMin = glm::min(fittedMin, fittedMax);
@@ -953,6 +991,8 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
     resources->accelerationStructures.reserve(model.primitives.size());
     resources->meshletBuffers.reserve(model.primitives.size());
     resources->meshletPrimitives.reserve(model.primitives.size());
+    resources->morphBuffers.reserve(model.primitives.size());
+    resources->morphBufferIndices.reserve(model.primitives.size());
     for (const GltfPrimitive& primitive : model.primitives)
     {
         const std::uint64_t vertexBytes = sizeof(GltfVertex) * primitive.vertices.size();
@@ -987,9 +1027,12 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
         }
 
         // Pack the meshlets, the vertex index list and the packed micro triangles into one
-        // storage buffer that is registered in the bindless buffer array.
+        // storage buffer that is registered in the bindless buffer array. Skinned primitives skip
+        // the mesh shader path: their vertices deform per pose, so they render through the vertex
+        // pipeline with GPU skinning. Morphed primitives do the same (deltas are applied in the
+        // vertex shader before skinning).
         resources->meshletPrimitives.push_back(ModelResources::MeshletPrimitive{});
-        if (meshShaderSupported)
+        if (meshShaderSupported && primitive.skinIndex < 0 && primitive.morphTargets.empty())
         {
             const MeshletMesh meshlets = BuildMeshlets(primitive.vertices, primitive.indices);
             if (!meshlets.Empty())
@@ -1050,11 +1093,70 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
                 m_meshletTriangleCount += meshlets.meshletTriangles.size();
             }
         }
+
+        // Morph target deltas: [target * vertexCount + vertex] pairs of (position delta,
+        // normal delta) float4s, registered in the bindless storage buffer array so the vertex
+        // shaders can index them per draw item.
+        resources->morphBuffers.push_back(nullptr);
+        resources->morphBufferIndices.push_back(0u);
+        if (!primitive.morphTargets.empty())
+        {
+            if (primitive.morphTargets.size() > kMaxMorphTargets)
+            {
+                MRE_WARN(
+                    "Model '{}' primitive has {} morph targets (max {}); morphing disabled for it",
+                    resources->name,
+                    primitive.morphTargets.size(),
+                    kMaxMorphTargets);
+            }
+            else
+            {
+                const std::size_t vertexCount = primitive.vertices.size();
+                std::vector<glm::vec4> deltas(
+                    primitive.morphTargets.size() * vertexCount * 2u,
+                    glm::vec4{0.0f});
+                for (std::size_t target = 0; target < primitive.morphTargets.size(); ++target)
+                {
+                    const GltfMorphTarget& morph = primitive.morphTargets[target];
+                    for (std::size_t vertex = 0; vertex < vertexCount; ++vertex)
+                    {
+                        glm::vec3 positionDelta{0.0f};
+                        glm::vec3 normalDelta{0.0f};
+                        if (vertex < morph.positionDeltas.size())
+                        {
+                            positionDelta = morph.positionDeltas[vertex];
+                        }
+                        if (vertex < morph.normalDeltas.size())
+                        {
+                            normalDelta = morph.normalDeltas[vertex];
+                        }
+                        deltas[(target * vertexCount + vertex) * 2u + 0u] =
+                            glm::vec4{positionDelta, 0.0f};
+                        deltas[(target * vertexCount + vertex) * 2u + 1u] =
+                            glm::vec4{normalDelta, 0.0f};
+                    }
+                }
+
+                resources->morphBuffers.back() = m_device->CreateBuffer(
+                    rhi::BufferDesc{
+                        deltas.size() * sizeof(glm::vec4),
+                        rhi::BufferUsage::Storage,
+                        false},
+                    deltas.data(),
+                    deltas.size() * sizeof(glm::vec4));
+                resources->morphBufferIndices.back() = m_nextBindlessBuffer++;
+                m_bindlessSet->BindStorageBuffer(
+                    2,
+                    *resources->morphBuffers.back(),
+                    resources->morphBufferIndices.back());
+            }
+        }
     }
     m_blasDirty = true;
 
-    for (const GltfNode& node : model.nodes)
+    for (std::size_t nodeIndex = 0; nodeIndex < model.nodes.size(); ++nodeIndex)
     {
+        const GltfNode& node = model.nodes[nodeIndex];
         if (node.meshIndex < 0 || node.meshIndex >= static_cast<int>(model.meshPrimitives.size()))
         {
             continue;
@@ -1069,7 +1171,10 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
             item.indexBuffer = resources->indexBuffers[primitiveIndex].get();
             item.indexCount = static_cast<std::uint32_t>(primitive.indices.size());
             item.firstIndex = 0;
-            item.pushConstants.model = fit * node.worldTransform;
+            item.nodeIndex = static_cast<int>(nodeIndex);
+            item.skinIndex = primitive.skinIndex;
+            item.baseNodeWorld = fit * node.worldTransform;
+            item.pushConstants.model = item.baseNodeWorld;
             if (primitiveIndex < resources->accelerationStructures.size())
             {
                 item.blas = resources->accelerationStructures[primitiveIndex].get();
@@ -1083,6 +1188,12 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
             item.meshletVertexIndexBase = meshletPrimitive.vertexIndexBase;
             item.meshletTriangleBase = meshletPrimitive.triangleBase;
             item.meshletBufferIndex = meshletPrimitive.bufferIndex;
+            item.morphBufferIndex = resources->morphBufferIndices[primitiveIndex];
+            item.morphTargetCount =
+                primitive.morphTargets.size() <= kMaxMorphTargets
+                    ? static_cast<std::uint32_t>(primitive.morphTargets.size())
+                    : 0u;
+            item.morphVertexCount = static_cast<std::uint32_t>(primitive.vertices.size());
 
             const std::uint32_t whiteIndex = m_whiteTexture->GetBindlessIndex();
             const std::uint32_t defaultSamplerIndex =
@@ -1306,6 +1417,8 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
         }
     }
 
+    resources->animationData = ExtractAnimationData(model);
+
     std::size_t textureCount = 0;
     for (const Material& material : resources->materials)
     {
@@ -1393,17 +1506,26 @@ void DeferredRenderer::AddModelInstance(std::size_t modelIndex, const glm::mat4&
     sceneObject.bounds.center = glm::vec3{transform * glm::vec4{model.fittedBounds.center, 1.0f}};
     sceneObject.bounds.radius = model.fittedBounds.radius * MaximumScale(transform);
 
+    if (model.animationData != nullptr)
+    {
+        sceneObject.animation = std::make_unique<SceneObjectInstance::AnimationInstance>();
+        sceneObject.animation->pose = RestPose(*model.animationData);
+        sceneObject.animation->previousPose = sceneObject.animation->pose;
+        sceneObject.animation->poseValid = true;
+    }
+
     for (const DrawItem& source : model.drawItems)
     {
         DrawItem instance = source;
-        const glm::mat4 baseTransform = transform * source.pushConstants.model;
+        const glm::mat4 baseTransform = transform * source.baseNodeWorld;
         instance.pushConstants.model = scaleMatrix * baseTransform;
         m_modelDrawItems.push_back(instance);
         m_modelBaseTransforms.push_back(baseTransform);
     }
 
     sceneObject.drawItemCount = m_modelDrawItems.size() - sceneObject.firstDrawItem;
-    m_objectInstances.push_back(sceneObject);
+    m_objectInstances.push_back(std::move(sceneObject));
+    RebuildJointPaletteLayout();
     ++m_geometryRevision;
 }
 
@@ -1422,15 +1544,513 @@ void DeferredRenderer::UpdateSceneObjectTransform(std::size_t objectIndex, const
         "Scene object draw items are out of range");
 
     const glm::mat4 scaleMatrix = glm::scale(glm::mat4{1.0f}, glm::vec3{m_modelScale});
+    const AnimationData* animationData = GetAnimationData(sceneObject);
     for (std::size_t index = 0; index < sceneObject.drawItemCount; ++index)
     {
         const DrawItem& source = model.drawItems[index];
         const std::size_t drawIndex = sceneObject.firstDrawItem + index;
-        const glm::mat4 baseTransform = transform * source.pushConstants.model;
+        glm::mat4 baseTransform = transform * source.baseNodeWorld;
+        if (animationData != nullptr && sceneObject.animation != nullptr)
+        {
+            const PoseData& pose = sceneObject.animation->pose;
+            if (source.skinIndex >= 0)
+            {
+                // Skinned meshes ignore the mesh node transform (glTF spec).
+                baseTransform = transform;
+            }
+            else if (source.nodeIndex >= 0 &&
+                     source.nodeIndex < static_cast<int>(pose.nodeWorld.size()))
+            {
+                baseTransform =
+                    transform * model.fitMatrix * pose.nodeWorld[static_cast<std::size_t>(source.nodeIndex)];
+            }
+        }
         m_modelDrawItems[drawIndex].pushConstants.model = scaleMatrix * baseTransform;
         m_modelBaseTransforms[drawIndex] = baseTransform;
     }
     ++m_geometryRevision;
+}
+
+const AnimationData* DeferredRenderer::GetAnimationData(const SceneObjectInstance& instance) const
+{
+    if (instance.modelIndex >= m_models.size())
+    {
+        return nullptr;
+    }
+    return m_models[instance.modelIndex]->animationData.get();
+}
+
+void DeferredRenderer::RebuildJointPaletteLayout()
+{
+    std::uint32_t usage = 0;
+    bool capacityExceeded = false;
+    for (SceneObjectInstance& instance : m_objectInstances)
+    {
+        if (instance.animation == nullptr)
+        {
+            continue;
+        }
+        const AnimationData* data = GetAnimationData(instance);
+        if (data == nullptr)
+        {
+            instance.animation.reset();
+            continue;
+        }
+
+        std::uint32_t instanceUsage = 0;
+        for (const GltfSkin& skin : data->skins)
+        {
+            instanceUsage += static_cast<std::uint32_t>(skin.joints.size());
+        }
+        if (usage + instanceUsage > kMaxJointMatrices)
+        {
+            capacityExceeded = true;
+            instance.animation->jointPaletteOffset = 0;
+            instance.animation->jointMatrixCount = 0;
+        }
+        else
+        {
+            instance.animation->jointPaletteOffset = usage;
+            instance.animation->jointMatrixCount = instanceUsage;
+            usage += instanceUsage;
+        }
+    }
+    if (capacityExceeded)
+    {
+        MRE_WARN(
+            "Joint palette capacity exceeded ({} matrices); skinning disabled for the overflow",
+            kMaxJointMatrices);
+    }
+
+    for (const SceneObjectInstance& instance : m_objectInstances)
+    {
+        if (instance.animation == nullptr)
+        {
+            continue;
+        }
+        const AnimationData* data = GetAnimationData(instance);
+        if (data == nullptr)
+        {
+            continue;
+        }
+
+        std::vector<std::uint32_t> skinOffsets(data->skins.size(), 0u);
+        std::uint32_t offset = 0;
+        for (std::size_t skin = 0; skin < data->skins.size(); ++skin)
+        {
+            skinOffsets[skin] = offset;
+            offset += static_cast<std::uint32_t>(data->skins[skin].joints.size());
+        }
+
+        for (std::size_t index = 0; index < instance.drawItemCount; ++index)
+        {
+            DrawItem& draw = m_modelDrawItems[instance.firstDrawItem + index];
+            draw.jointOffset = 0;
+            draw.jointCount = 0;
+            draw.previousJointOffset = 0;
+            if (draw.skinIndex < 0 || instance.animation->jointMatrixCount == 0)
+            {
+                continue;
+            }
+            const std::size_t skin = static_cast<std::size_t>(draw.skinIndex);
+            if (skin >= data->skins.size())
+            {
+                continue;
+            }
+            draw.jointOffset = instance.animation->jointPaletteOffset + skinOffsets[skin];
+            draw.jointCount = static_cast<std::uint32_t>(data->skins[skin].joints.size());
+            draw.previousJointOffset = kMaxJointMatrices + draw.jointOffset;
+        }
+    }
+}
+
+void DeferredRenderer::UploadJointPalettes(std::uint32_t frameIndex)
+{
+    if (frameIndex >= m_jointBuffers.size() || m_jointBuffers[frameIndex] == nullptr)
+    {
+        return;
+    }
+
+    rhi::Buffer& buffer = *m_jointBuffers[frameIndex];
+    for (const SceneObjectInstance& instance : m_objectInstances)
+    {
+        if (instance.animation == nullptr || instance.animation->jointMatrixCount == 0)
+        {
+            continue;
+        }
+        const SceneObjectInstance::AnimationInstance& animation = *instance.animation;
+        const std::uint64_t bytes =
+            static_cast<std::uint64_t>(animation.jointMatrixCount) * sizeof(glm::mat4);
+        if (animation.pose.jointMatrices.size() >= animation.jointMatrixCount)
+        {
+            buffer.Write(
+                animation.pose.jointMatrices.data(),
+                bytes,
+                static_cast<std::uint64_t>(animation.jointPaletteOffset) * sizeof(glm::mat4));
+        }
+        if (animation.previousPose.jointMatrices.size() >= animation.jointMatrixCount)
+        {
+            buffer.Write(
+                animation.previousPose.jointMatrices.data(),
+                bytes,
+                static_cast<std::uint64_t>(kMaxJointMatrices + animation.jointPaletteOffset) *
+                    sizeof(glm::mat4));
+        }
+    }
+}
+
+void DeferredRenderer::UploadMorphData(std::uint32_t frameIndex)
+{
+    if (frameIndex >= m_morphDataBuffers.size() || frameIndex >= m_morphWeightBuffers.size() ||
+        m_morphDataBuffers[frameIndex] == nullptr || m_morphWeightBuffers[frameIndex] == nullptr)
+    {
+        return;
+    }
+
+    const std::size_t itemCount = m_sceneDrawItems.size() + m_modelDrawItems.size();
+    if (itemCount > kMaxObjectData)
+    {
+        return;
+    }
+
+    std::vector<GpuMorphData> morphData(itemCount);
+    std::vector<float> weights(2ull * itemCount * kMaxMorphTargets, 0.0f);
+
+    // Scene draw items (the ground plane) never morph; model draw items start after them.
+    std::size_t index = m_sceneDrawItems.size();
+    for (std::size_t item = 0; item < m_modelDrawItems.size(); ++item, ++index)
+    {
+        const DrawItem& draw = m_modelDrawItems[item];
+        if (draw.morphTargetCount == 0)
+        {
+            continue;
+        }
+        morphData[index].data = glm::uvec4{
+            draw.morphBufferIndex,
+            draw.morphTargetCount,
+            draw.morphVertexCount,
+            0u};
+        morphData[index].offsets = glm::uvec4{
+            static_cast<std::uint32_t>(index * kMaxMorphTargets),
+            static_cast<std::uint32_t>((itemCount + index) * kMaxMorphTargets),
+            0u,
+            0u};
+
+        // The owning instance drives the weights (defaults or the evaluated clip).
+        const SceneObjectInstance* owner = nullptr;
+        for (const SceneObjectInstance& instance : m_objectInstances)
+        {
+            if (item >= instance.firstDrawItem &&
+                item < instance.firstDrawItem + instance.drawItemCount)
+            {
+                owner = &instance;
+                break;
+            }
+        }
+        if (owner == nullptr || owner->animation == nullptr)
+        {
+            continue;
+        }
+
+        const PoseData& pose = owner->animation->pose;
+        const PoseData& previousPose = owner->animation->previousPose;
+        const auto writeWeights = [&](const PoseData& source, std::size_t weightOffset) {
+            if (draw.nodeIndex < 0 || draw.nodeIndex >= static_cast<int>(source.nodeWeights.size()))
+            {
+                return;
+            }
+            const std::vector<float>& nodeWeights =
+                source.nodeWeights[static_cast<std::size_t>(draw.nodeIndex)];
+            for (std::uint32_t target = 0;
+                 target < draw.morphTargetCount && target < nodeWeights.size();
+                 ++target)
+            {
+                weights[weightOffset + target] = nodeWeights[target];
+            }
+        };
+        writeWeights(pose, morphData[index].offsets.x);
+        writeWeights(previousPose, morphData[index].offsets.y);
+    }
+
+    m_morphDataBuffers[frameIndex]->Write(
+        morphData.data(),
+        morphData.size() * sizeof(GpuMorphData));
+    m_morphWeightBuffers[frameIndex]->Write(weights.data(), weights.size() * sizeof(float));
+}
+
+void DeferredRenderer::UpdateAnimatedDrawTransforms()
+{
+    const glm::mat4 scaleMatrix = glm::scale(glm::mat4{1.0f}, glm::vec3{m_modelScale});
+    for (const SceneObjectInstance& instance : m_objectInstances)
+    {
+        if (instance.animation == nullptr)
+        {
+            continue;
+        }
+        const AnimationData* data = GetAnimationData(instance);
+        if (data == nullptr)
+        {
+            continue;
+        }
+
+        const PoseData& pose = instance.animation->pose;
+        const ModelResources& model = *m_models[instance.modelIndex];
+        for (std::size_t index = 0; index < instance.drawItemCount; ++index)
+        {
+            const std::size_t drawIndex = instance.firstDrawItem + index;
+            DrawItem& draw = m_modelDrawItems[drawIndex];
+            glm::mat4 baseTransform = instance.transform * draw.baseNodeWorld;
+            if (draw.skinIndex >= 0)
+            {
+                // Skinned meshes ignore the mesh node transform (glTF spec).
+                baseTransform = instance.transform;
+            }
+            else if (draw.nodeIndex >= 0 &&
+                     draw.nodeIndex < static_cast<int>(pose.nodeWorld.size()))
+            {
+                baseTransform = instance.transform * model.fitMatrix *
+                                pose.nodeWorld[static_cast<std::size_t>(draw.nodeIndex)];
+            }
+            draw.pushConstants.model = scaleMatrix * baseTransform;
+            m_modelBaseTransforms[drawIndex] = baseTransform;
+        }
+    }
+}
+
+void DeferredRenderer::UpdateAnimations(float deltaSeconds)
+{
+    if (!m_initialized)
+    {
+        return;
+    }
+
+    bool anyChanged = false;
+    for (SceneObjectInstance& instance : m_objectInstances)
+    {
+        SceneObjectInstance::AnimationInstance* animation = instance.animation.get();
+        if (animation == nullptr)
+        {
+            continue;
+        }
+        const AnimationData* data = GetAnimationData(instance);
+        if (data == nullptr)
+        {
+            continue;
+        }
+
+        bool changed = false;
+        const bool hasClip = animation->clipIndex >= 0 &&
+                             animation->clipIndex < static_cast<int>(data->animations.size());
+        if (hasClip && animation->playing)
+        {
+            const GltfAnimation& clip =
+                data->animations[static_cast<std::size_t>(animation->clipIndex)];
+            animation->time += deltaSeconds * animation->speed;
+            animation->time = WrapClipTime(clip.duration, animation->time, animation->loop);
+            changed = true;
+        }
+
+        if (changed || !animation->poseValid)
+        {
+            PoseData pose = RestPose(*data);
+            if (hasClip)
+            {
+                // The rest pose covers clips with no usable channels (EvaluatePose returns false).
+                static_cast<void>(EvaluatePose(
+                    *data,
+                    data->animations[static_cast<std::size_t>(animation->clipIndex)],
+                    animation->time,
+                    pose));
+            }
+            animation->previousPose = std::move(animation->pose);
+            animation->pose = std::move(pose);
+            animation->poseValid = true;
+            changed = true;
+        }
+
+        anyChanged = anyChanged || changed;
+    }
+
+    if (anyChanged)
+    {
+        UpdateAnimatedDrawTransforms();
+        // Cached point shadow maps key off the geometry revision; a changed pose moves skinned
+        // geometry, so refresh them for this frame.
+        ++m_geometryRevision;
+    }
+}
+
+bool DeferredRenderer::HasAnimation(std::size_t objectIndex) const
+{
+    if (objectIndex >= m_objectInstances.size())
+    {
+        return false;
+    }
+    return GetAnimationData(m_objectInstances[objectIndex]) != nullptr;
+}
+
+std::vector<std::string> DeferredRenderer::GetAnimationClips(std::size_t objectIndex) const
+{
+    std::vector<std::string> clips{};
+    if (objectIndex >= m_objectInstances.size())
+    {
+        return clips;
+    }
+    const AnimationData* data = GetAnimationData(m_objectInstances[objectIndex]);
+    if (data == nullptr)
+    {
+        return clips;
+    }
+    clips.reserve(data->animations.size());
+    for (const GltfAnimation& clip : data->animations)
+    {
+        clips.push_back(clip.name);
+    }
+    return clips;
+}
+
+const std::string& DeferredRenderer::GetAnimationClipName(std::size_t objectIndex) const
+{
+    static const std::string kEmpty{};
+    if (objectIndex >= m_objectInstances.size() ||
+        m_objectInstances[objectIndex].animation == nullptr)
+    {
+        return kEmpty;
+    }
+    return m_objectInstances[objectIndex].animation->clipName;
+}
+
+bool DeferredRenderer::IsAnimationPlaying(std::size_t objectIndex) const
+{
+    if (objectIndex >= m_objectInstances.size() ||
+        m_objectInstances[objectIndex].animation == nullptr)
+    {
+        return false;
+    }
+    return m_objectInstances[objectIndex].animation->playing;
+}
+
+float DeferredRenderer::GetAnimationTime(std::size_t objectIndex) const
+{
+    if (objectIndex >= m_objectInstances.size() ||
+        m_objectInstances[objectIndex].animation == nullptr)
+    {
+        return 0.0f;
+    }
+    return m_objectInstances[objectIndex].animation->time;
+}
+
+float DeferredRenderer::GetAnimationDuration(std::size_t objectIndex) const
+{
+    if (objectIndex >= m_objectInstances.size() ||
+        m_objectInstances[objectIndex].animation == nullptr)
+    {
+        return 0.0f;
+    }
+    const SceneObjectInstance& instance = m_objectInstances[objectIndex];
+    const AnimationData* data = GetAnimationData(instance);
+    const SceneObjectInstance::AnimationInstance& animation = *instance.animation;
+    if (data == nullptr || animation.clipIndex < 0 ||
+        animation.clipIndex >= static_cast<int>(data->animations.size()))
+    {
+        return 0.0f;
+    }
+    return data->animations[static_cast<std::size_t>(animation.clipIndex)].duration;
+}
+
+float DeferredRenderer::GetAnimationSpeed(std::size_t objectIndex) const
+{
+    if (objectIndex >= m_objectInstances.size() ||
+        m_objectInstances[objectIndex].animation == nullptr)
+    {
+        return 1.0f;
+    }
+    return m_objectInstances[objectIndex].animation->speed;
+}
+
+void DeferredRenderer::SetAnimationClip(std::size_t objectIndex, std::string_view clipName)
+{
+    if (objectIndex >= m_objectInstances.size())
+    {
+        return;
+    }
+    SceneObjectInstance& instance = m_objectInstances[objectIndex];
+    SceneObjectInstance::AnimationInstance* animation = instance.animation.get();
+    const AnimationData* data = GetAnimationData(instance);
+    if (animation == nullptr || data == nullptr)
+    {
+        return;
+    }
+
+    int clipIndex = -1;
+    for (std::size_t index = 0; index < data->animations.size(); ++index)
+    {
+        if (data->animations[index].name == clipName)
+        {
+            clipIndex = static_cast<int>(index);
+            break;
+        }
+    }
+
+    animation->clipIndex = clipIndex;
+    animation->clipName = clipIndex >= 0 ? data->animations[static_cast<std::size_t>(clipIndex)].name
+                                         : std::string{};
+    animation->time = 0.0f;
+    animation->playing = clipIndex >= 0;
+    animation->poseValid = false;
+    UpdateAnimations(0.0f);
+}
+
+void DeferredRenderer::SetAnimationPlaying(std::size_t objectIndex, bool playing)
+{
+    if (objectIndex >= m_objectInstances.size() ||
+        m_objectInstances[objectIndex].animation == nullptr)
+    {
+        return;
+    }
+    m_objectInstances[objectIndex].animation->playing = playing;
+}
+
+void DeferredRenderer::SetAnimationTime(std::size_t objectIndex, float seconds)
+{
+    if (objectIndex >= m_objectInstances.size() ||
+        m_objectInstances[objectIndex].animation == nullptr)
+    {
+        return;
+    }
+    SceneObjectInstance& instance = m_objectInstances[objectIndex];
+    SceneObjectInstance::AnimationInstance& animation = *instance.animation;
+    const AnimationData* data = GetAnimationData(instance);
+    if (data == nullptr || animation.clipIndex < 0 ||
+        animation.clipIndex >= static_cast<int>(data->animations.size()))
+    {
+        return;
+    }
+    const float duration =
+        data->animations[static_cast<std::size_t>(animation.clipIndex)].duration;
+    animation.time = WrapClipTime(duration, seconds, animation.loop);
+    animation.poseValid = false;
+    UpdateAnimations(0.0f);
+}
+
+void DeferredRenderer::SetAnimationSpeed(std::size_t objectIndex, float speed)
+{
+    if (objectIndex >= m_objectInstances.size() ||
+        m_objectInstances[objectIndex].animation == nullptr)
+    {
+        return;
+    }
+    m_objectInstances[objectIndex].animation->speed = std::max(speed, 0.0f);
+}
+
+void DeferredRenderer::SetAnimationLoop(std::size_t objectIndex, bool loop)
+{
+    if (objectIndex >= m_objectInstances.size() ||
+        m_objectInstances[objectIndex].animation == nullptr)
+    {
+        return;
+    }
+    m_objectInstances[objectIndex].animation->loop = loop;
 }
 
 bool DeferredRenderer::GetSceneBounds(glm::vec3& outMin, glm::vec3& outMax) const
@@ -1643,6 +2263,11 @@ void DeferredRenderer::UpdateObjectData(std::uint32_t frameIndex)
         objectData[index].subsurface = item.subsurface;
         objectData[index].subsurfaceTextureIndices = item.subsurfaceTextureIndices;
         objectData[index].subsurfaceSamplerIndices = item.subsurfaceSamplerIndices;
+        objectData[index].skinning = glm::uvec4{
+            item.jointOffset,
+            item.previousJointOffset,
+            item.jointCount,
+            item.jointCount > 0 ? 1u : 0u};
         item.pushConstants.drawIndex = static_cast<std::uint32_t>(index);
         meshDraws[index].meshletOffset = item.meshletOffset;
         meshDraws[index].meshletCount = item.meshletCount;
@@ -1735,6 +2360,9 @@ void DeferredRenderer::UpdateObjectData(std::uint32_t frameIndex)
     {
         m_meshDrawBuffers[frameIndex]->Write(meshDraws.data(), meshDraws.size() * sizeof(GpuMeshDraw));
     }
+
+    UploadJointPalettes(frameIndex);
+    UploadMorphData(frameIndex);
 }
 
 void DeferredRenderer::BuildAccelerationStructures(rhi::CommandList& commandList, std::uint32_t frameIndex)
@@ -4314,11 +4942,15 @@ bool DeferredRenderer::CreatePipelines(rhi::Device& device)
     shadowPipelineDesc.vertexShader = m_shadowVertexShader.get();
     shadowPipelineDesc.fragmentShader = m_shadowFragmentShader.get();
     rhi::ApplyShaderReflection(shadowPipelineDesc, shadowStages);
-    // The shadow pass consumes positions and UVs from the interleaved GltfVertex layout
-    // (position at byte 0, uv at byte 24); reflection cannot infer the interleaved offsets.
+    // The shadow pass consumes a subset of the interleaved GltfVertex layout (position at byte 0,
+    // uv at byte 24, joints at byte 32, weights at byte 48); reflection cannot infer the
+    // interleaved offsets. The skinning attributes are consumed for pose evaluation so their
+    // locations must be declared even though only positions drive the depth output.
     shadowPipelineDesc.vertexLayout = rhi::VertexLayout{};
     shadowPipelineDesc.vertexLayout.AddAttribute(0, rhi::Format::R32G32B32Sfloat, 0);
     shadowPipelineDesc.vertexLayout.AddAttribute(2, rhi::Format::R32G32Sfloat, 24);
+    shadowPipelineDesc.vertexLayout.AddAttribute(3, rhi::Format::R32G32B32A32Uint, 32);
+    shadowPipelineDesc.vertexLayout.AddAttribute(4, rhi::Format::R32G32B32A32Sfloat, 48);
     shadowPipelineDesc.vertexLayout.SetBindingStride(gbufferPipelineDesc.vertexLayout.GetStride());
     shadowPipelineDesc.depthTest = true;
     shadowPipelineDesc.depthWrite = true;
@@ -4696,6 +5328,22 @@ bool DeferredRenderer::CreateShadowResources(rhi::Device& device)
 
         std::unique_ptr<rhi::DescriptorSet> shadowSet = device.CreateDescriptorSet(*m_shadowSetLayout);
         shadowSet->BindBuffer(0, *m_shadowUniformBuffers.back());
+        if (frame < m_objectDataBuffers.size() && m_objectDataBuffers[frame] != nullptr)
+        {
+            shadowSet->BindBuffer(1, *m_objectDataBuffers[frame]);
+        }
+        if (frame < m_jointBuffers.size() && m_jointBuffers[frame] != nullptr)
+        {
+            shadowSet->BindBuffer(2, *m_jointBuffers[frame]);
+        }
+        if (frame < m_morphDataBuffers.size() && m_morphDataBuffers[frame] != nullptr)
+        {
+            shadowSet->BindBuffer(3, *m_morphDataBuffers[frame]);
+        }
+        if (frame < m_morphWeightBuffers.size() && m_morphWeightBuffers[frame] != nullptr)
+        {
+            shadowSet->BindBuffer(4, *m_morphWeightBuffers[frame]);
+        }
         m_shadowSets.push_back(std::move(shadowSet));
     }
 
@@ -4772,6 +5420,27 @@ bool DeferredRenderer::CreateClusterResources(rhi::Device& device)
         m_clusterGrid.count,
         kMaxLightsPerCluster);
     return true;
+}
+
+void DeferredRenderer::CreateJointPaletteResources(rhi::Device& device)
+{
+    const std::uint32_t framesInFlight = device.GetFramesInFlight();
+    m_jointBuffers.clear();
+    m_jointBuffers.reserve(framesInFlight);
+    for (std::uint32_t frame = 0; frame < framesInFlight; ++frame)
+    {
+        // The current and previous palettes share the buffer; the previous region starts at
+        // kMaxJointMatrices.
+        m_jointBuffers.push_back(device.CreateBuffer(rhi::BufferDesc{
+            2ull * kMaxJointMatrices * sizeof(glm::mat4),
+            rhi::BufferUsage::Storage,
+            true}));
+        if (m_jointBuffers.back() == nullptr)
+        {
+            MRE_CRITICAL("Failed to create the joint palette buffer");
+            return;
+        }
+    }
 }
 
 void DeferredRenderer::CreateMeshletResources(rhi::Device& device)

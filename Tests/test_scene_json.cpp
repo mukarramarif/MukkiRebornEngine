@@ -48,6 +48,13 @@ constexpr const char* kSceneText = R"({
         "density": 400.0,
         "friction": 0.7,
         "restitution": 0.1
+      },
+      "animation": {
+        "clip": "Walk",
+        "autoplay": true,
+        "loop": false,
+        "speed": 1.5,
+        "startTime": 2.25
       }
     },
     {
@@ -133,6 +140,14 @@ TEST(SceneJson, ParsesObjectsAndLights)
     EXPECT_FLOAT_EQ(scene.objects[0].physics.density, 400.0f);
     EXPECT_FLOAT_EQ(scene.objects[0].physics.friction, 0.7f);
     EXPECT_FLOAT_EQ(scene.objects[0].physics.restitution, 0.1f);
+    EXPECT_EQ(scene.objects[0].animation.clip, "Walk");
+    EXPECT_TRUE(scene.objects[0].animation.autoplay);
+    EXPECT_FALSE(scene.objects[0].animation.loop);
+    EXPECT_FLOAT_EQ(scene.objects[0].animation.speed, 1.5f);
+    EXPECT_FLOAT_EQ(scene.objects[0].animation.startTime, 2.25f);
+    EXPECT_TRUE(scene.objects[1].animation.clip.empty());
+    EXPECT_TRUE(scene.objects[1].animation.loop);
+    EXPECT_FLOAT_EQ(scene.objects[1].animation.speed, 1.0f);
     EXPECT_EQ(scene.objects[1].physics.body, mukki::ScenePhysicsBody::Static);
     EXPECT_EQ(scene.objects[1].physics.shape, mukki::ScenePhysicsShape::Sphere);
     EXPECT_FLOAT_EQ(scene.objects[1].physics.radius, 0.25f);
@@ -215,6 +230,13 @@ TEST(SceneJson, RoundTripsThroughSerialization)
         EXPECT_FLOAT_EQ(
             reloaded.objects[index].physics.restitution,
             scene.objects[index].physics.restitution);
+        EXPECT_EQ(reloaded.objects[index].animation.clip, scene.objects[index].animation.clip);
+        EXPECT_EQ(reloaded.objects[index].animation.autoplay, scene.objects[index].animation.autoplay);
+        EXPECT_EQ(reloaded.objects[index].animation.loop, scene.objects[index].animation.loop);
+        EXPECT_FLOAT_EQ(reloaded.objects[index].animation.speed, scene.objects[index].animation.speed);
+        EXPECT_FLOAT_EQ(
+            reloaded.objects[index].animation.startTime,
+            scene.objects[index].animation.startTime);
     }
 
     EXPECT_FLOAT_EQ(reloaded.physics.gravity.y, scene.physics.gravity.y);
@@ -308,6 +330,13 @@ TEST(SceneJson, RejectsInvalidInput)
         scene,
         error));
     EXPECT_NE(error.find("torus"), std::string::npos);
+
+    EXPECT_FALSE(mukki::SceneJson::Parse(
+        R"({"objects": [{"model": "Box.gltf", "animation": {"clip": "Walk", "speed": -1.0}}]})",
+        base,
+        scene,
+        error));
+    EXPECT_NE(error.find("speed"), std::string::npos);
 
     EXPECT_FALSE(mukki::SceneJson::Parse(
         R"({"physics": {"stepHz": 500.0}})",

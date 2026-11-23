@@ -15,6 +15,8 @@
 #include <glm/vec3.hpp>
 #include <glm/vec4.hpp>
 
+#include "Animation/AnimationData.h"
+#include "Animation/PoseEvaluator.h"
 #include "Assets/AsyncGltfLoader.h"
 #include "Renderer/BufferManager.h"
 #include "Renderer/Debug/DebugLines.h"
@@ -97,6 +99,18 @@ struct GpuObjectData
     glm::vec4 subsurface{0.0f};            // rgb: diffuseTransmissionColor, a: factor
     glm::uvec4 subsurfaceTextureIndices{0u}; // x: diffuseTransmissionTexture, y: color texture
     glm::uvec4 subsurfaceSamplerIndices{0u};
+    // Skinning: x: current joint palette offset, y: previous offset, z: joint count, w: 1 = skinned.
+    glm::uvec4 skinning{0u};
+};
+
+// Per draw item morph state, indexed by ObjectPushConstants::drawIndex. Must match GpuMorphData
+// in Renderer/Shaders/gbuffer.vert.slang and shadow.vert.slang.
+struct GpuMorphData
+{
+    // x: morph delta bindless buffer slot, y: morph target count, z: vertex count, w: unused.
+    glm::uvec4 data{0u};
+    // x: current weights offset, y: previous weights offset (in the per-frame weights buffer).
+    glm::uvec4 offsets{0u};
 };
 
 // Meshlet header as stored at the start of a per primitive meshlet buffer. Must match GpuMeshlet
@@ -117,6 +131,9 @@ inline constexpr std::uint32_t kMeshletCompactionCapacity = 1u << 18;
 inline constexpr std::uint32_t kShadowMeshletCompactionCapacity = 1u << 20;
 inline constexpr std::uint32_t kMeshletCullDisabled = 0xFFFFFFFFu;
 inline constexpr std::uint32_t kMeshletCullGroupSize = 64;
+// Per-frame joint palette capacity (joint matrices per region). Exceeding it disables skinning
+// for the instances that no longer fit.
+inline constexpr std::uint32_t kMaxJointMatrices = 1u << 14;
 
 // Per draw item meshlet source, indexed by ObjectPushConstants::drawIndex. Must match GpuMeshDraw
 // in Renderer/Shaders/meshlet.slang.
@@ -184,6 +201,22 @@ public:
     // pipeline; the transparent forward pass is skipped while active.
     void SetMeshletDebugView(bool enabled);
     [[nodiscard]] bool IsMeshletDebugViewEnabled() const { return m_meshletDebugView; }
+
+    // Advances animation time and re-evaluates the poses of animated scene objects. Call once per
+    // frame before Render (after physics has synced the object transforms).
+    void UpdateAnimations(float deltaSeconds);
+    [[nodiscard]] bool HasAnimation(std::size_t objectIndex) const;
+    [[nodiscard]] std::vector<std::string> GetAnimationClips(std::size_t objectIndex) const;
+    [[nodiscard]] const std::string& GetAnimationClipName(std::size_t objectIndex) const;
+    [[nodiscard]] bool IsAnimationPlaying(std::size_t objectIndex) const;
+    [[nodiscard]] float GetAnimationTime(std::size_t objectIndex) const;
+    [[nodiscard]] float GetAnimationDuration(std::size_t objectIndex) const;
+    [[nodiscard]] float GetAnimationSpeed(std::size_t objectIndex) const;
+    void SetAnimationClip(std::size_t objectIndex, std::string_view clipName);
+    void SetAnimationPlaying(std::size_t objectIndex, bool playing);
+    void SetAnimationTime(std::size_t objectIndex, float seconds);
+    void SetAnimationSpeed(std::size_t objectIndex, float speed);
+    void SetAnimationLoop(std::size_t objectIndex, bool loop);
     [[nodiscard]] std::uint64_t GetMeshletCount() const { return m_meshletCount; }
     [[nodiscard]] std::uint64_t GetMeshletTriangleCount() const { return m_meshletTriangleCount; }
 
@@ -332,6 +365,21 @@ private:
         std::uint32_t meshletBufferIndex = 0;     // bindless slot of the meshlet buffer
         // Slot of the compute-compacted meshlet list, or kMeshletCullDisabled when uncompacted.
         std::uint32_t compactedOffset = kMeshletCullDisabled;
+        // Skeletal animation: the glTF node this draw belongs to and the skin driving it.
+        int nodeIndex = -1;
+        int skinIndex = -1;
+        // Joint palette offsets in the per-frame joint buffer (matrices). jointCount == 0 when the
+        // draw is rigid.
+        std::uint32_t jointOffset = 0;
+        std::uint32_t jointCount = 0;
+        std::uint32_t previousJointOffset = 0;
+        // Morph targets: bindless slot of the per-primitive delta buffer and the target/vertex
+        // counts (morphTargetCount == 0 when the draw has no morphs).
+        std::uint32_t morphBufferIndex = 0;
+        std::uint32_t morphTargetCount = 0;
+        std::uint32_t morphVertexCount = 0;
+        // fit * rest node world transform (rigid draws), reused by transform updates.
+        glm::mat4 baseNodeWorld{1.0f};
         // KHR_materials_specular material data (see GpuObjectData).
         glm::vec4 specular{0.0f};
         glm::uvec4 specularTextureIndices{0u};
@@ -382,6 +430,8 @@ private:
 
 
     inline static constexpr std::uint32_t kMaxObjectData = 2048;
+    // Morph weights per draw item; primitives with more targets warn and render un-morphed.
+    inline static constexpr std::uint32_t kMaxMorphTargets = 16;
 
     struct Material
     {
@@ -425,21 +475,47 @@ private:
         std::vector<std::unique_ptr<rhi::AccelerationStructure>> accelerationStructures{};
         std::vector<std::unique_ptr<rhi::Buffer>> meshletBuffers{};
         std::vector<MeshletPrimitive> meshletPrimitives{};
+        // Morph delta buffers per primitive ([target * vertexCount + vertex] of two float4s:
+        // position delta, normal delta), registered in the bindless storage buffer array.
+        std::vector<std::unique_ptr<rhi::Buffer>> morphBuffers{};
+        std::vector<std::uint32_t> morphBufferIndices{};
         std::vector<DrawItem> drawItems{};
         SceneObjectBounds fittedBounds{};
         glm::vec3 fittedMin{0.0f};
         glm::vec3 fittedMax{0.0f};
         std::uint64_t vertexCount = 0;
         std::uint64_t triangleCount = 0;
+        // Model fitting transform (bounds centering + uniform scale) applied to node transforms.
+        glm::mat4 fitMatrix{1.0f};
+        // Shared immutable animation data; null for models without skins or clips.
+        std::shared_ptr<AnimationData> animationData{};
     };
 
     struct SceneObjectInstance
     {
+        // Per-instance animation state. Only instances of models with skins or clips own one.
+        struct AnimationInstance
+        {
+            int clipIndex = -1;
+            std::string clipName{};
+            float time = 0.0f;
+            float speed = 1.0f;
+            bool playing = false;
+            bool loop = true;
+            bool poseValid = false;
+            // Joint palette range in the per-frame joint buffer (matrices).
+            std::uint32_t jointPaletteOffset = 0;
+            std::uint32_t jointMatrixCount = 0;
+            PoseData pose{};
+            PoseData previousPose{};
+        };
+
         std::size_t modelIndex = 0;
         std::size_t firstDrawItem = 0;
         std::size_t drawItemCount = 0;
         glm::mat4 transform{1.0f};
         SceneObjectBounds bounds{};
+        std::unique_ptr<AnimationInstance> animation{};
     };
 
     struct ShadowPushConstants
@@ -565,6 +641,12 @@ private:
         rhi::CommandList& secondary,
         const rhi::RenderingDesc& desc);
     void RecordShadowMeshletCullPass(rhi::CommandList& commandList, std::uint32_t frameIndex);
+    void CreateJointPaletteResources(rhi::Device& device);
+    void RebuildJointPaletteLayout();
+    void UploadJointPalettes(std::uint32_t frameIndex);
+    void UpdateAnimatedDrawTransforms();
+    void UploadMorphData(std::uint32_t frameIndex);
+    [[nodiscard]] const AnimationData* GetAnimationData(const SceneObjectInstance& instance) const;
     void ApplyModelScale();
     void UpdateObjectData(std::uint32_t frameIndex);
     void BuildAccelerationStructures(rhi::CommandList& commandList, std::uint32_t frameIndex);
@@ -699,6 +781,9 @@ private:
     std::vector<std::unique_ptr<rhi::Buffer>> m_shadowMeshletCommandBuffers{};
     std::vector<std::unique_ptr<rhi::DescriptorSet>> m_shadowMeshSets{};
     std::vector<std::unique_ptr<rhi::DescriptorSet>> m_shadowCullSets{};
+    std::vector<std::unique_ptr<rhi::Buffer>> m_jointBuffers{};
+    std::vector<std::unique_ptr<rhi::Buffer>> m_morphDataBuffers{};
+    std::vector<std::unique_ptr<rhi::Buffer>> m_morphWeightBuffers{};
     bool m_shadowMeshletCompactionActive = false;
     std::vector<Light> m_spotShadowLights{};
     std::vector<Light> m_pointShadowLights{};

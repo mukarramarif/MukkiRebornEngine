@@ -218,7 +218,9 @@ flowchart TB
   G-buffer and shadow passes render them with `gbuffer.mesh.slang` / `shadow.mesh.slang`: one mesh
   shader workgroup per meshlet, culled against the view frustum and the normal cone, emitting its
   deduplicated vertices and packed triangles. The vertex pipeline remains for transparent
-  materials, the ground plane and devices without `VK_EXT_mesh_shader`. Meshlet rendering is on by
+  materials, the ground plane, skinned and morphed primitives (their vertices deform per pose,
+  so they use GPU skinning and morph deltas in the vertex shaders) and devices without
+  `VK_EXT_mesh_shader`. Meshlet rendering is on by
   default when supported; the `Scenes` window toggles it and `MRE_MESHLETS_OFF` disables it. The
   G-buffer and shadow paths first run compute culls (`meshlet_cull.comp.slang` /
   `shadow_cull.comp.slang`): each (view, draw) compacts its surviving meshlets into a per-frame

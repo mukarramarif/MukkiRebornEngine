@@ -60,6 +60,16 @@ struct SceneEnvironment
     float intensity = 1.0f;
 };
 
+// Optional per-object animation settings (glTF clips on the object's model).
+struct SceneAnimation
+{
+    std::string clip{};   // clip name; empty = no clip
+    bool autoplay = false;
+    bool loop = true;
+    float speed = 1.0f;
+    float startTime = 0.0f;
+};
+
 struct SceneObject
 {
     std::string name{};
@@ -68,6 +78,7 @@ struct SceneObject
     glm::vec3 rotation{0.0f};             // degrees around X, Y and Z, applied in YXZ order
     glm::vec3 scale{1.0f};
     ScenePhysics physics{};
+    SceneAnimation animation{};
 };
 
 struct SceneLight

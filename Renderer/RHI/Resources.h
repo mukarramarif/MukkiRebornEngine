@@ -24,6 +24,7 @@ enum class Format : std::uint8_t
     R32G32Sfloat,
     R32G32B32Sfloat,
     R32G32B32A32Sfloat,
+    R32G32B32A32Uint,
     D32Sfloat,
 };
 
@@ -73,6 +74,7 @@ enum class ShaderStageMask : std::uint8_t
     FragmentCompute = 6,
     FragmentMesh = 10,
     FragmentComputeMesh = 14,
+    VertexFragmentComputeMesh = 15,
 };
 
 enum class CullMode : std::uint8_t

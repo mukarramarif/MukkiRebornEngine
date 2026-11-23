@@ -18,8 +18,8 @@ class SceneBinary
 {
 public:
     static constexpr std::uint32_t kMagic = 0x5345524Du; // "MRES"
-    static constexpr std::uint32_t kVersion = 6;         // v6 adds environment, clouds, playerPlane
-    static constexpr std::uint32_t kLegacyVersion = 4;   // v4/v5 still decode with defaults
+    static constexpr std::uint32_t kVersion = 7;         // v7 adds per-object animation
+    static constexpr std::uint32_t kLegacyVersion = 4;   // v4-v6 still decode with defaults
 
     [[nodiscard]] static std::vector<std::byte> Encode(const SceneDescription& scene);
 

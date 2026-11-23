@@ -146,6 +146,11 @@ std::vector<std::byte> SceneBinary::Encode(const SceneDescription& scene)
         writer.F32(object.physics.density);
         writer.F32(object.physics.friction);
         writer.F32(object.physics.restitution);
+        writer.String(object.animation.clip);
+        writer.U32(object.animation.autoplay ? 1u : 0u);
+        writer.U32(object.animation.loop ? 1u : 0u);
+        writer.F32(object.animation.speed);
+        writer.F32(object.animation.startTime);
     }
 
     writer.U32(static_cast<std::uint32_t>(scene.probes.size()));
@@ -227,13 +232,14 @@ bool SceneBinary::Decode(std::span<const std::byte> data, SceneDescription& scen
         error = "scene binary has an invalid magic header";
         return false;
     }
-    if (version != kVersion && version != kLegacyVersion && version != 5u)
+    if (version != kVersion && version != kLegacyVersion && version != 5u && version != 6u)
     {
         error = "unsupported scene binary version " + std::to_string(version);
         return false;
     }
     const bool hasPhysics = version >= 5;
     const bool hasSceneSettings = version >= 6;
+    const bool hasAnimation = version >= 7;
 
     SceneDescription result{};
 
@@ -286,6 +292,20 @@ bool SceneBinary::Decode(std::span<const std::byte> data, SceneDescription& scen
             }
             object.physics.body = static_cast<ScenePhysicsBody>(body);
             object.physics.shape = static_cast<ScenePhysicsShape>(shape);
+        }
+
+        if (hasAnimation)
+        {
+            std::uint32_t autoplay = 0;
+            std::uint32_t loop = 1;
+            if (!reader.String(object.animation.clip) || !reader.U32(autoplay) || !reader.U32(loop) ||
+                !reader.F32(object.animation.speed) || !reader.F32(object.animation.startTime))
+            {
+                error = "scene binary is truncated while reading object animation";
+                return false;
+            }
+            object.animation.autoplay = autoplay != 0;
+            object.animation.loop = loop != 0;
         }
 
         result.objects.push_back(std::move(object));
