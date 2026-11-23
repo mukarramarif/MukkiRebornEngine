@@ -23,6 +23,15 @@ struct GltfVertex
     float weights[4]{0.0f, 0.0f, 0.0f, 0.0f};
 };
 
+// One glTF morph target: per-vertex position/normal deltas (TANGENT deltas are ignored; the
+// engine recomputes no tangents). Arrays may be empty when the target does not define that
+// attribute; entries past the array end are zero.
+struct GltfMorphTarget
+{
+    std::vector<glm::vec3> positionDeltas{};
+    std::vector<glm::vec3> normalDeltas{};
+};
+
 struct GltfPrimitive
 {
     std::vector<GltfVertex> vertices{};
@@ -31,6 +40,10 @@ struct GltfPrimitive
     // Skin driving this primitive, or -1 when rigid. Set when any node referencing the mesh has
     // a skin (primitives are shared across nodes).
     int skinIndex = -1;
+    // Morph targets in mesh order (all primitives of a mesh share the same targets per spec).
+    std::vector<GltfMorphTarget> morphTargets{};
+    // Mesh-level default weights (mesh.weights); empty when the mesh does not author them.
+    std::vector<float> defaultWeights{};
 };
 
 enum class GltfWrapMode : std::uint8_t
@@ -142,6 +155,9 @@ struct GltfAnimationSampler
     // LINEAR/STEP: one vec4 per key (xyz for translation/scale, xyzw quaternion for rotation).
     // CUBICSPLINE: three vec4s per key (in tangent, value, out tangent).
     std::vector<glm::vec4> values{};
+    // WEIGHTS channels: packed scalar values (one per key per morph target;
+    // CUBICSPLINE: three per key per target, in/value/out tangent order).
+    std::vector<float> weights{};
 };
 
 struct GltfAnimationChannel
@@ -149,6 +165,8 @@ struct GltfAnimationChannel
     int node = -1;
     GltfAnimationPath path = GltfAnimationPath::Translation;
     int sampler = -1;
+    // Number of morph targets driven by a WEIGHTS channel (validated against the node's mesh).
+    int weightCount = 0;
 };
 
 struct GltfAnimation

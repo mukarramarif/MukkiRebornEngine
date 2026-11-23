@@ -103,6 +103,16 @@ struct GpuObjectData
     glm::uvec4 skinning{0u};
 };
 
+// Per draw item morph state, indexed by ObjectPushConstants::drawIndex. Must match GpuMorphData
+// in Renderer/Shaders/gbuffer.vert.slang and shadow.vert.slang.
+struct GpuMorphData
+{
+    // x: morph delta bindless buffer slot, y: morph target count, z: vertex count, w: unused.
+    glm::uvec4 data{0u};
+    // x: current weights offset, y: previous weights offset (in the per-frame weights buffer).
+    glm::uvec4 offsets{0u};
+};
+
 // Meshlet header as stored at the start of a per primitive meshlet buffer. Must match GpuMeshlet
 // in Renderer/Shaders/meshlet.slang.
 struct GpuMeshlet
@@ -363,6 +373,11 @@ private:
         std::uint32_t jointOffset = 0;
         std::uint32_t jointCount = 0;
         std::uint32_t previousJointOffset = 0;
+        // Morph targets: bindless slot of the per-primitive delta buffer and the target/vertex
+        // counts (morphTargetCount == 0 when the draw has no morphs).
+        std::uint32_t morphBufferIndex = 0;
+        std::uint32_t morphTargetCount = 0;
+        std::uint32_t morphVertexCount = 0;
         // fit * rest node world transform (rigid draws), reused by transform updates.
         glm::mat4 baseNodeWorld{1.0f};
         // KHR_materials_specular material data (see GpuObjectData).
@@ -415,6 +430,8 @@ private:
 
 
     inline static constexpr std::uint32_t kMaxObjectData = 2048;
+    // Morph weights per draw item; primitives with more targets warn and render un-morphed.
+    inline static constexpr std::uint32_t kMaxMorphTargets = 16;
 
     struct Material
     {
@@ -458,6 +475,10 @@ private:
         std::vector<std::unique_ptr<rhi::AccelerationStructure>> accelerationStructures{};
         std::vector<std::unique_ptr<rhi::Buffer>> meshletBuffers{};
         std::vector<MeshletPrimitive> meshletPrimitives{};
+        // Morph delta buffers per primitive ([target * vertexCount + vertex] of two float4s:
+        // position delta, normal delta), registered in the bindless storage buffer array.
+        std::vector<std::unique_ptr<rhi::Buffer>> morphBuffers{};
+        std::vector<std::uint32_t> morphBufferIndices{};
         std::vector<DrawItem> drawItems{};
         SceneObjectBounds fittedBounds{};
         glm::vec3 fittedMin{0.0f};
@@ -624,6 +645,7 @@ private:
     void RebuildJointPaletteLayout();
     void UploadJointPalettes(std::uint32_t frameIndex);
     void UpdateAnimatedDrawTransforms();
+    void UploadMorphData(std::uint32_t frameIndex);
     [[nodiscard]] const AnimationData* GetAnimationData(const SceneObjectInstance& instance) const;
     void ApplyModelScale();
     void UpdateObjectData(std::uint32_t frameIndex);
@@ -760,6 +782,8 @@ private:
     std::vector<std::unique_ptr<rhi::DescriptorSet>> m_shadowMeshSets{};
     std::vector<std::unique_ptr<rhi::DescriptorSet>> m_shadowCullSets{};
     std::vector<std::unique_ptr<rhi::Buffer>> m_jointBuffers{};
+    std::vector<std::unique_ptr<rhi::Buffer>> m_morphDataBuffers{};
+    std::vector<std::unique_ptr<rhi::Buffer>> m_morphWeightBuffers{};
     bool m_shadowMeshletCompactionActive = false;
     std::vector<Light> m_spotShadowLights{};
     std::vector<Light> m_pointShadowLights{};

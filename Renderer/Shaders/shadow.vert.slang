@@ -44,9 +44,19 @@ struct GpuObjectData
     uint4 skinning; // x: joint offset, y: previous joint offset, z: joint count, w: 1 = skinned
 };
 
+// Must match mukki::DeferredRenderer::GpuMorphData.
+struct GpuMorphData
+{
+    uint4 data;    // x: delta buffer bindless slot, y: target count, z: vertex count, w: unused
+    uint4 offsets; // x: current weights offset, y: previous weights offset, z/w: unused
+};
+
 [[vk::binding(0, 0)]] ConstantBuffer<ShadowUniform> gShadow;
 [[vk::binding(1, 0)]] StructuredBuffer<GpuObjectData> gObjects;
 [[vk::binding(2, 0)]] StructuredBuffer<float4x4> gJoints;
+[[vk::binding(3, 0)]] StructuredBuffer<GpuMorphData> gMorphData;
+[[vk::binding(4, 0)]] StructuredBuffer<float4> gMorphWeights;
+[[vk::binding(2, 1)]] ByteAddressBuffer gBuffers[];
 [[vk::push_constant]] ConstantBuffer<ShadowPushConstants> gPush;
 
 struct VertexInput
@@ -64,9 +74,32 @@ struct VertexOutput
 };
 
 [shader("vertex")]
-VertexOutput vertexMain(VertexInput input)
+VertexOutput vertexMain(VertexInput input, uint vertexId : SV_VertexID)
 {
     float4 localPosition = float4(input.position, 1.0);
+
+    // Morph deltas apply in mesh space before skinning (current pose only; shadow views do not
+    // need the previous pose).
+    const GpuMorphData morph = gMorphData[gPush.drawIndex];
+    if (morph.data.y != 0u)
+    {
+        for (uint target = 0; target < morph.data.y; ++target)
+        {
+            const float weight = gMorphWeights[morph.offsets.x + target].x;
+            if (weight == 0.0f)
+            {
+                continue;
+            }
+            const ByteAddressBuffer buffer =
+                gBuffers[NonUniformResourceIndex(morph.data.x)];
+            const uint element = (target * morph.data.z + vertexId) * 8u;
+            localPosition.xyz += float3(
+                asfloat(buffer.Load(element)),
+                asfloat(buffer.Load(element + 4u)),
+                asfloat(buffer.Load(element + 8u))) * weight;
+        }
+    }
+
     const uint4 skinning = gObjects[gPush.drawIndex].skinning;
     if (skinning.w != 0u)
     {

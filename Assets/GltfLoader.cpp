@@ -38,6 +38,51 @@ struct AccessorView
     bool normalized = false;
 };
 
+bool ComponentCountOf(int type, int& out)
+{
+    switch (type)
+    {
+    case TINYGLTF_TYPE_SCALAR:
+        out = 1;
+        return true;
+    case TINYGLTF_TYPE_VEC2:
+        out = 2;
+        return true;
+    case TINYGLTF_TYPE_VEC3:
+        out = 3;
+        return true;
+    case TINYGLTF_TYPE_VEC4:
+        out = 4;
+        return true;
+    case TINYGLTF_TYPE_MAT4:
+        out = 16;
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool ComponentSizeOf(int componentType, std::size_t& out)
+{
+    switch (componentType)
+    {
+    case TINYGLTF_COMPONENT_TYPE_FLOAT:
+    case TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT:
+        out = 4;
+        return true;
+    case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT:
+    case TINYGLTF_COMPONENT_TYPE_SHORT:
+        out = 2;
+        return true;
+    case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE:
+    case TINYGLTF_COMPONENT_TYPE_BYTE:
+        out = 1;
+        return true;
+    default:
+        return false;
+    }
+}
+
 bool GetAccessorView(const tinygltf::Model& gltf, int accessorIndex, AccessorView& out)
 {
     if (accessorIndex < 0 || accessorIndex >= static_cast<int>(gltf.accessors.size()))
@@ -58,47 +103,14 @@ bool GetAccessorView(const tinygltf::Model& gltf, int accessorIndex, AccessorVie
     }
 
     int componentCount = 0;
-    if (accessor.type == TINYGLTF_TYPE_SCALAR)
-    {
-        componentCount = 1;
-    }
-    else if (accessor.type == TINYGLTF_TYPE_VEC2)
-    {
-        componentCount = 2;
-    }
-    else if (accessor.type == TINYGLTF_TYPE_VEC3)
-    {
-        componentCount = 3;
-    }
-    else if (accessor.type == TINYGLTF_TYPE_VEC4)
-    {
-        componentCount = 4;
-    }
-    else if (accessor.type == TINYGLTF_TYPE_MAT4)
-    {
-        componentCount = 16;
-    }
-    else
+    if (!ComponentCountOf(accessor.type, componentCount))
     {
         return false;
     }
 
     std::size_t componentSize = 0;
-    switch (accessor.componentType)
+    if (!ComponentSizeOf(accessor.componentType, componentSize))
     {
-    case TINYGLTF_COMPONENT_TYPE_FLOAT:
-    case TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT:
-        componentSize = 4;
-        break;
-    case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT:
-    case TINYGLTF_COMPONENT_TYPE_SHORT:
-        componentSize = 2;
-        break;
-    case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE:
-    case TINYGLTF_COMPONENT_TYPE_BYTE:
-        componentSize = 1;
-        break;
-    default:
         return false;
     }
 
@@ -109,6 +121,105 @@ bool GetAccessorView(const tinygltf::Model& gltf, int accessorIndex, AccessorVie
     out.componentType = accessor.componentType;
     out.componentCount = componentCount;
     out.normalized = accessor.normalized;
+    return true;
+}
+
+// Materializes an accessor into tightly packed bytes, applying sparse overrides. Morph target
+// accessors are commonly sparse (base bufferView missing or partial, with explicit overrides).
+bool ExpandAccessor(const tinygltf::Model& gltf, int accessorIndex, std::vector<std::uint8_t>& out)
+{
+    out.clear();
+    if (accessorIndex < 0 || accessorIndex >= static_cast<int>(gltf.accessors.size()))
+    {
+        return false;
+    }
+    const tinygltf::Accessor& accessor = gltf.accessors[accessorIndex];
+
+    int componentCount = 0;
+    std::size_t componentSize = 0;
+    if (!ComponentCountOf(accessor.type, componentCount) ||
+        !ComponentSizeOf(accessor.componentType, componentSize))
+    {
+        return false;
+    }
+    const std::size_t elementSize = componentSize * static_cast<std::size_t>(componentCount);
+    const std::size_t count = static_cast<std::size_t>(accessor.count);
+    out.assign(count * elementSize, 0);
+
+    if (accessor.bufferView >= 0 && accessor.bufferView < static_cast<int>(gltf.bufferViews.size()))
+    {
+        const tinygltf::BufferView& view = gltf.bufferViews[accessor.bufferView];
+        if (view.buffer >= 0 && view.buffer < static_cast<int>(gltf.buffers.size()))
+        {
+            const tinygltf::Buffer& buffer = gltf.buffers[view.buffer];
+            const std::size_t sourceStride = view.byteStride != 0 ? view.byteStride : elementSize;
+            const std::uint8_t* source =
+                buffer.data.data() + view.byteOffset + accessor.byteOffset;
+            for (std::size_t element = 0; element < count; ++element)
+            {
+                std::memcpy(
+                    out.data() + element * elementSize,
+                    source + element * sourceStride,
+                    elementSize);
+            }
+        }
+    }
+
+    if (accessor.sparse.isSparse)
+    {
+        const auto readSparseView = [&gltf](
+                                        int bufferViewIndex,
+                                        int byteOffset,
+                                        const std::uint8_t*& data) -> bool {
+            if (bufferViewIndex < 0 ||
+                bufferViewIndex >= static_cast<int>(gltf.bufferViews.size()))
+            {
+                return false;
+            }
+            const tinygltf::BufferView& view = gltf.bufferViews[bufferViewIndex];
+            if (view.buffer < 0 || view.buffer >= static_cast<int>(gltf.buffers.size()))
+            {
+                return false;
+            }
+            const tinygltf::Buffer& buffer = gltf.buffers[view.buffer];
+            data = buffer.data.data() + view.byteOffset + byteOffset;
+            return true;
+        };
+
+        std::size_t indexSize = 0;
+        if (!ComponentSizeOf(accessor.sparse.indices.componentType, indexSize))
+        {
+            return false;
+        }
+        const std::uint8_t* indexData = nullptr;
+        const std::uint8_t* valueData = nullptr;
+        if (!readSparseView(
+                accessor.sparse.indices.bufferView,
+                accessor.sparse.indices.byteOffset,
+                indexData) ||
+            !readSparseView(
+                accessor.sparse.values.bufferView,
+                accessor.sparse.values.byteOffset,
+                valueData))
+        {
+            return false;
+        }
+
+        const std::size_t sparseCount = static_cast<std::size_t>(accessor.sparse.count);
+        for (std::size_t sparse = 0; sparse < sparseCount; ++sparse)
+        {
+            std::uint32_t target = 0;
+            std::memcpy(&target, indexData + sparse * indexSize, indexSize);
+            if (target >= count)
+            {
+                continue;
+            }
+            std::memcpy(
+                out.data() + static_cast<std::size_t>(target) * elementSize,
+                valueData + sparse * elementSize,
+                elementSize);
+        }
+    }
     return true;
 }
 
@@ -226,6 +337,48 @@ bool ReadSkinningAttributes(
             out.vertices[vertex].joints[component] =
                 static_cast<std::uint32_t>(std::max(joint, 0.0f));
             out.vertices[vertex].weights[component] = weight;
+        }
+    }
+    return true;
+}
+
+// Reads a morph target delta accessor (VEC3 float or normalized integer) into per-vertex deltas.
+// Sparse accessors are materialized first; vertices past the accessor count stay zero per spec.
+bool ReadMorphDeltas(
+    const tinygltf::Model& gltf,
+    int accessorIndex,
+    std::size_t vertexCount,
+    std::vector<glm::vec3>& out)
+{
+    out.assign(vertexCount, glm::vec3{0.0f});
+    if (accessorIndex < 0 || accessorIndex >= static_cast<int>(gltf.accessors.size()))
+    {
+        return false;
+    }
+    const tinygltf::Accessor& accessor = gltf.accessors[accessorIndex];
+    int componentCount = 0;
+    std::size_t componentSize = 0;
+    if (!ComponentCountOf(accessor.type, componentCount) || componentCount != 3 ||
+        !ComponentSizeOf(accessor.componentType, componentSize))
+    {
+        return false;
+    }
+
+    std::vector<std::uint8_t> bytes{};
+    if (!ExpandAccessor(gltf, accessorIndex, bytes))
+    {
+        return false;
+    }
+
+    const std::size_t elementSize = componentSize * 3u;
+    const std::size_t count = std::min<std::size_t>(accessor.count, vertexCount);
+    for (std::size_t vertex = 0; vertex < count; ++vertex)
+    {
+        const std::uint8_t* source = bytes.data() + vertex * elementSize;
+        for (int component = 0; component < 3; ++component)
+        {
+            out[vertex][component] =
+                ReadComponent(source, component, accessor.componentType, accessor.normalized);
         }
     }
     return true;
@@ -794,6 +947,40 @@ bool LoadGltfModel(const std::filesystem::path& path, GltfModel& model)
                     converted);
             }
 
+            // Morph target deltas (POSITION/NORMAL; TANGENT deltas are not consumed by the
+            // engine's vertex format). Sparse accessors are expanded before reading.
+            bool warnedTangent = false;
+            for (const auto& target : primitive.targets)
+            {
+                GltfMorphTarget morph{};
+                const auto positionTarget = target.find("POSITION");
+                if (positionTarget != target.end() &&
+                    !ReadMorphDeltas(gltf, positionTarget->second, vertexCount, morph.positionDeltas))
+                {
+                    MRE_WARN(
+                        "glTF mesh {} has an invalid morph target position accessor",
+                        meshIndex);
+                }
+                const auto normalTarget = target.find("NORMAL");
+                if (normalTarget != target.end() &&
+                    !ReadMorphDeltas(gltf, normalTarget->second, vertexCount, morph.normalDeltas))
+                {
+                    MRE_WARN(
+                        "glTF mesh {} has an invalid morph target normal accessor",
+                        meshIndex);
+                }
+                if (!warnedTangent && target.find("TANGENT") != target.end())
+                {
+                    MRE_WARN(
+                        "glTF mesh {} morph target tangents are ignored (no tangent attribute)",
+                        meshIndex);
+                    warnedTangent = true;
+                }
+                converted.morphTargets.push_back(std::move(morph));
+            }
+            // Mesh-level default weights apply to every primitive of the mesh.
+            converted.defaultWeights.assign(mesh.weights.begin(), mesh.weights.end());
+
             converted.materialIndex = primitive.material;
 
             model.vertexCount += converted.vertices.size();
@@ -918,30 +1105,48 @@ bool LoadGltfModel(const std::filesystem::path& path, GltfModel& model)
 
             const std::size_t valuesPerKey =
                 convertedSampler.interpolation == GltfInterpolation::CubicSpline ? 3u : 1u;
-            if (output.count != convertedSampler.times.size() * valuesPerKey)
+            // Weights channels carry one extra value per morph target, so the exact count is
+            // validated per channel once the target path is known; here only reject samplers
+            // that cannot even cover their keys.
+            if (output.count < convertedSampler.times.size() * valuesPerKey)
             {
                 MRE_WARN(
-                    "glTF animation '{}' sampler key and value counts mismatch",
+                    "glTF animation '{}' sampler has fewer values than keys",
                     converted.name);
                 convertedSampler.times.clear();
                 converted.samplers.push_back(std::move(convertedSampler));
                 continue;
             }
 
-            convertedSampler.values.resize(output.count);
-            for (std::size_t element = 0; element < output.count; ++element)
+            // SCALAR outputs drive WEIGHTS channels (one value per key per morph target); all
+            // other channels use vec3/vec4 outputs stored in `values`.
+            if (output.componentCount == 1)
             {
-                const std::uint8_t* source = output.data + element * output.stride;
-                glm::vec4 value{0.0f};
-                for (int component = 0; component < output.componentCount; ++component)
+                convertedSampler.weights.resize(output.count);
+                for (std::size_t element = 0; element < output.count; ++element)
                 {
-                    value[component] = ReadComponent(
-                        source,
-                        component,
-                        output.componentType,
-                        output.normalized);
+                    const std::uint8_t* source = output.data + element * output.stride;
+                    convertedSampler.weights[element] =
+                        ReadComponent(source, 0, output.componentType, output.normalized);
                 }
-                convertedSampler.values[element] = value;
+            }
+            else
+            {
+                convertedSampler.values.resize(output.count);
+                for (std::size_t element = 0; element < output.count; ++element)
+                {
+                    const std::uint8_t* source = output.data + element * output.stride;
+                    glm::vec4 value{0.0f};
+                    for (int component = 0; component < output.componentCount; ++component)
+                    {
+                        value[component] = ReadComponent(
+                            source,
+                            component,
+                            output.componentType,
+                            output.normalized);
+                    }
+                    convertedSampler.values[element] = value;
+                }
             }
             converted.duration = std::max(converted.duration, convertedSampler.times.back());
             converted.samplers.push_back(std::move(convertedSampler));
@@ -968,10 +1173,36 @@ bool LoadGltfModel(const std::filesystem::path& path, GltfModel& model)
             else if (channel.target_path == "weights")
             {
                 convertedChannel.path = GltfAnimationPath::Weights;
-                MRE_WARN(
-                    "glTF animation '{}' morph target weights are not supported yet",
-                    converted.name);
-                continue;
+                // The channel drives as many weights as the node's mesh has morph targets.
+                const int node = channel.target_node;
+                if (node < 0 || node >= static_cast<int>(model.nodes.size()) ||
+                    model.nodes[static_cast<std::size_t>(node)].meshIndex < 0)
+                {
+                    MRE_WARN(
+                        "glTF animation '{}' weights channel targets a node without a mesh",
+                        converted.name);
+                    continue;
+                }
+                const int meshIndex = model.nodes[static_cast<std::size_t>(node)].meshIndex;
+                if (meshIndex < 0 || meshIndex >= static_cast<int>(meshPrimitives.size()) ||
+                    meshPrimitives[static_cast<std::size_t>(meshIndex)].empty())
+                {
+                    MRE_WARN(
+                        "glTF animation '{}' weights channel targets a mesh without primitives",
+                        converted.name);
+                    continue;
+                }
+                const std::uint32_t primitiveIndex =
+                    meshPrimitives[static_cast<std::size_t>(meshIndex)].front();
+                convertedChannel.weightCount = static_cast<int>(
+                    model.primitives[primitiveIndex].morphTargets.size());
+                if (convertedChannel.weightCount <= 0)
+                {
+                    MRE_WARN(
+                        "glTF animation '{}' weights channel targets a mesh without morph targets",
+                        converted.name);
+                    continue;
+                }
             }
             else
             {
@@ -994,9 +1225,34 @@ bool LoadGltfModel(const std::filesystem::path& path, GltfModel& model)
                 continue;
             }
 
+            // Morph channels are the only ones allowed extra values per key (one per morph
+            // target); TRS channels must match key-for-key so the evaluator's indexing stays
+            // valid.
+            const GltfAnimationSampler& channelSampler =
+                converted.samplers[static_cast<std::size_t>(convertedChannel.sampler)];
+            const std::size_t channelValuesPerKey =
+                channelSampler.interpolation == GltfInterpolation::CubicSpline ? 3u : 1u;
+            const std::size_t valuesPerKeyCount =
+                convertedChannel.path == GltfAnimationPath::Weights
+                    ? static_cast<std::size_t>(convertedChannel.weightCount)
+                    : 1u;
+            const std::size_t expectedValues =
+                channelSampler.times.size() * valuesPerKeyCount * channelValuesPerKey;
+            const std::size_t actualValues =
+                convertedChannel.path == GltfAnimationPath::Weights
+                    ? channelSampler.weights.size()
+                    : channelSampler.values.size();
+            if (actualValues != expectedValues)
+            {
+                MRE_WARN(
+                    "glTF animation '{}' channel '{}' sampler key and value counts mismatch",
+                    converted.name,
+                    channel.target_path);
+                continue;
+            }
+
             if (convertedChannel.path == GltfAnimationPath::Rotation && !warnedCubicRotation &&
-                converted.samplers[static_cast<std::size_t>(convertedChannel.sampler)].interpolation ==
-                    GltfInterpolation::CubicSpline)
+                channelSampler.interpolation == GltfInterpolation::CubicSpline)
             {
                 MRE_WARN(
                     "glTF animation '{}' cubic spline rotations are approximated with slerp",

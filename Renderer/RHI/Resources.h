@@ -74,6 +74,7 @@ enum class ShaderStageMask : std::uint8_t
     FragmentCompute = 6,
     FragmentMesh = 10,
     FragmentComputeMesh = 14,
+    VertexFragmentComputeMesh = 15,
 };
 
 enum class CullMode : std::uint8_t

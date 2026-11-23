@@ -201,7 +201,9 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
         rhi::DescriptorBinding{
             2,
             rhi::DescriptorType::StorageBuffer,
-            rhi::ShaderStageMask::FragmentComputeMesh,
+            // Morph delta buffers are read by the vertex shaders, so the bindless storage array
+            // must also cover the vertex stage.
+            rhi::ShaderStageMask::VertexFragmentComputeMesh,
             rhi::kMaxBindlessBuffers,
             true},
     };
@@ -328,6 +330,25 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
     m_tlasInstanceCounts.assign(framesInFlight, 0);
     m_geometryDataBuffers.resize(framesInFlight);
     CreateJointPaletteResources(device);
+    // Per draw item morph state and the per-frame current/previous weight regions.
+    m_morphDataBuffers.clear();
+    m_morphWeightBuffers.clear();
+    m_morphDataBuffers.reserve(framesInFlight);
+    m_morphWeightBuffers.reserve(framesInFlight);
+    for (std::uint32_t frame = 0; frame < framesInFlight; ++frame)
+    {
+        m_morphDataBuffers.push_back(device.CreateBuffer(rhi::BufferDesc{
+            kMaxObjectData * sizeof(GpuMorphData),
+            rhi::BufferUsage::Storage,
+            true}));
+        m_morphWeightBuffers.push_back(device.CreateBuffer(rhi::BufferDesc{
+            2ull * kMaxObjectData * kMaxMorphTargets * sizeof(float),
+            rhi::BufferUsage::Storage,
+            true}));
+        MRE_ASSERT(
+            m_morphDataBuffers.back() != nullptr && m_morphWeightBuffers.back() != nullptr,
+            "Failed to create the morph buffers");
+    }
     m_objectDataBuffers.clear();
     m_uniformBuffers.reserve(framesInFlight);
     m_sceneSets.reserve(framesInFlight);
@@ -348,6 +369,14 @@ bool DeferredRenderer::Init(rhi::Device& device, const Desc& desc)
         if (frame < m_jointBuffers.size() && m_jointBuffers[frame] != nullptr)
         {
             sceneSet->BindBuffer(2, *m_jointBuffers[frame]);
+        }
+        if (frame < m_morphDataBuffers.size() && m_morphDataBuffers[frame] != nullptr)
+        {
+            sceneSet->BindBuffer(3, *m_morphDataBuffers[frame]);
+        }
+        if (frame < m_morphWeightBuffers.size() && m_morphWeightBuffers[frame] != nullptr)
+        {
+            sceneSet->BindBuffer(4, *m_morphWeightBuffers[frame]);
         }
         m_sceneSets.push_back(std::move(sceneSet));
     }
@@ -471,6 +500,8 @@ void DeferredRenderer::Shutdown()
     m_shadowMeshSets.clear();
     m_shadowCullSets.clear();
     m_jointBuffers.clear();
+    m_morphDataBuffers.clear();
+    m_morphWeightBuffers.clear();
     m_meshletCount = 0;
     m_meshletTriangleCount = 0;
     m_meshletRenderingSupported = false;
@@ -960,6 +991,8 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
     resources->accelerationStructures.reserve(model.primitives.size());
     resources->meshletBuffers.reserve(model.primitives.size());
     resources->meshletPrimitives.reserve(model.primitives.size());
+    resources->morphBuffers.reserve(model.primitives.size());
+    resources->morphBufferIndices.reserve(model.primitives.size());
     for (const GltfPrimitive& primitive : model.primitives)
     {
         const std::uint64_t vertexBytes = sizeof(GltfVertex) * primitive.vertices.size();
@@ -996,9 +1029,10 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
         // Pack the meshlets, the vertex index list and the packed micro triangles into one
         // storage buffer that is registered in the bindless buffer array. Skinned primitives skip
         // the mesh shader path: their vertices deform per pose, so they render through the vertex
-        // pipeline with GPU skinning.
+        // pipeline with GPU skinning. Morphed primitives do the same (deltas are applied in the
+        // vertex shader before skinning).
         resources->meshletPrimitives.push_back(ModelResources::MeshletPrimitive{});
-        if (meshShaderSupported && primitive.skinIndex < 0)
+        if (meshShaderSupported && primitive.skinIndex < 0 && primitive.morphTargets.empty())
         {
             const MeshletMesh meshlets = BuildMeshlets(primitive.vertices, primitive.indices);
             if (!meshlets.Empty())
@@ -1059,6 +1093,64 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
                 m_meshletTriangleCount += meshlets.meshletTriangles.size();
             }
         }
+
+        // Morph target deltas: [target * vertexCount + vertex] pairs of (position delta,
+        // normal delta) float4s, registered in the bindless storage buffer array so the vertex
+        // shaders can index them per draw item.
+        resources->morphBuffers.push_back(nullptr);
+        resources->morphBufferIndices.push_back(0u);
+        if (!primitive.morphTargets.empty())
+        {
+            if (primitive.morphTargets.size() > kMaxMorphTargets)
+            {
+                MRE_WARN(
+                    "Model '{}' primitive has {} morph targets (max {}); morphing disabled for it",
+                    resources->name,
+                    primitive.morphTargets.size(),
+                    kMaxMorphTargets);
+            }
+            else
+            {
+                const std::size_t vertexCount = primitive.vertices.size();
+                std::vector<glm::vec4> deltas(
+                    primitive.morphTargets.size() * vertexCount * 2u,
+                    glm::vec4{0.0f});
+                for (std::size_t target = 0; target < primitive.morphTargets.size(); ++target)
+                {
+                    const GltfMorphTarget& morph = primitive.morphTargets[target];
+                    for (std::size_t vertex = 0; vertex < vertexCount; ++vertex)
+                    {
+                        glm::vec3 positionDelta{0.0f};
+                        glm::vec3 normalDelta{0.0f};
+                        if (vertex < morph.positionDeltas.size())
+                        {
+                            positionDelta = morph.positionDeltas[vertex];
+                        }
+                        if (vertex < morph.normalDeltas.size())
+                        {
+                            normalDelta = morph.normalDeltas[vertex];
+                        }
+                        deltas[(target * vertexCount + vertex) * 2u + 0u] =
+                            glm::vec4{positionDelta, 0.0f};
+                        deltas[(target * vertexCount + vertex) * 2u + 1u] =
+                            glm::vec4{normalDelta, 0.0f};
+                    }
+                }
+
+                resources->morphBuffers.back() = m_device->CreateBuffer(
+                    rhi::BufferDesc{
+                        deltas.size() * sizeof(glm::vec4),
+                        rhi::BufferUsage::Storage,
+                        false},
+                    deltas.data(),
+                    deltas.size() * sizeof(glm::vec4));
+                resources->morphBufferIndices.back() = m_nextBindlessBuffer++;
+                m_bindlessSet->BindStorageBuffer(
+                    2,
+                    *resources->morphBuffers.back(),
+                    resources->morphBufferIndices.back());
+            }
+        }
     }
     m_blasDirty = true;
 
@@ -1096,6 +1188,12 @@ std::optional<std::size_t> DeferredRenderer::UploadModel(const std::filesystem::
             item.meshletVertexIndexBase = meshletPrimitive.vertexIndexBase;
             item.meshletTriangleBase = meshletPrimitive.triangleBase;
             item.meshletBufferIndex = meshletPrimitive.bufferIndex;
+            item.morphBufferIndex = resources->morphBufferIndices[primitiveIndex];
+            item.morphTargetCount =
+                primitive.morphTargets.size() <= kMaxMorphTargets
+                    ? static_cast<std::uint32_t>(primitive.morphTargets.size())
+                    : 0u;
+            item.morphVertexCount = static_cast<std::uint32_t>(primitive.vertices.size());
 
             const std::uint32_t whiteIndex = m_whiteTexture->GetBindlessIndex();
             const std::uint32_t defaultSamplerIndex =
@@ -1599,6 +1697,85 @@ void DeferredRenderer::UploadJointPalettes(std::uint32_t frameIndex)
                     sizeof(glm::mat4));
         }
     }
+}
+
+void DeferredRenderer::UploadMorphData(std::uint32_t frameIndex)
+{
+    if (frameIndex >= m_morphDataBuffers.size() || frameIndex >= m_morphWeightBuffers.size() ||
+        m_morphDataBuffers[frameIndex] == nullptr || m_morphWeightBuffers[frameIndex] == nullptr)
+    {
+        return;
+    }
+
+    const std::size_t itemCount = m_sceneDrawItems.size() + m_modelDrawItems.size();
+    if (itemCount > kMaxObjectData)
+    {
+        return;
+    }
+
+    std::vector<GpuMorphData> morphData(itemCount);
+    std::vector<float> weights(2ull * itemCount * kMaxMorphTargets, 0.0f);
+
+    // Scene draw items (the ground plane) never morph; model draw items start after them.
+    std::size_t index = m_sceneDrawItems.size();
+    for (std::size_t item = 0; item < m_modelDrawItems.size(); ++item, ++index)
+    {
+        const DrawItem& draw = m_modelDrawItems[item];
+        if (draw.morphTargetCount == 0)
+        {
+            continue;
+        }
+        morphData[index].data = glm::uvec4{
+            draw.morphBufferIndex,
+            draw.morphTargetCount,
+            draw.morphVertexCount,
+            0u};
+        morphData[index].offsets = glm::uvec4{
+            static_cast<std::uint32_t>(index * kMaxMorphTargets),
+            static_cast<std::uint32_t>((itemCount + index) * kMaxMorphTargets),
+            0u,
+            0u};
+
+        // The owning instance drives the weights (defaults or the evaluated clip).
+        const SceneObjectInstance* owner = nullptr;
+        for (const SceneObjectInstance& instance : m_objectInstances)
+        {
+            if (item >= instance.firstDrawItem &&
+                item < instance.firstDrawItem + instance.drawItemCount)
+            {
+                owner = &instance;
+                break;
+            }
+        }
+        if (owner == nullptr || owner->animation == nullptr)
+        {
+            continue;
+        }
+
+        const PoseData& pose = owner->animation->pose;
+        const PoseData& previousPose = owner->animation->previousPose;
+        const auto writeWeights = [&](const PoseData& source, std::size_t weightOffset) {
+            if (draw.nodeIndex < 0 || draw.nodeIndex >= static_cast<int>(source.nodeWeights.size()))
+            {
+                return;
+            }
+            const std::vector<float>& nodeWeights =
+                source.nodeWeights[static_cast<std::size_t>(draw.nodeIndex)];
+            for (std::uint32_t target = 0;
+                 target < draw.morphTargetCount && target < nodeWeights.size();
+                 ++target)
+            {
+                weights[weightOffset + target] = nodeWeights[target];
+            }
+        };
+        writeWeights(pose, morphData[index].offsets.x);
+        writeWeights(previousPose, morphData[index].offsets.y);
+    }
+
+    m_morphDataBuffers[frameIndex]->Write(
+        morphData.data(),
+        morphData.size() * sizeof(GpuMorphData));
+    m_morphWeightBuffers[frameIndex]->Write(weights.data(), weights.size() * sizeof(float));
 }
 
 void DeferredRenderer::UpdateAnimatedDrawTransforms()
@@ -2185,6 +2362,7 @@ void DeferredRenderer::UpdateObjectData(std::uint32_t frameIndex)
     }
 
     UploadJointPalettes(frameIndex);
+    UploadMorphData(frameIndex);
 }
 
 void DeferredRenderer::BuildAccelerationStructures(rhi::CommandList& commandList, std::uint32_t frameIndex)
@@ -5157,6 +5335,14 @@ bool DeferredRenderer::CreateShadowResources(rhi::Device& device)
         if (frame < m_jointBuffers.size() && m_jointBuffers[frame] != nullptr)
         {
             shadowSet->BindBuffer(2, *m_jointBuffers[frame]);
+        }
+        if (frame < m_morphDataBuffers.size() && m_morphDataBuffers[frame] != nullptr)
+        {
+            shadowSet->BindBuffer(3, *m_morphDataBuffers[frame]);
+        }
+        if (frame < m_morphWeightBuffers.size() && m_morphWeightBuffers[frame] != nullptr)
+        {
+            shadowSet->BindBuffer(4, *m_morphWeightBuffers[frame]);
         }
         m_shadowSets.push_back(std::move(shadowSet));
     }

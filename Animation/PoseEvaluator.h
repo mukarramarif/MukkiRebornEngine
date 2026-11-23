@@ -9,12 +9,14 @@
 namespace mukki
 {
 
-// Evaluated pose of one model instance: world transforms in model space and the flattened joint
-// matrices (jointWorld * inverseBind) ordered by skin.
+// Evaluated pose of one model instance: world transforms in model space, the flattened joint
+// matrices (jointWorld * inverseBind) ordered by skin and the per-node morph weights.
 struct PoseData
 {
     std::vector<glm::mat4> nodeWorld{};
     std::vector<glm::mat4> jointMatrices{};
+    // Per-node morph target weights (indexed by node, then target).
+    std::vector<std::vector<float>> nodeWeights{};
 };
 
 // The pose with every node at its rest transform.

@@ -102,12 +102,24 @@ must not expose backend types, and Vulkan types may only appear under `Renderer/
   G-buffer vertex shader skins position + normal (current and previous palette, so motion
   vectors stay correct), `shadow.vert` skins with the current pose only, and skinned primitives
   always take the vertex pipeline (no meshlets) — the shadow pipeline vertex layout declares the
-  interleaved locations 0/2/3/4 with the `GltfVertex` offsets. Ray traced hits still shade the
-  bind pose (per-instance BLAS refit is deferred). Scene binary v7 + `SceneJson` carry a
-  per-object `animation` block (clip/autoplay/loop/speed/startTime); the sandbox applies it after
-  `LoadScene` and the object editor exposes an `Animation` section. `Sandbox/Scenes/
-  animation.scene.json` demos the Fox; `Tests/test_animation.cpp` covers wrapping/rest pose/
-  interpolation/joint matrices and Fox skinning, the loader test covers skin/animation parsing.
+  interleaved locations 0/2/3/4 with the `GltfVertex` offsets. Morph targets: `GltfPrimitive`
+  carries per-target position/normal deltas (sparse accessors expanded via `ExpandAccessor`;
+  TANGENT deltas are ignored) and the mesh default weights; WEIGHTS channels drive
+  `channel.weightCount` values per key stored in `GltfAnimationSampler::weights` (packed
+  [key][target]). `PoseData::nodeWeights` evaluates through `SampleMorphWeight` (linear/step/
+  hermite cubic). The renderer uploads one bindless storage buffer per morphed primitive
+  ([target * vertexCount + vertex] position/normal delta float4 pairs), skips meshlets for
+  morphed primitives and applies the deltas in the vertex shaders before skinning (current +
+  previous weights for motion vectors): `GpuMorphData` (delta slot/target count/vertex count +
+  weight offsets) and the weight regions live in per-frame buffers bound at scene/shadow set
+  bindings 3 and 4; the bindless storage array layout covers the vertex stage for this.
+  `kMaxMorphTargets` is 16. Ray traced hits still shade the bind pose (per-instance BLAS refit is
+  deferred). Scene binary v7 + `SceneJson` carry a per-object `animation` block
+  (clip/autoplay/loop/speed/startTime); the sandbox applies it after `LoadScene` and the object
+  editor exposes an `Animation` section. `Sandbox/Scenes/animation.scene.json` demos the Fox,
+  `Sandbox/Scenes/morph.scene.json` the morph sphere/cube; `Tests/test_animation.cpp` covers
+  wrapping/rest pose/interpolation/joint matrices, Fox skinning and morph weight evaluation, the
+  loader test covers skin/animation/morph parsing.
 - Materials: glTF `alphaMode = MASK` is supported. The flag and `alphaCutoff` are packed into
   `ObjectPushConstants.params.z/.w` (set by `DeferredRenderer` from `GltfMaterial`), the G-buffer
   discards `baseColor.a * baseColorFactor.a < cutoff`, and the shadow fragment stage alpha-tests

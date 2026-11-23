@@ -108,6 +108,75 @@ glm::quat SampleRotation(const GltfAnimationSampler& sampler, float time)
     return glm::slerp(a, b, t);
 }
 
+// Samples one morph target of a WEIGHTS sampler. Values are packed
+// [key][part][target] where part is (in tangent, value, out tangent) for CUBICSPLINE.
+float SampleMorphWeight(
+    const GltfAnimationSampler& sampler,
+    float time,
+    std::size_t target,
+    std::size_t weightCount)
+{
+    if (sampler.times.empty() || weightCount == 0)
+    {
+        return 0.0f;
+    }
+
+    std::size_t low = 0;
+    float t = 0.0f;
+    FindKey(sampler.times, time, low, t);
+    const std::size_t stride =
+        sampler.interpolation == GltfInterpolation::CubicSpline ? 3u : 1u;
+    const auto valueAt = [&sampler, weightCount, stride, target](std::size_t key, std::size_t part) {
+        return sampler.weights[(key * stride + part) * weightCount + target];
+    };
+    const float a = valueAt(low, stride == 3u ? 1u : 0u);
+    if (sampler.interpolation == GltfInterpolation::Step ||
+        low + 1 >= sampler.times.size() || t <= 0.0f)
+    {
+        return a;
+    }
+
+    const float b = valueAt(low + 1, stride == 3u ? 1u : 0u);
+    if (sampler.interpolation == GltfInterpolation::Linear)
+    {
+        return glm::mix(a, b, t);
+    }
+
+    // Hermite between the keys using the neighboring tangents.
+    const float deltaTime = sampler.times[low + 1] - sampler.times[low];
+    const float outTangent = valueAt(low, 2u);
+    const float inTangent = valueAt(low + 1, 0u);
+    const float t2 = t * t;
+    const float t3 = t2 * t;
+    return (2.0f * t3 - 3.0f * t2 + 1.0f) * a +
+           (t3 - 2.0f * t2 + t) * deltaTime * outTangent +
+           (-2.0f * t3 + 3.0f * t2) * b +
+           (t3 - t2) * deltaTime * inTangent;
+}
+
+// Fills pose.nodeWeights with the mesh default weights (zero where absent).
+void InitializeWeights(const AnimationData& data, PoseData& pose)
+{
+    pose.nodeWeights.resize(data.nodes.size());
+    for (std::size_t node = 0; node < data.nodes.size(); ++node)
+    {
+        const std::size_t count =
+            node < data.nodeMorphTargetCounts.size() && data.nodeMorphTargetCounts[node] > 0
+                ? static_cast<std::size_t>(data.nodeMorphTargetCounts[node])
+                : 0u;
+        pose.nodeWeights[node].assign(count, 0.0f);
+        if (node < data.nodeDefaultWeights.size())
+        {
+            const std::size_t defaults =
+                std::min(data.nodeDefaultWeights[node].size(), count);
+            for (std::size_t target = 0; target < defaults; ++target)
+            {
+                pose.nodeWeights[node][target] = data.nodeDefaultWeights[node][target];
+            }
+        }
+    }
+}
+
 void ComputeWorldTransforms(
     const AnimationData& data,
     const std::vector<glm::mat4>& local,
@@ -189,6 +258,7 @@ PoseData RestPose(const AnimationData& data)
     }
     ComputeWorldTransforms(data, local, pose.nodeWorld);
     FillJointMatrices(data, pose);
+    InitializeWeights(data, pose);
     return pose;
 }
 
@@ -209,6 +279,7 @@ bool EvaluatePose(
         rotations[node] = data.nodes[node].rotation;
         scales[node] = data.nodes[node].scale;
     }
+    InitializeWeights(data, pose);
 
     for (const GltfAnimationChannel& channel : clip.channels)
     {
@@ -240,8 +311,22 @@ bool EvaluatePose(
             animated[node] = true;
             break;
         case GltfAnimationPath::Weights:
-            // Morph targets are not supported yet.
+        {
+            const std::size_t weightCount =
+                channel.weightCount > 0
+                    ? static_cast<std::size_t>(channel.weightCount)
+                    : (node < data.nodeMorphTargetCounts.size() &&
+                               data.nodeMorphTargetCounts[node] > 0
+                           ? static_cast<std::size_t>(data.nodeMorphTargetCounts[node])
+                           : 0u);
+            std::vector<float>& weights = pose.nodeWeights[node];
+            weights.assign(weightCount, 0.0f);
+            for (std::size_t target = 0; target < weightCount; ++target)
+            {
+                weights[target] = SampleMorphWeight(sampler, time, target, weightCount);
+            }
             break;
+        }
         }
     }
 

@@ -312,4 +312,108 @@ TEST(Animation, FoxSkinDeformsOverTime)
     EXPECT_GT(glm::distance(restPosition, animatedPosition), 1e-3f);
 }
 
+TEST(Animation, MorphWeightsStepInterpolationUsesLowerKey)
+{
+    mukki::AnimationData data{};
+    data.nodes.resize(1);
+    data.nodes[0].localTransform = glm::mat4{1.0f};
+    data.rootNodes.push_back(0);
+    data.nodeMorphTargetCounts = {2};
+    data.nodeDefaultWeights.resize(1);
+
+    mukki::GltfAnimationSampler sampler{};
+    sampler.interpolation = mukki::GltfInterpolation::Step;
+    sampler.times = {0.0f, 1.0f};
+    sampler.weights = {0.0f, 0.0f, 1.0f, 0.5f};
+    mukki::GltfAnimation clip{};
+    clip.duration = 1.0f;
+    clip.samplers.push_back(std::move(sampler));
+    clip.channels.push_back(
+        mukki::GltfAnimationChannel{0, mukki::GltfAnimationPath::Weights, 0, 2});
+
+    mukki::PoseData pose{};
+    ASSERT_TRUE(mukki::EvaluatePose(data, clip, 0.9f, pose));
+    ASSERT_EQ(pose.nodeWeights.size(), 1u);
+    ASSERT_EQ(pose.nodeWeights[0].size(), 2u);
+    EXPECT_FLOAT_EQ(pose.nodeWeights[0][0], 0.0f);
+    EXPECT_FLOAT_EQ(pose.nodeWeights[0][1], 0.0f);
+
+    ASSERT_TRUE(mukki::EvaluatePose(data, clip, 1.0f, pose));
+    EXPECT_FLOAT_EQ(pose.nodeWeights[0][0], 1.0f);
+    EXPECT_FLOAT_EQ(pose.nodeWeights[0][1], 0.5f);
+}
+
+TEST(Animation, MorphCubeDeformsAlongItsWeights)
+{
+    const std::filesystem::path modelPath =
+        std::filesystem::path{MRE_SOURCE_DIR} /
+        "ThirdParty/glTF-Sample-Models/2.0/AnimatedMorphCube/glTF/AnimatedMorphCube.gltf";
+    if (!std::filesystem::exists(modelPath))
+    {
+        GTEST_SKIP() << "glTF sample models submodule is not initialized";
+    }
+
+    mukki::GltfModel model{};
+    ASSERT_TRUE(mukki::LoadGltfModel(modelPath, model));
+    auto animationData = mukki::ExtractAnimationData(model);
+    ASSERT_NE(animationData, nullptr);
+    ASSERT_EQ(animationData->animations.size(), 1u);
+    ASSERT_EQ(animationData->nodeMorphTargetCounts[0], 2);
+
+    const mukki::GltfAnimation& clip = animationData->animations[0];
+
+    // At t = 0 the pose matches the first keyframe.
+    mukki::PoseData pose{};
+    ASSERT_TRUE(mukki::EvaluatePose(*animationData, clip, 0.0f, pose));
+    ASSERT_EQ(pose.nodeWeights.size(), 1u);
+    ASSERT_EQ(pose.nodeWeights[0].size(), 2u);
+    EXPECT_FLOAT_EQ(pose.nodeWeights[0][0], clip.samplers[0].weights[0]);
+    EXPECT_FLOAT_EQ(pose.nodeWeights[0][1], clip.samplers[0].weights[1]);
+
+    // Mid clip the sampled weights must match an independent linear interpolation between the
+    // two bounding keyframes (values are packed [key][target]).
+    const float time = 1.0f;
+    const std::vector<float>& times = clip.samplers[0].times;
+    const std::vector<float>& keys = clip.samplers[0].weights;
+    const auto upper = std::upper_bound(times.begin(), times.end(), time);
+    ASSERT_GT(upper - times.begin(), 0);
+    ASSERT_LT(upper, times.end());
+    const std::size_t high = static_cast<std::size_t>(upper - times.begin());
+    const std::size_t low = high - 1;
+    const float u = (time - times[low]) / (times[high] - times[low]);
+    const float expected0 = keys[low * 2u + 0u] * (1.0f - u) + keys[high * 2u + 0u] * u;
+    const float expected1 = keys[low * 2u + 1u] * (1.0f - u) + keys[high * 2u + 1u] * u;
+    ASSERT_GT(std::abs(expected0) + std::abs(expected1), 1e-3f);
+    ASSERT_TRUE(mukki::EvaluatePose(*animationData, clip, time, pose));
+    EXPECT_NEAR(pose.nodeWeights[0][0], expected0, 1e-4f);
+    EXPECT_NEAR(pose.nodeWeights[0][1], expected1, 1e-4f);
+
+    // The deformed position equals base + sum(weight * delta) per target; vertex 0 of this file
+    // happens to have zero deltas, so pick a vertex that actually morphs.
+    const mukki::GltfPrimitive& primitive = model.primitives[0];
+    ASSERT_EQ(primitive.morphTargets.size(), 2u);
+    std::size_t vertexIndex = primitive.vertices.size();
+    for (std::size_t vertex = 0; vertex < primitive.vertices.size(); ++vertex)
+    {
+        const glm::vec3 candidateDelta =
+            primitive.morphTargets[0].positionDeltas[vertex] +
+            primitive.morphTargets[1].positionDeltas[vertex];
+        if (glm::length(candidateDelta) > 1e-4f)
+        {
+            vertexIndex = vertex;
+            break;
+        }
+    }
+    ASSERT_LT(vertexIndex, primitive.vertices.size());
+    const glm::vec3 base = primitive.vertices[vertexIndex].position;
+    const glm::vec3 delta =
+        pose.nodeWeights[0][0] * primitive.morphTargets[0].positionDeltas[vertexIndex] +
+        pose.nodeWeights[0][1] * primitive.morphTargets[1].positionDeltas[vertexIndex];
+    ASSERT_GT(glm::length(delta), 1e-4f);
+    const glm::vec3 deformed = base + delta;
+    EXPECT_NEAR(deformed.x, base.x + delta.x, 1e-5f);
+    EXPECT_NEAR(deformed.y, base.y + delta.y, 1e-5f);
+    EXPECT_NEAR(deformed.z, base.z + delta.z, 1e-5f);
+}
+
 } // namespace
